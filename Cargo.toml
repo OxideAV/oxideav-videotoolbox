@@ -22,6 +22,12 @@ oxideav-core = { version = "0.1", optional = true }
 # ships a stub `register()` that's a no-op.
 [target.'cfg(target_os = "macos")'.dependencies]
 libloading = "0.8"
+# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
+# via the `oxideav_core::register!` macro. Macos-only because the
+# entire crate body is `#![cfg(target_os = "macos")]`. Optional +
+# gated behind `registry` so default-features=false consumers don't
+# pull it in.
+linkme = { version = "0.3", optional = true }
 
 [features]
 default = ["registry"]
@@ -30,4 +36,4 @@ default = ["registry"]
 # `oxideav-core` so the crate can plug into the `oxideav` framework
 # registry. Default-on; turn off for tooling that just wants the raw
 # VideoToolbox bridge bindings without the framework.
-registry = ["dep:oxideav-core"]
+registry = ["dep:oxideav-core", "dep:linkme"]

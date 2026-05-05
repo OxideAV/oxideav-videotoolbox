@@ -42,3 +42,6 @@ pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {
     // Round 1: framework loads but no factories registered yet.
     let _ = sys::framework();
 }
+
+#[cfg(feature = "registry")]
+oxideav_core::register!("videotoolbox", register);
