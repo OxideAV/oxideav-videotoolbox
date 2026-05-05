@@ -20,8 +20,9 @@
 //!
 //! # Status
 //!
-//! Round 1 (this commit): scaffolding + libloading-based framework
-//! loader + symbol-resolution smoke tests. No codecs wired yet.
+//! Round 2 (this commit): real H.264 + HEVC decode + encode factories
+//! via `VTDecompressionSession` / `VTCompressionSession`. Both codec ids
+//! register with `priority = 10` and `hardware_accelerated = true`.
 //!
 //! # Workspace policy
 //!
@@ -32,15 +33,98 @@
 
 pub mod sys;
 
-/// Stable module path for the registry entry point. Round 2 will wire
-/// in `VTDecompressionSession` for H.264 / HEVC / ProRes / MPEG-2 /
-/// VP9 / AV1 (M3+) and `VTCompressionSession` for H.264 / HEVC /
-/// ProRes / JPEG with priority 0 (preferred over the pure-Rust impls
-/// at priority 100+).
 #[cfg(feature = "registry")]
-pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {
-    // Round 1: framework loads but no factories registered yet.
-    let _ = sys::framework();
+pub mod decoder;
+#[cfg(feature = "registry")]
+pub mod encoder;
+
+/// Register H.264 and HEVC hardware decode + encode factories via
+/// VideoToolbox. If the framework cannot be loaded (older OS, sandboxed
+/// environment, non-macOS) the function logs and returns without
+/// registering anything — the runtime falls back to the pure-Rust impls.
+#[cfg(feature = "registry")]
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
+
+    // Confirm the framework loads before registering factories.
+    match sys::vtable() {
+        Ok(_) => {}
+        Err(e) => {
+            // Library not available (e.g. running under Rosetta on an old
+            // OS, or in a Linux cross-build test). Graceful no-op.
+            eprintln!("oxideav-videotoolbox: framework unavailable, skipping registration: {e}");
+            return;
+        }
+    }
+
+    // ── H.264 decoder ──────────────────────────────────────────────────────
+    let h264_caps = CodecCapabilities::video("h264_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("h264"))
+            .capabilities(h264_caps.clone().with_decode())
+            .decoder(decoder::H264VtDecoder::make)
+            .tags([
+                CodecTag::fourcc(b"H264"),
+                CodecTag::fourcc(b"h264"),
+                CodecTag::fourcc(b"AVC1"),
+                CodecTag::fourcc(b"avc1"),
+                CodecTag::fourcc(b"X264"),
+                CodecTag::matroska("V_MPEG4/ISO/AVC"),
+            ]),
+    );
+
+    // ── H.264 encoder ──────────────────────────────────────────────────────
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("h264"))
+            .capabilities(
+                CodecCapabilities::video("h264_videotoolbox")
+                    .with_lossy(true)
+                    .with_intra_only(false)
+                    .with_hardware(true)
+                    .with_priority(10)
+                    .with_encode(),
+            )
+            .encoder(encoder::make_h264_encoder),
+    );
+
+    // ── HEVC decoder ───────────────────────────────────────────────────────
+    let hevc_caps = CodecCapabilities::video("hevc_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("hevc"))
+            .capabilities(hevc_caps.clone().with_decode())
+            .decoder(decoder::HevcVtDecoder::make)
+            .tags([
+                CodecTag::fourcc(b"hvc1"),
+                CodecTag::fourcc(b"hev1"),
+                CodecTag::matroska("V_MPEGH/ISO/HEVC"),
+            ]),
+    );
+
+    // ── HEVC encoder ───────────────────────────────────────────────────────
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("hevc"))
+            .capabilities(
+                CodecCapabilities::video("hevc_videotoolbox")
+                    .with_lossy(true)
+                    .with_intra_only(false)
+                    .with_hardware(true)
+                    .with_priority(10)
+                    .with_encode(),
+            )
+            .encoder(encoder::make_hevc_encoder),
+    );
+
+    let _ = (h264_caps, hevc_caps); // suppress unused warnings
 }
 
 #[cfg(feature = "registry")]

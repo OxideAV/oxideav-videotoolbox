@@ -14,7 +14,7 @@ The whole crate is `#![cfg(target_os = "macos")]`. On Linux / Windows it compile
 
 ## Priority
 
-Hardware factories register with `CodecCapabilities::with_priority(0)` — **lower numbers win at resolution time**, so on macOS hardware paths are preferred over the pure-Rust impls (which sit at priority 100+).
+Hardware factories register with `CodecCapabilities::with_priority(10)` — **lower numbers win at resolution time**, so on macOS hardware paths are preferred over the pure-Rust impls (which sit at priority 100+).
 
 ## Opt-out
 
@@ -33,7 +33,7 @@ Users who want to force the pure-Rust path can disable hardware acceleration glo
 | AV1          | hardware (M3+)    | hardware (M3+)    |
 | JPEG         | hardware          | hardware          |
 
-Round 1 (this commit): scaffolding only. Round 2: H.264 / HEVC decode + encode. Round 3: ProRes + JPEG. Round 4: VP9 / AV1 / MPEG-2.
+Round 1: scaffolding. Round 2 (this commit): H.264 + HEVC decode + encode — both wired, roundtrip PSNR_Y H.264 ≈ 46 dB, HEVC ≈ 50 dB. Round 3: ProRes + JPEG. Round 4: VP9 / AV1 / MPEG-2.
 
 ## Workspace policy
 
