@@ -1,0 +1,33 @@
+[package]
+name = "oxideav-videotoolbox"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-videotoolbox"
+homepage = "https://github.com/OxideAV/oxideav-videotoolbox"
+authors = ["Mark Karpeles"]
+description = "macOS VideoToolbox hardware decode/encode bridge for the oxideav framework — runtime-loaded via libloading, no compile-time framework dep"
+readme = "README.md"
+keywords = ["videotoolbox", "macos", "hardware", "video", "oxideav"]
+categories = ["multimedia::encoding", "multimedia::video", "hardware-support"]
+
+[dependencies]
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# tooling consumers can depend on `oxideav-videotoolbox` with
+# `default-features = false` and avoid the framework dependency tree.
+oxideav-core = { version = "0.1", optional = true }
+
+# libloading is only pulled on macOS targets — every non-mac build
+# ships a stub `register()` that's a no-op.
+[target.'cfg(target_os = "macos")'.dependencies]
+libloading = "0.8"
+
+[features]
+default = ["registry"]
+
+# Wires up the codec/encoder/decoder trait implementations against
+# `oxideav-core` so the crate can plug into the `oxideav` framework
+# registry. Default-on; turn off for tooling that just wants the raw
+# VideoToolbox bridge bindings without the framework.
+registry = ["dep:oxideav-core"]
