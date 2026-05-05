@@ -194,8 +194,7 @@ pub type FnVTCompressionSessionCompleteFrames = unsafe extern "C" fn(
     complete_until_presentation_time_stamp: CMTime,
 ) -> OSStatus;
 
-pub type FnVTCompressionSessionInvalidate =
-    unsafe extern "C" fn(session: VTCompressionSessionRef);
+pub type FnVTCompressionSessionInvalidate = unsafe extern "C" fn(session: VTCompressionSessionRef);
 
 pub type FnVTCompressionSessionPrepareToEncodeFrames =
     unsafe extern "C" fn(session: VTCompressionSessionRef) -> OSStatus;
@@ -244,8 +243,7 @@ pub type FnCMBlockBufferCreateWithMemoryBlock = unsafe extern "C" fn(
     block_buffer_out: *mut CMBlockBufferRef,
 ) -> OSStatus;
 
-pub type FnCMBlockBufferGetDataLength =
-    unsafe extern "C" fn(the_buffer: CMBlockBufferRef) -> usize;
+pub type FnCMBlockBufferGetDataLength = unsafe extern "C" fn(the_buffer: CMBlockBufferRef) -> usize;
 
 pub type FnCMVideoFormatDescriptionCreateFromH264ParameterSets = unsafe extern "C" fn(
     allocator: CFAllocatorRef,
@@ -284,9 +282,8 @@ pub type FnCMVideoFormatDescriptionGetHEVCParameterSetAtIndex = unsafe extern "C
     nal_unit_header_length_out: *mut i32,
 ) -> OSStatus;
 
-pub type FnCMSampleBufferGetFormatDescription = unsafe extern "C" fn(
-    sample_buffer: CMSampleBufferRef,
-) -> CMFormatDescriptionRef;
+pub type FnCMSampleBufferGetFormatDescription =
+    unsafe extern "C" fn(sample_buffer: CMSampleBufferRef) -> CMFormatDescriptionRef;
 
 // CoreVideo
 pub type FnCVPixelBufferCreateWithBytes = unsafe extern "C" fn(
@@ -335,11 +332,9 @@ pub type FnCVPixelBufferGetBytesPerRowOfPlane =
 pub type FnCVPixelBufferGetHeightOfPlane =
     unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef, plane_index: usize) -> usize;
 
-pub type FnCVPixelBufferGetWidth =
-    unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> usize;
+pub type FnCVPixelBufferGetWidth = unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> usize;
 
-pub type FnCVPixelBufferGetHeight =
-    unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> usize;
+pub type FnCVPixelBufferGetHeight = unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> usize;
 
 // CoreFoundation
 pub type FnCFDictionaryCreate = unsafe extern "C" fn(
@@ -357,11 +352,8 @@ pub type FnCFNumberCreate = unsafe extern "C" fn(
     value_ptr: *const c_void,
 ) -> CFNumberRef;
 
-pub type FnCFStringCreateWithCString = unsafe extern "C" fn(
-    alloc: CFAllocatorRef,
-    c_str: *const u8,
-    encoding: u32,
-) -> CFStringRef;
+pub type FnCFStringCreateWithCString =
+    unsafe extern "C" fn(alloc: CFAllocatorRef, c_str: *const u8, encoding: u32) -> CFStringRef;
 
 pub type FnCFRelease = unsafe extern "C" fn(cf: CFTypeRef);
 pub type FnCFRetain = unsafe extern "C" fn(cf: CFTypeRef) -> CFTypeRef;
@@ -440,7 +432,10 @@ static VTABLE: OnceLock<Result<Vtable, String>> = OnceLock::new();
 /// Get (or load) the fully-resolved vtable. Returns the cached `Err` if a
 /// previous load attempt failed.
 pub fn vtable() -> Result<&'static Vtable, &'static str> {
-    VTABLE.get_or_init(load_vtable).as_ref().map_err(|s| s.as_str())
+    VTABLE
+        .get_or_init(load_vtable)
+        .as_ref()
+        .map_err(|s| s.as_str())
 }
 
 /// Legacy `framework()` helper — kept for the smoke test in the `sys` module.
@@ -455,7 +450,10 @@ pub struct FrameworkSmoke {
 }
 
 pub fn framework() -> Result<&'static FrameworkSmoke, &'static str> {
-    FRAMEWORK.get_or_init(load_smoke).as_ref().map_err(|s| s.as_str())
+    FRAMEWORK
+        .get_or_init(load_smoke)
+        .as_ref()
+        .map_err(|s| s.as_str())
 }
 
 fn load_smoke() -> Result<FrameworkSmoke, String> {
@@ -463,7 +461,9 @@ fn load_smoke() -> Result<FrameworkSmoke, String> {
         video_toolbox: open("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox")?,
         core_video: open("/System/Library/Frameworks/CoreVideo.framework/CoreVideo")?,
         core_media: open("/System/Library/Frameworks/CoreMedia.framework/CoreMedia")?,
-        core_foundation: open("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")?,
+        core_foundation: open(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+        )?,
     })
 }
 
@@ -484,33 +484,133 @@ fn load_vtable() -> Result<Vtable, String> {
     }
 
     Ok(Vtable {
-        vt_decomp_create: sym!(vt, "VTDecompressionSessionCreate", FnVTDecompressionSessionCreate),
-        vt_decomp_decode: sym!(vt, "VTDecompressionSessionDecodeFrame", FnVTDecompressionSessionDecodeFrame),
-        vt_decomp_finish: sym!(vt, "VTDecompressionSessionFinishDelayedFrames", FnVTDecompressionSessionFinishDelayedFrames),
-        vt_decomp_invalidate: sym!(vt, "VTDecompressionSessionInvalidate", FnVTDecompressionSessionInvalidate),
-        vt_comp_create: sym!(vt, "VTCompressionSessionCreate", FnVTCompressionSessionCreate),
-        vt_comp_encode: sym!(vt, "VTCompressionSessionEncodeFrame", FnVTCompressionSessionEncodeFrame),
-        vt_comp_complete: sym!(vt, "VTCompressionSessionCompleteFrames", FnVTCompressionSessionCompleteFrames),
-        vt_comp_invalidate: sym!(vt, "VTCompressionSessionInvalidate", FnVTCompressionSessionInvalidate),
-        vt_comp_prepare: sym!(vt, "VTCompressionSessionPrepareToEncodeFrames", FnVTCompressionSessionPrepareToEncodeFrames),
+        vt_decomp_create: sym!(
+            vt,
+            "VTDecompressionSessionCreate",
+            FnVTDecompressionSessionCreate
+        ),
+        vt_decomp_decode: sym!(
+            vt,
+            "VTDecompressionSessionDecodeFrame",
+            FnVTDecompressionSessionDecodeFrame
+        ),
+        vt_decomp_finish: sym!(
+            vt,
+            "VTDecompressionSessionFinishDelayedFrames",
+            FnVTDecompressionSessionFinishDelayedFrames
+        ),
+        vt_decomp_invalidate: sym!(
+            vt,
+            "VTDecompressionSessionInvalidate",
+            FnVTDecompressionSessionInvalidate
+        ),
+        vt_comp_create: sym!(
+            vt,
+            "VTCompressionSessionCreate",
+            FnVTCompressionSessionCreate
+        ),
+        vt_comp_encode: sym!(
+            vt,
+            "VTCompressionSessionEncodeFrame",
+            FnVTCompressionSessionEncodeFrame
+        ),
+        vt_comp_complete: sym!(
+            vt,
+            "VTCompressionSessionCompleteFrames",
+            FnVTCompressionSessionCompleteFrames
+        ),
+        vt_comp_invalidate: sym!(
+            vt,
+            "VTCompressionSessionInvalidate",
+            FnVTCompressionSessionInvalidate
+        ),
+        vt_comp_prepare: sym!(
+            vt,
+            "VTCompressionSessionPrepareToEncodeFrames",
+            FnVTCompressionSessionPrepareToEncodeFrames
+        ),
         vt_session_set_property: sym!(vt, "VTSessionSetProperty", FnVTSessionSetProperty),
         cm_sample_create_ready: sym!(cm, "CMSampleBufferCreateReady", FnCMSampleBufferCreateReady),
-        cm_sample_get_data_buffer: sym!(cm, "CMSampleBufferGetDataBuffer", FnCMSampleBufferGetDataBuffer),
-        cm_block_copy_data: sym!(cm, "CMBlockBufferCopyDataBytes", FnCMBlockBufferCopyDataBytes),
-        cm_sample_get_image_buffer: sym!(cm, "CMSampleBufferGetImageBuffer", FnCMSampleBufferGetImageBuffer),
-        cm_block_create_with_mem: sym!(cm, "CMBlockBufferCreateWithMemoryBlock", FnCMBlockBufferCreateWithMemoryBlock),
-        cm_block_get_data_length: sym!(cm, "CMBlockBufferGetDataLength", FnCMBlockBufferGetDataLength),
-        cm_fmt_from_h264_params: sym!(cm, "CMVideoFormatDescriptionCreateFromH264ParameterSets", FnCMVideoFormatDescriptionCreateFromH264ParameterSets),
-        cm_fmt_from_hevc_params: sym!(cm, "CMVideoFormatDescriptionCreateFromHEVCParameterSets", FnCMVideoFormatDescriptionCreateFromHEVCParameterSets),
-        cm_fmt_h264_param_at_idx: sym!(cm, "CMVideoFormatDescriptionGetH264ParameterSetAtIndex", FnCMVideoFormatDescriptionGetH264ParameterSetAtIndex),
-        cm_fmt_hevc_param_at_idx: sym!(cm, "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex", FnCMVideoFormatDescriptionGetHEVCParameterSetAtIndex),
-        cm_sample_get_format_desc: sym!(cm, "CMSampleBufferGetFormatDescription", FnCMSampleBufferGetFormatDescription),
-        cv_pb_create_planar: sym!(cv, "CVPixelBufferCreateWithPlanarBytes", FnCVPixelBufferCreateWithPlanarBytes),
-        cv_pb_lock: sym!(cv, "CVPixelBufferLockBaseAddress", FnCVPixelBufferLockBaseAddress),
-        cv_pb_unlock: sym!(cv, "CVPixelBufferUnlockBaseAddress", FnCVPixelBufferUnlockBaseAddress),
-        cv_pb_get_base_of_plane: sym!(cv, "CVPixelBufferGetBaseAddressOfPlane", FnCVPixelBufferGetBaseAddressOfPlane),
-        cv_pb_get_bpr_of_plane: sym!(cv, "CVPixelBufferGetBytesPerRowOfPlane", FnCVPixelBufferGetBytesPerRowOfPlane),
-        cv_pb_get_height_of_plane: sym!(cv, "CVPixelBufferGetHeightOfPlane", FnCVPixelBufferGetHeightOfPlane),
+        cm_sample_get_data_buffer: sym!(
+            cm,
+            "CMSampleBufferGetDataBuffer",
+            FnCMSampleBufferGetDataBuffer
+        ),
+        cm_block_copy_data: sym!(
+            cm,
+            "CMBlockBufferCopyDataBytes",
+            FnCMBlockBufferCopyDataBytes
+        ),
+        cm_sample_get_image_buffer: sym!(
+            cm,
+            "CMSampleBufferGetImageBuffer",
+            FnCMSampleBufferGetImageBuffer
+        ),
+        cm_block_create_with_mem: sym!(
+            cm,
+            "CMBlockBufferCreateWithMemoryBlock",
+            FnCMBlockBufferCreateWithMemoryBlock
+        ),
+        cm_block_get_data_length: sym!(
+            cm,
+            "CMBlockBufferGetDataLength",
+            FnCMBlockBufferGetDataLength
+        ),
+        cm_fmt_from_h264_params: sym!(
+            cm,
+            "CMVideoFormatDescriptionCreateFromH264ParameterSets",
+            FnCMVideoFormatDescriptionCreateFromH264ParameterSets
+        ),
+        cm_fmt_from_hevc_params: sym!(
+            cm,
+            "CMVideoFormatDescriptionCreateFromHEVCParameterSets",
+            FnCMVideoFormatDescriptionCreateFromHEVCParameterSets
+        ),
+        cm_fmt_h264_param_at_idx: sym!(
+            cm,
+            "CMVideoFormatDescriptionGetH264ParameterSetAtIndex",
+            FnCMVideoFormatDescriptionGetH264ParameterSetAtIndex
+        ),
+        cm_fmt_hevc_param_at_idx: sym!(
+            cm,
+            "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex",
+            FnCMVideoFormatDescriptionGetHEVCParameterSetAtIndex
+        ),
+        cm_sample_get_format_desc: sym!(
+            cm,
+            "CMSampleBufferGetFormatDescription",
+            FnCMSampleBufferGetFormatDescription
+        ),
+        cv_pb_create_planar: sym!(
+            cv,
+            "CVPixelBufferCreateWithPlanarBytes",
+            FnCVPixelBufferCreateWithPlanarBytes
+        ),
+        cv_pb_lock: sym!(
+            cv,
+            "CVPixelBufferLockBaseAddress",
+            FnCVPixelBufferLockBaseAddress
+        ),
+        cv_pb_unlock: sym!(
+            cv,
+            "CVPixelBufferUnlockBaseAddress",
+            FnCVPixelBufferUnlockBaseAddress
+        ),
+        cv_pb_get_base_of_plane: sym!(
+            cv,
+            "CVPixelBufferGetBaseAddressOfPlane",
+            FnCVPixelBufferGetBaseAddressOfPlane
+        ),
+        cv_pb_get_bpr_of_plane: sym!(
+            cv,
+            "CVPixelBufferGetBytesPerRowOfPlane",
+            FnCVPixelBufferGetBytesPerRowOfPlane
+        ),
+        cv_pb_get_height_of_plane: sym!(
+            cv,
+            "CVPixelBufferGetHeightOfPlane",
+            FnCVPixelBufferGetHeightOfPlane
+        ),
         cv_pb_get_width: sym!(cv, "CVPixelBufferGetWidth", FnCVPixelBufferGetWidth),
         cv_pb_get_height: sym!(cv, "CVPixelBufferGetHeight", FnCVPixelBufferGetHeight),
         cf_dict_create: sym!(cf, "CFDictionaryCreate", FnCFDictionaryCreate),
@@ -539,7 +639,13 @@ fn open(path: &str) -> Result<Library, String> {
 /// Caller must call `cf_release` on the returned value when done.
 pub unsafe fn cf_string(vt: &Vtable, s: &str) -> CFStringRef {
     let cstr = std::ffi::CString::new(s).unwrap();
-    unsafe { (vt.cf_string_create)(std::ptr::null_mut(), cstr.as_ptr() as *const u8, K_CF_STRING_ENCODING_UTF8) }
+    unsafe {
+        (vt.cf_string_create)(
+            std::ptr::null_mut(),
+            cstr.as_ptr() as *const u8,
+            K_CF_STRING_ENCODING_UTF8,
+        )
+    }
 }
 
 /// Create a CFNumber (i32) via the vtable.
@@ -547,7 +653,13 @@ pub unsafe fn cf_string(vt: &Vtable, s: &str) -> CFStringRef {
 /// # Safety
 /// Caller must call `cf_release` on the returned value when done.
 pub unsafe fn cf_number_i32(vt: &Vtable, v: i32) -> CFNumberRef {
-    unsafe { (vt.cf_number_create)(std::ptr::null_mut(), K_CF_NUMBER_SI_NT32_TYPE, &v as *const i32 as *const _) }
+    unsafe {
+        (vt.cf_number_create)(
+            std::ptr::null_mut(),
+            K_CF_NUMBER_SI_NT32_TYPE,
+            &v as *const i32 as *const _,
+        )
+    }
 }
 
 /// Create an empty CFDictionary (no entries) via the vtable.

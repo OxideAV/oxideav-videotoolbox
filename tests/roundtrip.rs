@@ -39,9 +39,18 @@ fn synthetic_frame(width: usize, height: usize, frame_idx: u8, pts: i64) -> Vide
     VideoFrame {
         pts: Some(pts),
         planes: vec![
-            VideoPlane { stride: width, data: y },
-            VideoPlane { stride: chroma_w, data: u },
-            VideoPlane { stride: chroma_w, data: v },
+            VideoPlane {
+                stride: width,
+                data: y,
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: u,
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: v,
+            },
         ],
     }
 }
@@ -104,10 +113,8 @@ fn run_roundtrip(codec: &str) {
     };
 
     let mut encoder: Box<dyn Encoder> = match codec {
-        "h264" => vt_encoder::make_h264_encoder(&enc_params)
-            .expect("H264VtEncoder construction"),
-        "hevc" => vt_encoder::make_hevc_encoder(&enc_params)
-            .expect("HevcVtEncoder construction"),
+        "h264" => vt_encoder::make_h264_encoder(&enc_params).expect("H264VtEncoder construction"),
+        "hevc" => vt_encoder::make_hevc_encoder(&enc_params).expect("HevcVtEncoder construction"),
         _ => panic!("unknown codec {codec}"),
     };
 
@@ -117,7 +124,9 @@ fn run_roundtrip(codec: &str) {
     for i in 0..n_frames {
         let frame = synthetic_frame(width, height, i as u8, (i as i64) * 33_333);
         source_frames.push(frame.clone());
-        encoder.send_frame(&Frame::Video(frame)).expect("send_frame");
+        encoder
+            .send_frame(&Frame::Video(frame))
+            .expect("send_frame");
         loop {
             match encoder.receive_packet() {
                 Ok(pkt) => encoded_packets.push(pkt),
@@ -151,10 +160,8 @@ fn run_roundtrip(codec: &str) {
     };
 
     let mut decoder: Box<dyn Decoder> = match codec {
-        "h264" => vt_decoder::H264VtDecoder::make(&dec_params)
-            .expect("H264VtDecoder construction"),
-        "hevc" => vt_decoder::HevcVtDecoder::make(&dec_params)
-            .expect("HevcVtDecoder construction"),
+        "h264" => vt_decoder::H264VtDecoder::make(&dec_params).expect("H264VtDecoder construction"),
+        "hevc" => vt_decoder::HevcVtDecoder::make(&dec_params).expect("HevcVtDecoder construction"),
         _ => panic!("unknown codec"),
     };
 

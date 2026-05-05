@@ -17,11 +17,13 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane};
+use oxideav_core::{
+    CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
+};
 
 use crate::sys::{
-    self, CMSampleTimingInfo, CMTime, VTDecompressionOutputCallbackRecord,
-    K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY, K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE,
+    self, CMSampleTimingInfo, CMTime, K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE,
+    VTDecompressionOutputCallbackRecord, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY,
     K_OS_STATUS_NO_ERROR,
 };
 
@@ -179,12 +181,15 @@ unsafe extern "C" fn decomp_callback(
     if !uv_ptr.is_null() {
         for row in 0..uv_height.min(chroma_h) {
             let row_len = (chroma_w * 2).min(uv_stride);
-            let src =
-                unsafe { std::slice::from_raw_parts(uv_ptr.add(row * uv_stride), row_len) };
+            let src = unsafe { std::slice::from_raw_parts(uv_ptr.add(row * uv_stride), row_len) };
             let dst = row * chroma_w;
             for col in 0..chroma_w {
                 u_data[dst + col] = if col * 2 < row_len { src[col * 2] } else { 128 };
-                v_data[dst + col] = if col * 2 + 1 < row_len { src[col * 2 + 1] } else { 128 };
+                v_data[dst + col] = if col * 2 + 1 < row_len {
+                    src[col * 2 + 1]
+                } else {
+                    128
+                };
             }
         }
     }
@@ -194,9 +199,18 @@ unsafe extern "C" fn decomp_callback(
     guard.frames.push_back(VideoFrame {
         pts: None,
         planes: vec![
-            VideoPlane { stride: width, data: y_data },
-            VideoPlane { stride: chroma_w, data: u_data },
-            VideoPlane { stride: chroma_w, data: v_data },
+            VideoPlane {
+                stride: width,
+                data: y_data,
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: u_data,
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: v_data,
+            },
         ],
     });
 }
@@ -253,7 +267,9 @@ fn create_vt_session(
     unsafe { (vt.cf_release)(pf_key) };
 
     if status != K_OS_STATUS_NO_ERROR {
-        Err(Error::other(format!("VTDecompressionSessionCreate: OSStatus {status}")))
+        Err(Error::other(format!(
+            "VTDecompressionSessionCreate: OSStatus {status}"
+        )))
     } else {
         Ok(session)
     }
@@ -329,7 +345,9 @@ fn submit_nal_units(
     if status != K_OS_STATUS_NO_ERROR {
         // Free our copy since CF won't.
         unsafe { libc_free(data_copy) };
-        return Err(Error::other(format!("CMBlockBufferCreateWithMemoryBlock: {status}")));
+        return Err(Error::other(format!(
+            "CMBlockBufferCreateWithMemoryBlock: {status}"
+        )));
     }
 
     let timing = CMSampleTimingInfo {
@@ -439,10 +457,18 @@ impl H264VtDecoder {
 
         let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
 
-        let param_ptrs: Vec<*const u8> =
-            self.sps_list.iter().chain(self.pps_list.iter()).map(|v| v.as_ptr()).collect();
-        let param_sizes: Vec<usize> =
-            self.sps_list.iter().chain(self.pps_list.iter()).map(|v| v.len()).collect();
+        let param_ptrs: Vec<*const u8> = self
+            .sps_list
+            .iter()
+            .chain(self.pps_list.iter())
+            .map(|v| v.as_ptr())
+            .collect();
+        let param_sizes: Vec<usize> = self
+            .sps_list
+            .iter()
+            .chain(self.pps_list.iter())
+            .map(|v| v.len())
+            .collect();
 
         let mut fmt_desc: sys::CMVideoFormatDescriptionRef = std::ptr::null_mut();
         let st = unsafe {
@@ -542,8 +568,7 @@ impl oxideav_core::Decoder for H264VtDecoder {
         }
 
         if !vcl_nals.is_empty() && !self.session.is_null() {
-            let vt = sys::vtable()
-                .map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
+            let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
             let pts = packet.pts;
             let ctr = self.pts_counter;
             submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, pts, ctr)?;
@@ -559,7 +584,11 @@ impl oxideav_core::Decoder for H264VtDecoder {
         if let Some(f) = self.output_queue.pop_front() {
             return Ok(Frame::Video(f));
         }
-        Err(if self.flushed { Error::Eof } else { Error::NeedMore })
+        Err(if self.flushed {
+            Error::Eof
+        } else {
+            Error::NeedMore
+        })
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -734,8 +763,7 @@ impl oxideav_core::Decoder for HevcVtDecoder {
         }
 
         if !vcl_nals.is_empty() && !self.session.is_null() {
-            let vt = sys::vtable()
-                .map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
+            let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
             let pts = packet.pts;
             let ctr = self.pts_counter;
             submit_nal_units(vt, self.session, self.fmt_desc, &vcl_nals, pts, ctr)?;
@@ -751,7 +779,11 @@ impl oxideav_core::Decoder for HevcVtDecoder {
         if let Some(f) = self.output_queue.pop_front() {
             return Ok(Frame::Video(f));
         }
-        Err(if self.flushed { Error::Eof } else { Error::NeedMore })
+        Err(if self.flushed {
+            Error::Eof
+        } else {
+            Error::NeedMore
+        })
     }
 
     fn flush(&mut self) -> Result<()> {

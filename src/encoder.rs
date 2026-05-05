@@ -17,9 +17,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase,
-};
+use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase};
 
 use crate::sys::{self, CMTime, K_OS_STATUS_NO_ERROR};
 
@@ -63,7 +61,6 @@ impl EncCallbackState {
     }
 }
 
-
 /// Extract H.264 parameter sets (SPS + PPS) from a CMVideoFormatDescription
 /// and return them as Annex-B bytes (start code + raw NAL).
 unsafe fn extract_h264_param_sets(
@@ -77,13 +74,27 @@ unsafe fn extract_h264_param_sets(
     let mut _size: usize = 0;
     let mut _nal_len: i32 = 0;
     unsafe {
-        (vt.cm_fmt_h264_param_at_idx)(fmt_desc, 0, &mut _ptr, &mut _size, &mut count, &mut _nal_len);
+        (vt.cm_fmt_h264_param_at_idx)(
+            fmt_desc,
+            0,
+            &mut _ptr,
+            &mut _size,
+            &mut count,
+            &mut _nal_len,
+        );
     }
     for i in 0..count {
         let mut ptr: *const u8 = std::ptr::null();
         let mut size: usize = 0;
         let st = unsafe {
-            (vt.cm_fmt_h264_param_at_idx)(fmt_desc, i, &mut ptr, &mut size, &mut std::mem::zeroed(), &mut std::mem::zeroed())
+            (vt.cm_fmt_h264_param_at_idx)(
+                fmt_desc,
+                i,
+                &mut ptr,
+                &mut size,
+                &mut std::mem::zeroed(),
+                &mut std::mem::zeroed(),
+            )
         };
         if st == 0 && !ptr.is_null() && size > 0 {
             out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
@@ -104,13 +115,27 @@ unsafe fn extract_hevc_param_sets(
     let mut _size: usize = 0;
     let mut _nal_len: i32 = 0;
     unsafe {
-        (vt.cm_fmt_hevc_param_at_idx)(fmt_desc, 0, &mut _ptr, &mut _size, &mut count, &mut _nal_len);
+        (vt.cm_fmt_hevc_param_at_idx)(
+            fmt_desc,
+            0,
+            &mut _ptr,
+            &mut _size,
+            &mut count,
+            &mut _nal_len,
+        );
     }
     for i in 0..count {
         let mut ptr: *const u8 = std::ptr::null();
         let mut size: usize = 0;
         let st = unsafe {
-            (vt.cm_fmt_hevc_param_at_idx)(fmt_desc, i, &mut ptr, &mut size, &mut std::mem::zeroed(), &mut std::mem::zeroed())
+            (vt.cm_fmt_hevc_param_at_idx)(
+                fmt_desc,
+                i,
+                &mut ptr,
+                &mut size,
+                &mut std::mem::zeroed(),
+                &mut std::mem::zeroed(),
+            )
         };
         if st == 0 && !ptr.is_null() && size > 0 {
             out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
@@ -270,11 +295,23 @@ unsafe impl Send for VtEncoder {}
 
 impl VtEncoder {
     pub fn new_h264(params: &CodecParameters) -> Result<Box<dyn oxideav_core::Encoder>> {
-        Self::create("h264", K_CM_VIDEO_CODEC_TYPE_H264, K_VT_H264_BASELINE, false, params)
+        Self::create(
+            "h264",
+            K_CM_VIDEO_CODEC_TYPE_H264,
+            K_VT_H264_BASELINE,
+            false,
+            params,
+        )
     }
 
     pub fn new_hevc(params: &CodecParameters) -> Result<Box<dyn oxideav_core::Encoder>> {
-        Self::create("hevc", K_CM_VIDEO_CODEC_TYPE_HEVC, K_VT_HEVC_MAIN, true, params)
+        Self::create(
+            "hevc",
+            K_CM_VIDEO_CODEC_TYPE_HEVC,
+            K_VT_HEVC_MAIN,
+            true,
+            params,
+        )
     }
 
     fn create(
@@ -454,7 +491,10 @@ impl VtEncoder {
         });
         let boxes_raw = Box::into_raw(boxes) as *mut c_void;
 
-        unsafe extern "C" fn release_planes(_release_ref_con: *mut c_void, data_ptr: *const c_void) {
+        unsafe extern "C" fn release_planes(
+            _release_ref_con: *mut c_void,
+            data_ptr: *const c_void,
+        ) {
             // data_ptr is the opaque context we passed; we passed boxes_raw as release_ref_con.
             let _ = data_ptr;
         }
@@ -550,9 +590,8 @@ impl oxideav_core::Encoder for VtEncoder {
         }
 
         // Force synchronous completion.
-        let complete_status = unsafe {
-            (vt.vt_comp_complete)(self.session, CMTime::make(i64::MAX, 1))
-        };
+        let complete_status =
+            unsafe { (vt.vt_comp_complete)(self.session, CMTime::make(i64::MAX, 1)) };
         if complete_status != K_OS_STATUS_NO_ERROR {
             return Err(Error::other(format!(
                 "VTCompressionSessionCompleteFrames: {complete_status}"
@@ -560,7 +599,10 @@ impl oxideav_core::Encoder for VtEncoder {
         }
 
         // Drain newly produced packets.
-        let mut guard = self.state.lock().map_err(|_| Error::other("lock poisoned"))?;
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| Error::other("lock poisoned"))?;
         if let Some(ref e) = guard.error {
             return Err(Error::other(e.clone()));
         }
@@ -584,15 +626,16 @@ impl oxideav_core::Encoder for VtEncoder {
             return Ok(());
         }
         let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
-        let status = unsafe {
-            (vt.vt_comp_complete)(self.session, CMTime::make(i64::MAX, 1))
-        };
+        let status = unsafe { (vt.vt_comp_complete)(self.session, CMTime::make(i64::MAX, 1)) };
         if status != K_OS_STATUS_NO_ERROR {
             return Err(Error::other(format!(
                 "VTCompressionSessionCompleteFrames (flush): {status}"
             )));
         }
-        let mut guard = self.state.lock().map_err(|_| Error::other("lock poisoned"))?;
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| Error::other("lock poisoned"))?;
         while let Some(data) = guard.packets.pop_front() {
             let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data);
             self.output_queue.push_back(pkt);
