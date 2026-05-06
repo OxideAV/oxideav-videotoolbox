@@ -22,8 +22,8 @@ use oxideav_videotoolbox::{decoder as vt_decoder, encoder as vt_encoder};
 
 /// Generate a synthetic I420 frame with a smooth luma ramp and flat chroma.
 fn synthetic_frame(width: usize, height: usize, frame_idx: u8, pts: i64) -> VideoFrame {
-    let chroma_w = (width + 1) / 2;
-    let chroma_h = (height + 1) / 2;
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
 
     let mut y = vec![0u8; width * height];
     let u = vec![128u8; chroma_w * chroma_h];
