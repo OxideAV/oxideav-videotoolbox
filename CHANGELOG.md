@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.1...v0.0.2) - 2026-05-06
+
+### Fixed
+
+- apply cargo fmt (rustfmt CI check was failing)
+
+### Other
+
+- use `usize::div_ceil` for chroma subsampling
+- drop dead `linkme` dep
+- clarify load-vs-init fallback + document require_hardware opt-out
+- round 2: real H.264 + HEVC decode + encode via VideoToolbox
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+
 ### Added
 
 - **Round 2: real H.264 + HEVC decode + encode** via
