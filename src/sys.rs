@@ -245,6 +245,15 @@ pub type FnCMBlockBufferCreateWithMemoryBlock = unsafe extern "C" fn(
 
 pub type FnCMBlockBufferGetDataLength = unsafe extern "C" fn(the_buffer: CMBlockBufferRef) -> usize;
 
+pub type FnCMVideoFormatDescriptionCreate = unsafe extern "C" fn(
+    allocator: CFAllocatorRef,
+    codec_type: u32,
+    width: i32,
+    height: i32,
+    extensions: CFDictionaryRef,
+    format_description_out: *mut CMVideoFormatDescriptionRef,
+) -> OSStatus;
+
 pub type FnCMVideoFormatDescriptionCreateFromH264ParameterSets = unsafe extern "C" fn(
     allocator: CFAllocatorRef,
     parameter_set_count: usize,
@@ -336,6 +345,20 @@ pub type FnCVPixelBufferGetWidth = unsafe extern "C" fn(pixel_buffer: CVPixelBuf
 
 pub type FnCVPixelBufferGetHeight = unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> usize;
 
+pub type FnCVPixelBufferGetPixelFormatType =
+    unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> u32;
+
+pub type FnCVPixelBufferGetPlaneCount =
+    unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> usize;
+
+pub type FnCVPixelBufferIsPlanar = unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> u8;
+
+pub type FnCVPixelBufferGetBaseAddress =
+    unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> *mut c_void;
+
+pub type FnCVPixelBufferGetBytesPerRow =
+    unsafe extern "C" fn(pixel_buffer: CVPixelBufferRef) -> usize;
+
 // CoreFoundation
 pub type FnCFDictionaryCreate = unsafe extern "C" fn(
     allocator: CFAllocatorRef,
@@ -397,6 +420,7 @@ pub struct Vtable {
     pub cm_sample_get_image_buffer: FnCMSampleBufferGetImageBuffer,
     pub cm_block_create_with_mem: FnCMBlockBufferCreateWithMemoryBlock,
     pub cm_block_get_data_length: FnCMBlockBufferGetDataLength,
+    pub cm_video_fmt_create: FnCMVideoFormatDescriptionCreate,
     pub cm_fmt_from_h264_params: FnCMVideoFormatDescriptionCreateFromH264ParameterSets,
     pub cm_fmt_from_hevc_params: FnCMVideoFormatDescriptionCreateFromHEVCParameterSets,
     pub cm_fmt_h264_param_at_idx: FnCMVideoFormatDescriptionGetH264ParameterSetAtIndex,
@@ -411,6 +435,11 @@ pub struct Vtable {
     pub cv_pb_get_height_of_plane: FnCVPixelBufferGetHeightOfPlane,
     pub cv_pb_get_width: FnCVPixelBufferGetWidth,
     pub cv_pb_get_height: FnCVPixelBufferGetHeight,
+    pub cv_pb_get_pixel_format: FnCVPixelBufferGetPixelFormatType,
+    pub cv_pb_get_plane_count: FnCVPixelBufferGetPlaneCount,
+    pub cv_pb_is_planar: FnCVPixelBufferIsPlanar,
+    pub cv_pb_get_base: FnCVPixelBufferGetBaseAddress,
+    pub cv_pb_get_bpr: FnCVPixelBufferGetBytesPerRow,
     // CF
     pub cf_dict_create: FnCFDictionaryCreate,
     pub cf_number_create: FnCFNumberCreate,
@@ -556,6 +585,11 @@ fn load_vtable() -> Result<Vtable, String> {
             "CMBlockBufferGetDataLength",
             FnCMBlockBufferGetDataLength
         ),
+        cm_video_fmt_create: sym!(
+            cm,
+            "CMVideoFormatDescriptionCreate",
+            FnCMVideoFormatDescriptionCreate
+        ),
         cm_fmt_from_h264_params: sym!(
             cm,
             "CMVideoFormatDescriptionCreateFromH264ParameterSets",
@@ -613,6 +647,27 @@ fn load_vtable() -> Result<Vtable, String> {
         ),
         cv_pb_get_width: sym!(cv, "CVPixelBufferGetWidth", FnCVPixelBufferGetWidth),
         cv_pb_get_height: sym!(cv, "CVPixelBufferGetHeight", FnCVPixelBufferGetHeight),
+        cv_pb_get_pixel_format: sym!(
+            cv,
+            "CVPixelBufferGetPixelFormatType",
+            FnCVPixelBufferGetPixelFormatType
+        ),
+        cv_pb_get_plane_count: sym!(
+            cv,
+            "CVPixelBufferGetPlaneCount",
+            FnCVPixelBufferGetPlaneCount
+        ),
+        cv_pb_is_planar: sym!(cv, "CVPixelBufferIsPlanar", FnCVPixelBufferIsPlanar),
+        cv_pb_get_base: sym!(
+            cv,
+            "CVPixelBufferGetBaseAddress",
+            FnCVPixelBufferGetBaseAddress
+        ),
+        cv_pb_get_bpr: sym!(
+            cv,
+            "CVPixelBufferGetBytesPerRow",
+            FnCVPixelBufferGetBytesPerRow
+        ),
         cf_dict_create: sym!(cf, "CFDictionaryCreate", FnCFDictionaryCreate),
         cf_number_create: sym!(cf, "CFNumberCreate", FnCFNumberCreate),
         cf_string_create: sym!(cf, "CFStringCreateWithCString", FnCFStringCreateWithCString),

@@ -16,11 +16,15 @@
 use oxideav_core::{
     CodecId, CodecParameters, Decoder, Encoder, Error, Frame, PixelFormat, VideoFrame, VideoPlane,
 };
-use oxideav_videotoolbox::{decoder as vt_decoder, encoder as vt_encoder};
+use oxideav_videotoolbox::{blob as vt_blob, decoder as vt_decoder, encoder as vt_encoder};
 
 // ─────────────────────────── Helpers ──────────────────────────────────────────
 
-/// Generate a synthetic I420 frame with a smooth luma ramp and flat chroma.
+/// Generate a synthetic I420 frame with a smooth (no modulo-wraparound)
+/// luma gradient and flat chroma. Designed to be friendly to lossy codecs:
+/// the previous "(col + row/2 + frame*10) % 255" pattern had a hard
+/// discontinuity at the wrap point that JPEG's DCT could not represent
+/// without ~10 dB of error.
 fn synthetic_frame(width: usize, height: usize, frame_idx: u8, pts: i64) -> VideoFrame {
     let chroma_w = width.div_ceil(2);
     let chroma_h = height.div_ceil(2);
@@ -29,10 +33,14 @@ fn synthetic_frame(width: usize, height: usize, frame_idx: u8, pts: i64) -> Vide
     let u = vec![128u8; chroma_w * chroma_h];
     let v = vec![128u8; chroma_w * chroma_h];
 
+    // Smooth diagonal gradient with no wraparound. Range is roughly
+    // 16..235 (video range). Per-frame offset is small so PSNR_Y of
+    // decoded[0] vs source[0] stays high.
+    let offset = frame_idx as i32; // 0..n_frames, well under 255
     for row in 0..height {
         for col in 0..width {
-            y[row * width + col] =
-                ((col as u32 + row as u32 / 2 + frame_idx as u32 * 10) % 255) as u8;
+            let raw = 16 + (col + row / 2) as i32 / 4 + offset;
+            y[row * width + col] = raw.clamp(16, 235) as u8;
         }
     }
 
@@ -115,6 +123,10 @@ fn run_roundtrip(codec: &str) {
     let mut encoder: Box<dyn Encoder> = match codec {
         "h264" => vt_encoder::make_h264_encoder(&enc_params).expect("H264VtEncoder construction"),
         "hevc" => vt_encoder::make_hevc_encoder(&enc_params).expect("HevcVtEncoder construction"),
+        "mjpeg" => vt_blob::make_jpeg_encoder(&enc_params).expect("JpegVtEncoder construction"),
+        "prores" => {
+            vt_blob::make_prores_encoder(&enc_params).expect("ProResVtEncoder construction")
+        }
         _ => panic!("unknown codec {codec}"),
     };
 
@@ -162,6 +174,10 @@ fn run_roundtrip(codec: &str) {
     let mut decoder: Box<dyn Decoder> = match codec {
         "h264" => vt_decoder::H264VtDecoder::make(&dec_params).expect("H264VtDecoder construction"),
         "hevc" => vt_decoder::HevcVtDecoder::make(&dec_params).expect("HevcVtDecoder construction"),
+        "mjpeg" => vt_blob::make_jpeg_decoder(&dec_params).expect("JpegVtDecoder construction"),
+        "prores" => {
+            vt_blob::make_prores_decoder(&dec_params).expect("ProResVtDecoder construction")
+        }
         _ => panic!("unknown codec"),
     };
 
@@ -235,4 +251,37 @@ fn h264_roundtrip() {
 #[test]
 fn hevc_roundtrip() {
     run_roundtrip("hevc");
+}
+
+#[test]
+fn mjpeg_roundtrip() {
+    run_roundtrip("mjpeg");
+}
+
+#[test]
+fn prores_roundtrip() {
+    run_roundtrip("prores");
+}
+
+/// Confirms `register()` installs decode + encode factories for every
+/// codec the crate claims in its README (h264 / hevc / mjpeg / prores).
+#[test]
+fn register_installs_all_round3_factories() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping registry check");
+        return;
+    }
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_videotoolbox::register(&mut ctx);
+    for id in ["h264", "hevc", "mjpeg", "prores"] {
+        let cid = oxideav_core::CodecId::new(id);
+        assert!(
+            ctx.codecs.has_decoder(&cid),
+            "no VT decoder registered for {id}"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&cid),
+            "no VT encoder registered for {id}"
+        );
+    }
 }

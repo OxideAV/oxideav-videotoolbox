@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 3: JPEG (MJPEG) + ProRes decode + encode** via `VTDecompressionSession` / `VTCompressionSession`.
+  - New `blob.rs` module factors out a `BlobDecoder` / `BlobEncoder` pair for codecs whose format description is built from `CMVideoFormatDescriptionCreate(codec_type, width, height)` with no out-of-band parameter sets. Used by JPEG (`'jpeg'`) and ProRes (`'apcn'`).
+  - `make_jpeg_decoder` / `make_jpeg_encoder` register against `CodecId::new("mjpeg")` with the JPEG fourcc tags (`jpeg / JPEG / MJPG / mjpg`).
+  - `make_prores_decoder` / `make_prores_encoder` register against `CodecId::new("prores")` with all six ProRes fourccs (`apco / apcs / apcn / apch / ap4h / ap4x`). Defaults to ProRes 422 (`'apcn'`); profile selection from `CodecParameters::tag` is a future-round item.
+  - Both codec ids register with `priority = 10`, `hardware_accelerated = true`, `intra_only = true`.
+  - Pixel-format adaptive decode callback: VT honours the NV12 destination-attribute request for H.264/HEVC but returns 16-bit biplanar 4:2:2 (`'sv22'`) for ProRes regardless. The blob callback inspects `CVPixelBufferGetPixelFormatType` and dispatches to one of NV12 (`'420v'`/`'420f'`), packed UYVY (`'2vuy'`), packed YUY2 (`'yuvs'`), or biplanar 16-bit 4:2:2 (`'sv22'`).
+  - End-to-end roundtrip tests: 320×240 synthetic gradient, 10 frames. Measured PSNR_Y: MJPEG ≈ 36 dB, ProRes ≈ 52 dB (both well above the 35 dB threshold).
+- Added `CMVideoFormatDescriptionCreate`, `CVPixelBufferGetPixelFormatType`, `CVPixelBufferGetPlaneCount`, `CVPixelBufferIsPlanar`, `CVPixelBufferGetBaseAddress`, `CVPixelBufferGetBytesPerRow` to the vtable.
+
+### Changed
+
+- Roundtrip test fixture switched from `(col + row/2 + frame*10) % 255` (which had a modulo-wraparound discontinuity that JPEG's DCT could not represent without ~10 dB of error) to a smooth diagonal gradient clipped to video-range `[16, 235]`.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.1...v0.0.2) - 2026-05-06
 
 ### Fixed

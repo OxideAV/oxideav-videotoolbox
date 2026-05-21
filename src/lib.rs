@@ -34,6 +34,8 @@
 pub mod sys;
 
 #[cfg(feature = "registry")]
+pub mod blob;
+#[cfg(feature = "registry")]
 pub mod decoder;
 #[cfg(feature = "registry")]
 pub mod encoder;
@@ -124,7 +126,61 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
             .encoder(encoder::make_hevc_encoder),
     );
 
-    let _ = (h264_caps, hevc_caps); // suppress unused warnings
+    // ── JPEG decoder ───────────────────────────────────────────────────────
+    let jpeg_caps = CodecCapabilities::video("mjpeg_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(true)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("mjpeg"))
+            .capabilities(jpeg_caps.clone().with_decode())
+            .decoder(blob::make_jpeg_decoder)
+            .tags([
+                CodecTag::fourcc(b"jpeg"),
+                CodecTag::fourcc(b"JPEG"),
+                CodecTag::fourcc(b"MJPG"),
+                CodecTag::fourcc(b"mjpg"),
+            ]),
+    );
+
+    // ── JPEG encoder ───────────────────────────────────────────────────────
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("mjpeg"))
+            .capabilities(jpeg_caps.clone().with_encode())
+            .encoder(blob::make_jpeg_encoder),
+    );
+
+    // ── ProRes decoder ─────────────────────────────────────────────────────
+    let prores_caps = CodecCapabilities::video("prores_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(true)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("prores"))
+            .capabilities(prores_caps.clone().with_decode())
+            .decoder(blob::make_prores_decoder)
+            .tags([
+                CodecTag::fourcc(b"apco"),
+                CodecTag::fourcc(b"apcs"),
+                CodecTag::fourcc(b"apcn"),
+                CodecTag::fourcc(b"apch"),
+                CodecTag::fourcc(b"ap4h"),
+                CodecTag::fourcc(b"ap4x"),
+            ]),
+    );
+
+    // ── ProRes encoder ─────────────────────────────────────────────────────
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("prores"))
+            .capabilities(prores_caps.clone().with_encode())
+            .encoder(blob::make_prores_encoder),
+    );
+
+    let _ = (h264_caps, hevc_caps, jpeg_caps, prores_caps); // suppress unused warnings
 }
 
 #[cfg(feature = "registry")]
