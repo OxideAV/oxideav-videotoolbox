@@ -110,8 +110,9 @@ unsafe extern "C" fn dec_callback(
 
 /// Convert a `CVPixelBuffer` (in one of several supported pixel formats)
 /// into a planar I420 `VideoFrame`. Handles 8-bit biplanar NV12 (`'420v'`,
-/// `'420f'`) and 8-bit packed 4:2:2 (`'2vuy'` UYVY, `'yuvs'` YUYV).
-/// Returns an error string for unsupported formats; the caller logs it.
+/// `'420f'`), 8-bit packed 4:2:2 (`'2vuy'` UYVY, `'yuvs'` YUY2), and 16-bit
+/// 4:2:2 (`'sv22'` biplanar, `'v216'` packed). Returns an error string for
+/// unsupported formats; the caller logs it.
 fn decode_pixel_buffer(
     vt: &sys::Vtable,
     image_buffer: sys::CVImageBufferRef,
@@ -164,9 +165,106 @@ fn decode_pixel_buffer(
             chroma_w,
             chroma_h,
         )),
+        // 'v216' (kCVPixelFormatType_422YpCbCr16): packed 4:2:2 with
+        // each component as little-endian 16-bit. Sample order per
+        // 2-pixel block: Cb0 Y0 Cr0 Y1 (8 bytes). ProRes 422 decodes to
+        // this on the Apple-hosted macos-latest x86_64 runner.
+        0x76323136 => Ok(decode_v216_to_i420(
+            vt,
+            image_buffer,
+            width,
+            height,
+            chroma_w,
+            chroma_h,
+        )),
         other => Err(format!(
             "unsupported CVPixelBuffer format 0x{other:08x} (decoded {width}x{height})"
         )),
+    }
+}
+
+/// Convert packed `'v216'` (Component Y'CbCr 16-bit 4:2:2, packed
+/// `[Cb0 Y0 Cr0 Y1]` little-endian per 2-pixel block) into planar I420.
+/// Container holds a 10..16-bit value left-justified; we take the high
+/// byte as an 8-bit video-range proxy.
+fn decode_v216_to_i420(
+    vt: &sys::Vtable,
+    image_buffer: sys::CVImageBufferRef,
+    width: usize,
+    height: usize,
+    chroma_w: usize,
+    chroma_h: usize,
+) -> VideoFrame {
+    let base = unsafe { (vt.cv_pb_get_base)(image_buffer) } as *const u8;
+    let bpr = unsafe { (vt.cv_pb_get_bpr)(image_buffer) };
+
+    let mut y_data = vec![0u8; width * height];
+    let mut cb_422 = vec![0u16; chroma_w * height];
+    let mut cr_422 = vec![0u16; chroma_w * height];
+
+    // 8 bytes per 2-pixel block (4 components × 2 bytes).
+    if !base.is_null() {
+        for row in 0..height {
+            let row_ptr = unsafe { base.add(row * bpr) };
+            // Bytes per row should be ≥ width * 4, but defensively clamp
+            // in case of stride padding.
+            let blocks = (bpr / 8).min(chroma_w);
+            for cx in 0..blocks {
+                let off = cx * 8;
+                let cb_lo = unsafe { *row_ptr.add(off) };
+                let cb_hi = unsafe { *row_ptr.add(off + 1) };
+                let y0_lo = unsafe { *row_ptr.add(off + 2) };
+                let y0_hi = unsafe { *row_ptr.add(off + 3) };
+                let cr_lo = unsafe { *row_ptr.add(off + 4) };
+                let cr_hi = unsafe { *row_ptr.add(off + 5) };
+                let y1_lo = unsafe { *row_ptr.add(off + 6) };
+                let y1_hi = unsafe { *row_ptr.add(off + 7) };
+                let cb = ((cb_hi as u16) << 8 | cb_lo as u16) >> 8;
+                let cr = ((cr_hi as u16) << 8 | cr_lo as u16) >> 8;
+                let y0 = ((y0_hi as u16) << 8 | y0_lo as u16) >> 8;
+                let y1 = ((y1_hi as u16) << 8 | y1_lo as u16) >> 8;
+                let px = cx * 2;
+                if px < width {
+                    y_data[row * width + px] = y0 as u8;
+                }
+                if px + 1 < width {
+                    y_data[row * width + px + 1] = y1 as u8;
+                }
+                cb_422[row * chroma_w + cx] = cb;
+                cr_422[row * chroma_w + cx] = cr;
+            }
+        }
+    }
+
+    let mut u_data = vec![0u8; chroma_w * chroma_h];
+    let mut v_data = vec![0u8; chroma_w * chroma_h];
+    for cy in 0..chroma_h {
+        let r0 = (cy * 2).min(height.saturating_sub(1));
+        let r1 = (cy * 2 + 1).min(height.saturating_sub(1));
+        for cx in 0..chroma_w {
+            let u = (cb_422[r0 * chroma_w + cx] + cb_422[r1 * chroma_w + cx]).div_ceil(2);
+            let v = (cr_422[r0 * chroma_w + cx] + cr_422[r1 * chroma_w + cx]).div_ceil(2);
+            u_data[cy * chroma_w + cx] = u as u8;
+            v_data[cy * chroma_w + cx] = v as u8;
+        }
+    }
+
+    VideoFrame {
+        pts: None,
+        planes: vec![
+            VideoPlane {
+                stride: width,
+                data: y_data,
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: u_data,
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: v_data,
+            },
+        ],
     }
 }
 
