@@ -31,18 +31,24 @@ Users who want to force the pure-Rust path globally can pass `--no-hwaccel` to t
 
 ## Coverage roadmap
 
-| Codec        | Decode (M-series) | Encode (M-series) | Status               |
-|--------------|-------------------|-------------------|----------------------|
-| H.264        | hardware          | hardware          | wired (≈ 51 dB PSNR_Y) |
-| HEVC         | hardware          | hardware          | wired (≈ 54 dB PSNR_Y) |
-| ProRes       | hardware          | hardware          | wired (≈ 52 dB PSNR_Y) |
-| JPEG (MJPEG) | hardware          | hardware          | wired (≈ 36 dB PSNR_Y) |
-| MPEG-2       | hardware          | —                 | roadmap              |
-| MPEG-4 Pt 2  | hardware          | —                 | roadmap              |
-| VP9          | hardware (M1+)    | —                 | roadmap              |
-| AV1          | hardware (M3+)    | hardware (M3+)    | roadmap              |
+| Codec        | Decode (M-series) | Encode (M-series) | Status                  |
+|--------------|-------------------|-------------------|-------------------------|
+| H.264        | hardware          | hardware          | wired (≈ 51 dB PSNR_Y)  |
+| HEVC         | hardware          | hardware          | wired (≈ 54 dB PSNR_Y)  |
+| ProRes       | hardware          | hardware          | wired (≈ 52 dB PSNR_Y)  |
+| JPEG (MJPEG) | hardware          | hardware          | wired (≈ 36 dB PSNR_Y)  |
+| MPEG-2       | hardware          | — (no VT encoder) | wired (≈ 61 dB PSNR_Y, decode-only) |
+| MPEG-4 Pt 2  | hardware          | —                 | roadmap                 |
+| VP9          | hardware (M1+)    | —                 | roadmap                 |
+| AV1          | hardware (M3+)    | hardware (M3+)    | roadmap                 |
 
-Round 1: scaffolding. Round 2: H.264 + HEVC decode + encode. **Round 3 (this commit): JPEG (MJPEG) + ProRes decode + encode via a shared blob-codec module (`blob.rs`)** — single-blob frames built on `CMVideoFormatDescriptionCreate(width, height, codecType)` rather than the parameter-set extraction H.264/HEVC need. Round 4: VP9 / AV1 / MPEG-2 / MPEG-4 Pt 2.
+Round 1: scaffolding. Round 2: H.264 + HEVC decode + encode. Round 3: JPEG (MJPEG) + ProRes decode + encode via a shared blob-codec module (`blob.rs`) — single-blob frames built on `CMVideoFormatDescriptionCreate(width, height, codecType)` rather than the parameter-set extraction H.264/HEVC need. **Round 4 (this commit): MPEG-2 video decode** (`kCMVideoCodecType_MPEG2Video`) — decode-only, since VideoToolbox exposes an MPEG-2 *decoder* but no encoder. An elementary-stream framer (`FrameSplit::Mpeg2Es`) carves the incoming bitstream into per-picture access units before each is handed to a `VTDecompressionSession`. Remaining roadmap: VP9 / AV1 / MPEG-4 Pt 2.
+
+### Round 4 implementation notes
+
+* **MPEG-2 is decode-only.** VideoToolbox ships an MPEG-2 decoder but no MPEG-2 compression session, so `make_mpeg2_decoder` registers a decoder against `CodecId::new("mpeg2video")` (tags `mp2v / MPG2 / mpg2 / hdv2 / m2v1 / V_MPEG2`) and there is deliberately no matching encoder factory.
+* **Elementary-stream framer.** Unlike the container-framed JPEG/ProRes path (one `Packet` == one frame), an MPEG-2 elementary stream is not pre-framed. `BlobDecoder` gained a `FrameSplit` mode; `FrameSplit::Mpeg2Es` splits on the picture start code (`00 00 01 00`), attaching any leading sequence (`b3`) / GOP (`b8`) / extension (`b5`) headers to the first picture so VT can size the decoder. This is intrinsic bitstream framing (the codec's job), not container parsing.
+* **Validated against ffmpeg as a black-box.** The decode test generates an MPEG-2 elementary stream with `ffmpeg` (opaque validator), decodes it through VideoToolbox, and compares the result to ffmpeg's own software decode: PSNR_Y ≈ 61 dB on a 320×240 / 10-frame gradient. The test self-skips when ffmpeg or the framework is unavailable.
 
 ### Round 3 implementation notes
 

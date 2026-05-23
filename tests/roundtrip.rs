@@ -1,15 +1,20 @@
-//! End-to-end encode → decode roundtrip tests for H.264 and HEVC.
+//! End-to-end tests for the VideoToolbox bridge.
 //!
 //! Gated to `cfg(all(target_os = "macos", feature = "registry"))` —
 //! on non-mac platforms or without the `registry` feature this module
 //! compiles to nothing (empty rlib, zero tests run).
 //!
-//! Test strategy:
+//! Encode → decode roundtrip (H.264 / HEVC / MJPEG / ProRes):
 //! 1. Generate a synthetic 320×240 I420 test pattern (luma ramp).
-//! 2. Encode 10 frames via `H264VtEncoder` (resp. `HevcVtEncoder`).
-//! 3. Decode the resulting Annex-B stream via `H264VtDecoder` (resp. `HevcVtDecoder`).
+//! 2. Encode 10 frames via the matching VT encoder.
+//! 3. Decode the resulting stream via the matching VT decoder.
 //! 4. Assert decoded frame dimensions match 320×240.
 //! 5. Assert PSNR_Y ≥ 35 dB on at least one decoded frame.
+//!
+//! Decode-only (MPEG-2): VideoToolbox has no MPEG-2 encoder, so the test
+//! produces an elementary stream with `ffmpeg` (a black-box validator),
+//! decodes it through VideoToolbox, and compares to ffmpeg's own software
+//! decode (PSNR_Y ≥ 30 dB).
 
 #![cfg(all(target_os = "macos", feature = "registry"))]
 
@@ -284,4 +289,219 @@ fn register_installs_all_round3_factories() {
             "no VT encoder registered for {id}"
         );
     }
+}
+
+/// MPEG-2 is decode-only (VideoToolbox exposes no MPEG-2 encoder), so its
+/// factory must install a decoder but NOT an encoder.
+#[test]
+fn register_installs_mpeg2_decode_only() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping mpeg2 registry check");
+        return;
+    }
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_videotoolbox::register(&mut ctx);
+    let cid = oxideav_core::CodecId::new("mpeg2video");
+    assert!(
+        ctx.codecs.has_decoder(&cid),
+        "no VT decoder registered for mpeg2video"
+    );
+    assert!(
+        !ctx.codecs.has_encoder(&cid),
+        "VT must not register an MPEG-2 encoder (none exists)"
+    );
+}
+
+// ─────────────────────────── MPEG-2 decode test ───────────────────────────────
+
+/// Run `ffmpeg` as an opaque black-box validator to produce an MPEG-2
+/// elementary stream (and a reference raw-YUV decode). Returns
+/// `(elementary_stream_bytes, reference_first_frame_i420)` or `None` if
+/// ffmpeg is unavailable on the runner.
+fn ffmpeg_mpeg2_fixture(width: usize, height: usize, frames: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    use std::process::Command;
+
+    // Locate ffmpeg; skip the test gracefully if it's not installed.
+    let ffmpeg = [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "ffmpeg",
+    ]
+    .into_iter()
+    .find(|p| {
+        Command::new(p)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })?;
+
+    let dir = std::env::temp_dir();
+    let m2v = dir.join(format!("oxideav_vt_mpeg2_{width}x{height}.m2v"));
+    let yuv = dir.join(format!("oxideav_vt_mpeg2_{width}x{height}.yuv"));
+
+    // Encode a smooth gradient to an MPEG-2 elementary stream.
+    let status = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "gradients=s={width}x{height}:c0=black:c1=white:d=1:r={frames},format=yuv420p"
+            ),
+            "-frames:v",
+            &frames.to_string(),
+            "-c:v",
+            "mpeg2video",
+            "-g",
+            "5",
+            "-q:v",
+            "3",
+            "-f",
+            "mpeg2video",
+        ])
+        .arg(&m2v)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    // Reference decode: first frame as raw I420.
+    let status = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&m2v)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    let es = std::fs::read(&m2v).ok()?;
+    let ref_yuv = std::fs::read(&yuv).ok()?;
+    let _ = std::fs::remove_file(&m2v);
+    let _ = std::fs::remove_file(&yuv);
+
+    let frame_size = width * height * 3 / 2;
+    if ref_yuv.len() < frame_size {
+        return None;
+    }
+    Some((es, ref_yuv[..frame_size].to_vec()))
+}
+
+/// Decode an ffmpeg-produced MPEG-2 elementary stream through the
+/// VideoToolbox bridge and assert the first decoded frame matches ffmpeg's
+/// own software decode (PSNR_Y ≥ 30 dB — chroma subsampling round-trips and
+/// VT's IDCT differ slightly from ffmpeg's, so the bar is a touch below the
+/// lossy-encode tests).
+#[test]
+fn mpeg2_decode_against_ffmpeg() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping mpeg2 decode");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let frames = 10usize;
+
+    let Some((es, ref_i420)) = ffmpeg_mpeg2_fixture(width, height, frames) else {
+        eprintln!("oxideav-videotoolbox: ffmpeg unavailable, skipping mpeg2 decode test");
+        return;
+    };
+
+    let dec_params = {
+        let mut p = CodecParameters::video(CodecId::new("mpeg2video"));
+        p.width = Some(width as u32);
+        p.height = Some(height as u32);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+        p
+    };
+
+    let mut decoder = vt_blob::make_mpeg2_decoder(&dec_params).expect("MPEG-2 VT decoder");
+
+    // Feed the whole elementary stream as a single packet; the decoder's
+    // FrameSplit::Mpeg2Es framer carves it into per-picture access units.
+    let pkt = oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 1_000_000), es);
+
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    decoder.send_packet(&pkt).expect("send_packet (mpeg2)");
+    loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(vf)) => decoded.push(vf),
+            Ok(_) => {}
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame error: {e}"),
+        }
+    }
+    decoder.flush().expect("decoder flush");
+    loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(vf)) => decoded.push(vf),
+            Ok(_) => {}
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame (flush) error: {e}"),
+        }
+    }
+
+    assert!(
+        !decoded.is_empty(),
+        "MPEG-2 VT decoder produced no frames from the elementary stream"
+    );
+
+    // Dimensions.
+    for (i, df) in decoded.iter().enumerate() {
+        assert_eq!(df.planes.len(), 3, "mpeg2 frame {i}: expected 3 planes");
+        let dec_w = df.planes[0].stride;
+        let dec_h = df.planes[0].data.len() / dec_w.max(1);
+        assert_eq!(dec_w, width, "mpeg2 frame {i}: width mismatch");
+        assert_eq!(dec_h, height, "mpeg2 frame {i}: height mismatch");
+    }
+
+    // Build a reference VideoFrame from ffmpeg's raw I420 first frame.
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    let y_len = width * height;
+    let c_len = chroma_w * chroma_h;
+    let ref_frame = VideoFrame {
+        pts: None,
+        planes: vec![
+            VideoPlane {
+                stride: width,
+                data: ref_i420[..y_len].to_vec(),
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: ref_i420[y_len..y_len + c_len].to_vec(),
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: ref_i420[y_len + c_len..y_len + 2 * c_len].to_vec(),
+            },
+        ],
+    };
+
+    // Best PSNR_Y across decoded frames vs ffmpeg's first frame (decode order
+    // vs display order may shuffle which of ours best matches frame 0).
+    let best_psnr = decoded
+        .iter()
+        .map(|df| psnr_y(&ref_frame, df))
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    println!(
+        "mpeg2 decode: {} frames decoded, best PSNR_Y vs ffmpeg = {:.1} dB",
+        decoded.len(),
+        best_psnr
+    );
+
+    assert!(
+        best_psnr >= 30.0,
+        "mpeg2 PSNR_Y {best_psnr:.1} dB < 30 dB threshold"
+    );
 }

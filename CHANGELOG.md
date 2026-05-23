@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 4: MPEG-2 video decode** via `VTDecompressionSession`
+  (`kCMVideoCodecType_MPEG2Video` = `'mp2v'`). Decode-only — VideoToolbox
+  exposes an MPEG-2 decoder but no MPEG-2 encoder, so `make_mpeg2_decoder`
+  registers a decoder against `CodecId::new("mpeg2video")` and there is
+  deliberately no encoder factory.
+  - New `FrameSplit` mode on `BlobDecoder`. `FrameSplit::Mpeg2Es` carves an
+    incoming MPEG-2 elementary stream into per-picture access units (split on
+    the picture start code `00 00 01 00`, attaching leading sequence/GOP/
+    extension headers to the first picture) before handing each to VT. JPEG
+    and ProRes keep `FrameSplit::Whole` (one `Packet` == one frame).
+  - Codec tags: `mp2v / MPG2 / mpg2 / hdv2 / m2v1` (fourcc) and `V_MPEG2`
+    (Matroska). Registers with `priority = 10`, `hardware_accelerated = true`.
+  - Decode validated against `ffmpeg` as a black-box validator: an
+    ffmpeg-produced MPEG-2 elementary stream decoded through VideoToolbox
+    matches ffmpeg's own software decode at PSNR_Y ≈ 61 dB (320×240, 10
+    frames). Test self-skips when ffmpeg or the framework is unavailable.
+  - `register` now installs an MPEG-2 decoder (and asserts via test that it
+    installs *no* MPEG-2 encoder).
+- Added `kCMVideoCodecType_MPEG2Video` constant.
 - **Round 3: JPEG (MJPEG) + ProRes decode + encode** via `VTDecompressionSession` / `VTCompressionSession`.
   - New `blob.rs` module factors out a `BlobDecoder` / `BlobEncoder` pair for codecs whose format description is built from `CMVideoFormatDescriptionCreate(codec_type, width, height)` with no out-of-band parameter sets. Used by JPEG (`'jpeg'`) and ProRes (`'apcn'`).
   - `make_jpeg_decoder` / `make_jpeg_encoder` register against `CodecId::new("mjpeg")` with the JPEG fourcc tags (`jpeg / JPEG / MJPG / mjpg`).

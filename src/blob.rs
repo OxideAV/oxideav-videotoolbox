@@ -7,13 +7,17 @@
 //! parameter-set extraction is involved.
 //!
 //! This module factors out the common decode + encode pipeline behind a
-//! generic codec-type tag so JPEG (`'jpeg'`) and the six ProRes fourccs
-//! (`apco / apcs / apcn / apch / ap4h / ap4x`) share a single
-//! `VTDecompressionSession` / `VTCompressionSession` driver.
+//! generic codec-type tag so JPEG (`'jpeg'`), the six ProRes fourccs
+//! (`apco / apcs / apcn / apch / ap4h / ap4x`), and MPEG-2 video (`'mp2v'`,
+//! decode-only) share a single `VTDecompressionSession` /
+//! `VTCompressionSession` driver.
 //!
-//! The decoder accepts whole-frame `Packet`s; the encoder produces
-//! whole-frame `Packet`s. Annex-B start-code handling that H.264/HEVC
-//! need is absent here — frames are byte-for-byte what VT consumed/emitted.
+//! By default the decoder accepts whole-frame `Packet`s; the encoder
+//! produces whole-frame `Packet`s. Annex-B start-code handling that
+//! H.264/HEVC need is absent here — frames are byte-for-byte what VT
+//! consumed/emitted. MPEG-2 is the exception: its input is an *elementary*
+//! stream, so the decoder uses a `FrameSplit::Mpeg2Es` framer to carve
+//! per-picture access units before submission.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -531,18 +535,87 @@ fn decode_packed_422_to_i420(
     }
 }
 
+// ─────────────────────────── Frame splitting ─────────────────────────────────
+
+/// How a `BlobDecoder` carves submitted `Packet`s into VT access units.
+///
+/// JPEG and ProRes are container-framed: each `Packet` is already exactly
+/// one self-contained compressed frame, so the bytes pass straight through.
+/// An MPEG-2 *elementary* stream is not pre-framed — a packet may carry one
+/// picture, several pictures, or a sequence/GOP header followed by pictures.
+/// Splitting an elementary stream into per-picture access units is intrinsic
+/// bitstream framing (the codec's job, not a container's), so the splitter
+/// lives in the codec bridge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FrameSplit {
+    /// One `Packet` == one VT access unit (JPEG, ProRes).
+    Whole,
+    /// MPEG-2 elementary stream: split on picture start codes, attaching any
+    /// preceding sequence/GOP/extension headers to the following picture.
+    Mpeg2Es,
+}
+
+/// Split an MPEG-2 elementary-stream buffer into per-picture access units.
+///
+/// MPEG-2 start codes are `00 00 01 xx`. The picture start code is
+/// `00 00 01 00`. Each access unit we emit is "everything from one
+/// picture-start-code boundary up to (but not including) the next picture
+/// start code", with any leading sequence header (`b3`), GOP header (`b8`),
+/// or extension (`b5`) bytes that precede the first picture attached to it.
+/// VideoToolbox accepts a sequence-header-prefixed picture as a complete
+/// MPEG-2 access unit.
+fn split_mpeg2_access_units(buf: &[u8]) -> Vec<&[u8]> {
+    // Collect byte offsets of every picture start code (00 00 01 00).
+    let mut picture_starts: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && buf[i + 3] == 0 {
+            picture_starts.push(i);
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+
+    if picture_starts.is_empty() {
+        // No picture start code at all — hand the whole buffer to VT and let
+        // it decide. (Defensive: shouldn't happen for a valid ES.)
+        return if buf.is_empty() {
+            Vec::new()
+        } else {
+            vec![buf]
+        };
+    }
+
+    let mut units: Vec<&[u8]> = Vec::new();
+    for (idx, &start) in picture_starts.iter().enumerate() {
+        // For the first picture, include any leading sequence/GOP/extension
+        // headers (everything from offset 0). VT needs the sequence header
+        // to size the decoder; carrying it on the first picture is the
+        // standard MPEG-2 access-unit shape.
+        let unit_start = if idx == 0 { 0 } else { start };
+        let unit_end = picture_starts.get(idx + 1).copied().unwrap_or(buf.len());
+        if unit_end > unit_start {
+            units.push(&buf[unit_start..unit_end]);
+        }
+    }
+    units
+}
+
 // ─────────────────────────── Decoder ─────────────────────────────────────────
 
 /// Blob-style VTDecompressionSession decoder.
 ///
 /// Used for any codec whose format description can be built from just
 /// `(codec_type, width, height)` and whose frames are whole-payload
-/// CMBlockBuffers (JPEG, ProRes).
+/// CMBlockBuffers (JPEG, ProRes) or per-picture access units carved from an
+/// elementary stream (MPEG-2).
 pub struct BlobDecoder {
     codec_id: CodecId,
     codec_type: u32,
     width: usize,
     height: usize,
+    framer: FrameSplit,
     session: sys::VTDecompressionSessionRef,
     fmt_desc: sys::CMVideoFormatDescriptionRef,
     state: Arc<Mutex<DecCallbackState>>,
@@ -561,6 +634,15 @@ impl BlobDecoder {
         codec_type: u32,
         params: &CodecParameters,
     ) -> Result<Box<dyn Decoder>> {
+        Self::make_with_framer(codec_id, codec_type, FrameSplit::Whole, params)
+    }
+
+    pub fn make_with_framer(
+        codec_id: &str,
+        codec_type: u32,
+        framer: FrameSplit,
+        params: &CodecParameters,
+    ) -> Result<Box<dyn Decoder>> {
         sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
         let width = params.width.unwrap_or(0) as usize;
         let height = params.height.unwrap_or(0) as usize;
@@ -574,6 +656,7 @@ impl BlobDecoder {
             codec_type,
             width,
             height,
+            framer,
             session: std::ptr::null_mut(),
             fmt_desc: std::ptr::null_mut(),
             state: DecCallbackState::new(),
@@ -791,7 +874,22 @@ impl Decoder for BlobDecoder {
         }
 
         self.ensure_session()?;
-        self.submit_frame(&packet.data, packet.pts)?;
+        match self.framer {
+            FrameSplit::Whole => {
+                self.submit_frame(&packet.data, packet.pts)?;
+            }
+            FrameSplit::Mpeg2Es => {
+                // Carve the elementary stream into per-picture access units.
+                // Only the first access unit inherits the packet's PTS; the
+                // rest get sequential synthetic timestamps so VT keeps a
+                // monotone presentation timeline.
+                let units = split_mpeg2_access_units(&packet.data);
+                for (idx, unit) in units.iter().enumerate() {
+                    let pts = if idx == 0 { packet.pts } else { None };
+                    self.submit_frame(unit, pts)?;
+                }
+            }
+        }
         self.pull_frames();
         Ok(())
     }
@@ -1218,6 +1316,8 @@ pub const K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_PROXY: u32 = 0x6170636F;
 pub const K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444: u32 = 0x61703468;
 /// kCMVideoCodecType_AppleProRes4444XQ = 'ap4x' (0x61703478).
 pub const K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444_XQ: u32 = 0x61703478;
+/// kCMVideoCodecType_MPEG2Video = 'mp2v' (0x6D703276).
+pub const K_CM_VIDEO_CODEC_TYPE_MPEG2_VIDEO: u32 = 0x6D703276;
 
 // ─────────────────────────── Public factories ────────────────────────────────
 
@@ -1241,4 +1341,20 @@ pub fn make_prores_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>>
     // Default-encode as ProRes 422 (apcn). Profile-selection via params.tag
     // is a future-round item.
     BlobEncoder::make("prores", K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422, params)
+}
+
+/// MPEG-2 video decoder via VideoToolbox.
+///
+/// Decode-only: VideoToolbox exposes a hardware/SW MPEG-2 *decoder*
+/// (`kCMVideoCodecType_MPEG2Video`) but no MPEG-2 encoder, so there is no
+/// matching `make_mpeg2_encoder`. Input is an MPEG-2 elementary stream;
+/// the `FrameSplit::Mpeg2Es` framer carves it into per-picture access units
+/// before handing each to a `VTDecompressionSession`.
+pub fn make_mpeg2_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    BlobDecoder::make_with_framer(
+        "mpeg2video",
+        K_CM_VIDEO_CODEC_TYPE_MPEG2_VIDEO,
+        FrameSplit::Mpeg2Es,
+        params,
+    )
 }

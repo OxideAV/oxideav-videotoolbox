@@ -20,9 +20,12 @@
 //!
 //! # Status
 //!
-//! Round 2 (this commit): real H.264 + HEVC decode + encode factories
-//! via `VTDecompressionSession` / `VTCompressionSession`. Both codec ids
-//! register with `priority = 10` and `hardware_accelerated = true`.
+//! H.264 + HEVC decode + encode and JPEG + ProRes decode + encode are wired
+//! via `VTDecompressionSession` / `VTCompressionSession`. Round 4 (this
+//! commit) adds **MPEG-2 video decode** (`kCMVideoCodecType_MPEG2Video`,
+//! decode-only — VideoToolbox has no MPEG-2 encoder), with an
+//! elementary-stream framer that carves per-picture access units. All codec
+//! ids register with `priority = 10` and `hardware_accelerated = true`.
 //!
 //! # Workspace policy
 //!
@@ -40,10 +43,11 @@ pub mod decoder;
 #[cfg(feature = "registry")]
 pub mod encoder;
 
-/// Register H.264 and HEVC hardware decode + encode factories via
-/// VideoToolbox. If the framework cannot be loaded (older OS, sandboxed
-/// environment, non-macOS) the function logs and returns without
-/// registering anything — the runtime falls back to the pure-Rust impls.
+/// Register VideoToolbox hardware factories: H.264 / HEVC / JPEG / ProRes
+/// decode + encode, plus MPEG-2 video decode (decode-only). If the framework
+/// cannot be loaded (older OS, sandboxed environment, non-macOS) the function
+/// logs and returns without registering anything — the runtime falls back to
+/// the pure-Rust impls.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
@@ -180,7 +184,28 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
             .encoder(blob::make_prores_encoder),
     );
 
-    let _ = (h264_caps, hevc_caps, jpeg_caps, prores_caps); // suppress unused warnings
+    // ── MPEG-2 decoder (decode-only — VT has no MPEG-2 encoder) ─────────────
+    let mpeg2_caps = CodecCapabilities::video("mpeg2_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("mpeg2video"))
+            .capabilities(mpeg2_caps.clone().with_decode())
+            .decoder(blob::make_mpeg2_decoder)
+            .tags([
+                CodecTag::fourcc(b"mp2v"),
+                CodecTag::fourcc(b"MPG2"),
+                CodecTag::fourcc(b"mpg2"),
+                CodecTag::fourcc(b"hdv2"),
+                CodecTag::fourcc(b"m2v1"),
+                CodecTag::matroska("V_MPEG2"),
+            ]),
+    );
+
+    let _ = (h264_caps, hevc_caps, jpeg_caps, prores_caps, mpeg2_caps); // suppress unused warnings
 }
 
 #[cfg(feature = "registry")]
