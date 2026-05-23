@@ -1358,3 +1358,56 @@ pub fn make_mpeg2_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> 
         params,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::split_mpeg2_access_units;
+
+    // Start codes: B3 = sequence header, B8 = GOP, 00 = picture, B5 = ext.
+    const SEQ: &[u8] = &[0x00, 0x00, 0x01, 0xB3, 0xAA];
+    const GOP: &[u8] = &[0x00, 0x00, 0x01, 0xB8, 0xBB];
+    const PIC: &[u8] = &[0x00, 0x00, 0x01, 0x00, 0xCC];
+    const SLICE: &[u8] = &[0x00, 0x00, 0x01, 0x01, 0xDD];
+
+    fn cat(parts: &[&[u8]]) -> Vec<u8> {
+        parts.iter().flat_map(|p| p.iter().copied()).collect()
+    }
+
+    #[test]
+    fn single_picture_with_seq_header() {
+        // SEQ + PIC + SLICE → one access unit covering the whole buffer.
+        let buf = cat(&[SEQ, PIC, SLICE]);
+        let units = split_mpeg2_access_units(&buf);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0], &buf[..]);
+    }
+
+    #[test]
+    fn two_pictures_first_keeps_headers() {
+        // SEQ + GOP + PIC1 + SLICE + PIC2 + SLICE → two access units; the
+        // first inherits the leading sequence/GOP headers, the second starts
+        // at its own picture start code.
+        let pic1 = cat(&[SEQ, GOP, PIC, SLICE]);
+        let pic2 = cat(&[PIC, SLICE]);
+        let buf = cat(&[&pic1, &pic2]);
+        let units = split_mpeg2_access_units(&buf);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0], &pic1[..]);
+        assert_eq!(units[1], &pic2[..]);
+    }
+
+    #[test]
+    fn no_picture_start_code_returns_whole() {
+        // A buffer with only a sequence header (no picture) is handed through
+        // intact rather than dropped.
+        let buf = cat(&[SEQ]);
+        let units = split_mpeg2_access_units(&buf);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0], &buf[..]);
+    }
+
+    #[test]
+    fn empty_buffer_yields_nothing() {
+        assert!(split_mpeg2_access_units(&[]).is_empty());
+    }
+}
