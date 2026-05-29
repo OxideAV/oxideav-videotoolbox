@@ -24,11 +24,17 @@
 //! via `VTDecompressionSession` / `VTCompressionSession`. Round 4 added
 //! **MPEG-2 video decode** (`kCMVideoCodecType_MPEG2Video`, decode-only —
 //! VideoToolbox has no MPEG-2 encoder), with an elementary-stream framer
-//! that carves per-picture access units. Round 5 (this commit) adds **VP9
-//! decode** (`kCMVideoCodecType_VP9` = `'vp09'`, decode-only — VT has no
-//! VP9 encoder either); VP9 frames are container-framed (IVF / Matroska /
-//! MP4) so each demuxed `Packet` is one access unit and the existing blob
-//! `FrameSplit::Whole` path applies unchanged. All codec ids register with
+//! that carves per-picture access units. Round 5 added **VP9 decode**
+//! (`kCMVideoCodecType_VP9` = `'vp09'`, decode-only — VT has no VP9 encoder
+//! either); VP9 frames are container-framed (IVF / Matroska / MP4) so each
+//! demuxed `Packet` is one access unit and the existing blob
+//! `FrameSplit::Whole` path applies unchanged. Round 6 (this commit) adds
+//! **MPEG-4 Part 2 video decode** (`kCMVideoCodecType_MPEG4Video` = `'mp4v'`
+//! — the DivX / Xvid / ASP family, **not** H.264). VT exposes no MPEG-4
+//! Part 2 compression session, so it is decode-only as well; a new
+//! `FrameSplit::Mpeg4PartTwoEs` framer splits on VOP start codes
+//! (`00 00 01 B6`) and attaches preceding VOS / VOL / GOV headers to the
+//! first VOP so VT can size the decoder. All codec ids register with
 //! `priority = 10` and `hardware_accelerated = true`.
 //!
 //! # Workspace policy
@@ -48,10 +54,11 @@ pub mod decoder;
 pub mod encoder;
 
 /// Register VideoToolbox hardware factories: H.264 / HEVC / JPEG / ProRes
-/// decode + encode, plus MPEG-2 video and VP9 decode (decode-only — neither
-/// has a VT encoder). If the framework cannot be loaded (older OS, sandboxed
-/// environment, non-macOS) the function logs and returns without registering
-/// anything — the runtime falls back to the pure-Rust impls.
+/// decode + encode, plus MPEG-2 video, VP9, and MPEG-4 Part 2 decode
+/// (decode-only — none of the three has a VT encoder). If the framework
+/// cannot be loaded (older OS, sandboxed environment, non-macOS) the function
+/// logs and returns without registering anything — the runtime falls back to
+/// the pure-Rust impls.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
@@ -227,6 +234,37 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
             ]),
     );
 
+    // ── MPEG-4 Part 2 decoder (decode-only — VT has no MPEG-4 Pt 2 encoder) ─
+    //
+    // This is MPEG-4 Part 2 (Visual / ASP / SP) — the family that includes
+    // DivX and Xvid — **not** MPEG-4 Part 10 (H.264). H.264 is registered
+    // separately above with `kCMVideoCodecType_H264` (`'avc1'`).
+    let mpeg4_caps = CodecCapabilities::video("mpeg4_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("mpeg4"))
+            .capabilities(mpeg4_caps.clone().with_decode())
+            .decoder(blob::make_mpeg4_part_two_decoder)
+            .tags([
+                CodecTag::fourcc(b"mp4v"),
+                CodecTag::fourcc(b"MP4V"),
+                CodecTag::fourcc(b"M4S2"),
+                CodecTag::fourcc(b"m4s2"),
+                CodecTag::fourcc(b"DIVX"),
+                CodecTag::fourcc(b"divx"),
+                CodecTag::fourcc(b"DX50"),
+                CodecTag::fourcc(b"XVID"),
+                CodecTag::fourcc(b"xvid"),
+                CodecTag::fourcc(b"FMP4"),
+                CodecTag::fourcc(b"fmp4"),
+                CodecTag::matroska("V_MPEG4/ISO/ASP"),
+            ]),
+    );
+
     let _ = (
         h264_caps,
         hevc_caps,
@@ -234,6 +272,7 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
         prores_caps,
         mpeg2_caps,
         vp9_caps,
+        mpeg4_caps,
     ); // suppress unused warnings
 }
 

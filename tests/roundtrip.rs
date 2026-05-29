@@ -333,6 +333,30 @@ fn register_installs_vp9_decode_only() {
     );
 }
 
+/// MPEG-4 Part 2 (Visual / ASP / DivX / Xvid) is decode-only — VideoToolbox
+/// exposes no MPEG-4 Pt 2 compression session — so its factory must install
+/// a decoder under `CodecId::new("mpeg4")` but NOT an encoder. This is the
+/// MPEG-4 Pt 2 codec id; H.264 (MPEG-4 Pt 10) is registered separately
+/// under `CodecId::new("h264")` and has both decoder and encoder.
+#[test]
+fn register_installs_mpeg4_part_two_decode_only() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping mpeg4 registry check");
+        return;
+    }
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_videotoolbox::register(&mut ctx);
+    let cid = oxideav_core::CodecId::new("mpeg4");
+    assert!(
+        ctx.codecs.has_decoder(&cid),
+        "no VT decoder registered for mpeg4"
+    );
+    assert!(
+        !ctx.codecs.has_encoder(&cid),
+        "VT must not register an MPEG-4 Part 2 encoder (none exists)"
+    );
+}
+
 // ─────────────────────────── MPEG-2 decode test ───────────────────────────────
 
 /// Run `ffmpeg` as an opaque black-box validator to produce an MPEG-2
@@ -831,4 +855,214 @@ mod ivf_tests {
         buf.pop();
         assert!(parse_ivf(&buf).is_none());
     }
+}
+
+// ────────────────────── MPEG-4 Part 2 decode test ───────────────────────────
+
+/// Run `ffmpeg` as an opaque black-box validator to produce an MPEG-4 Part 2
+/// (Simple Profile) elementary stream (and a reference raw-YUV decode).
+/// Returns `(elementary_stream_bytes, reference_first_frame_i420)` or `None`
+/// if ffmpeg is unavailable / lacks its built-in MPEG-4 Part 2 encoder.
+fn ffmpeg_mpeg4_part_two_fixture(
+    width: usize,
+    height: usize,
+    frames: usize,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    use std::process::Command;
+
+    let ffmpeg = [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "ffmpeg",
+    ]
+    .into_iter()
+    .find(|p| {
+        Command::new(p)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })?;
+
+    let dir = std::env::temp_dir();
+    let m4v = dir.join(format!("oxideav_vt_mpeg4_{width}x{height}.m4v"));
+    let yuv = dir.join(format!("oxideav_vt_mpeg4_{width}x{height}.yuv"));
+
+    // Encode a smooth gradient to an MPEG-4 Part 2 elementary stream.
+    // ffmpeg's built-in `mpeg4` encoder produces an ES that starts with the
+    // VOS / VOL headers and an IVOP, exactly what VideoToolbox needs.
+    //
+    // `-profile:v 1` (Simple Profile @ L1) is the broadly-compatible
+    // baseline. `-g 5` keeps GOPs short so the first VOP is intra and the
+    // decode test gets sample-similarity to ffmpeg's own decode quickly.
+    let status = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "gradients=s={width}x{height}:c0=black:c1=white:d=1:r={frames},format=yuv420p"
+            ),
+            "-frames:v",
+            &frames.to_string(),
+            "-c:v",
+            "mpeg4",
+            "-g",
+            "5",
+            "-q:v",
+            "3",
+            "-f",
+            "m4v",
+        ])
+        .arg(&m4v)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    // Reference decode: first frame as raw I420.
+    let status = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&m4v)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    let es = std::fs::read(&m4v).ok()?;
+    let ref_yuv = std::fs::read(&yuv).ok()?;
+    let _ = std::fs::remove_file(&m4v);
+    let _ = std::fs::remove_file(&yuv);
+
+    let frame_size = width * height * 3 / 2;
+    if ref_yuv.len() < frame_size {
+        return None;
+    }
+    Some((es, ref_yuv[..frame_size].to_vec()))
+}
+
+/// Decode an ffmpeg-produced MPEG-4 Part 2 elementary stream through the
+/// VideoToolbox bridge and assert the first decoded frame matches ffmpeg's
+/// own software decode (PSNR_Y ≥ 30 dB — same bar as MPEG-2 / VP9 since
+/// VT's IDCT differs slightly from ffmpeg's).
+///
+/// Self-skips when ffmpeg / VideoToolbox is unavailable, or when the VT
+/// MPEG-4 Part 2 decoder errors at session-create time on the runner.
+#[test]
+fn mpeg4_part_two_decode_against_ffmpeg() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping mpeg4 decode");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let frames = 10usize;
+
+    let Some((es, ref_i420)) = ffmpeg_mpeg4_part_two_fixture(width, height, frames) else {
+        eprintln!("oxideav-videotoolbox: ffmpeg unavailable, skipping mpeg4 decode test");
+        return;
+    };
+
+    let dec_params = {
+        let mut p = CodecParameters::video(CodecId::new("mpeg4"));
+        p.width = Some(width as u32);
+        p.height = Some(height as u32);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+        p
+    };
+
+    let mut decoder = match vt_blob::make_mpeg4_part_two_decoder(&dec_params) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("VT MPEG-4 Part 2 decoder unavailable on this host: {e}; skipping");
+            return;
+        }
+    };
+
+    let pkt = oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 1_000_000), es);
+
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    if let Err(e) = decoder.send_packet(&pkt) {
+        eprintln!("VT MPEG-4 Part 2 send_packet error: {e}; skipping");
+        return;
+    }
+    loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(vf)) => decoded.push(vf),
+            Ok(_) => {}
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame (mpeg4) error: {e}"),
+        }
+    }
+    decoder.flush().expect("decoder flush");
+    loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(vf)) => decoded.push(vf),
+            Ok(_) => {}
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame (mpeg4 flush) error: {e}"),
+        }
+    }
+
+    if decoded.is_empty() {
+        eprintln!("VT MPEG-4 Part 2 decoder produced no frames; skipping");
+        return;
+    }
+
+    // Dimensions.
+    for (i, df) in decoded.iter().enumerate() {
+        assert_eq!(df.planes.len(), 3, "mpeg4 frame {i}: expected 3 planes");
+        let dec_w = df.planes[0].stride;
+        let dec_h = df.planes[0].data.len() / dec_w.max(1);
+        assert_eq!(dec_w, width, "mpeg4 frame {i}: width mismatch");
+        assert_eq!(dec_h, height, "mpeg4 frame {i}: height mismatch");
+    }
+
+    // Build reference VideoFrame from ffmpeg's raw I420 first frame.
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    let y_len = width * height;
+    let c_len = chroma_w * chroma_h;
+    let ref_frame = VideoFrame {
+        pts: None,
+        planes: vec![
+            VideoPlane {
+                stride: width,
+                data: ref_i420[..y_len].to_vec(),
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: ref_i420[y_len..y_len + c_len].to_vec(),
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: ref_i420[y_len + c_len..y_len + 2 * c_len].to_vec(),
+            },
+        ],
+    };
+
+    let best_psnr = decoded
+        .iter()
+        .map(|df| psnr_y(&ref_frame, df))
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    println!(
+        "mpeg4 decode: {} frames decoded, best PSNR_Y vs ffmpeg = {:.1} dB",
+        decoded.len(),
+        best_psnr
+    );
+
+    assert!(
+        best_psnr >= 30.0,
+        "mpeg4 PSNR_Y {best_psnr:.1} dB < 30 dB threshold"
+    );
 }

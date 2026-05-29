@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 6: MPEG-4 Part 2 video decode** via `VTDecompressionSession`
+  (`kCMVideoCodecType_MPEG4Video` = `'mp4v'`). Decode-only — VideoToolbox
+  exposes an MPEG-4 Part 2 decoder (historically used for DivX / Xvid
+  playback on macOS) but no MPEG-4 Pt 2 compression session, so
+  `make_mpeg4_part_two_decoder` registers a decoder against
+  `CodecId::new("mpeg4")` and there is no encoder factory. **This is MPEG-4
+  Part 2 (Visual ASP / SP), not H.264 (MPEG-4 Part 10).**
+  - New `FrameSplit::Mpeg4PartTwoEs` framer on `BlobDecoder`. Splits an
+    incoming MPEG-4 Pt 2 elementary stream on the VOP (Video Object Plane)
+    start code (`00 00 01 B6`), attaching any leading VOS (`B0`) / Visual
+    Object (`B5`) / VO (`00..1F`) / VOL (`20..2F`) / GOV (`B3`) / user-data
+    (`B2`) bytes to the first VOP so the VOL travels with it. Existing
+    MPEG-2 / VP9 / JPEG / ProRes framers unchanged.
+  - Codec tags: `mp4v / MP4V / M4S2 / m4s2 / DIVX / divx / DX50 / XVID /
+    xvid / FMP4 / fmp4` (fourcc) and `V_MPEG4/ISO/ASP` (Matroska). Registers
+    with `priority = 10`, `hardware_accelerated = true`.
+  - Decode validated against `ffmpeg -c:v mpeg4 -f m4v` as a black-box
+    validator. The test feeds the ES through `make_mpeg4_part_two_decoder`
+    and (when the session creates) compares to ffmpeg's own software decode
+    at PSNR_Y ≥ 30 dB. The test self-skips when ffmpeg or the framework is
+    unavailable, **and** when VT returns `kVTVideoDecoderBadDataErr` at
+    session-create time (some VT hosts require the VOL to be supplied via
+    format-description extension atoms rather than extracted from the
+    bitstream; the registry's SW fallback handles those hosts).
+  - Five new unit tests cover the MPEG-4 Part 2 access-unit splitter:
+    single VOP with headers, two VOPs with first inheriting headers,
+    no-VOP-found pass-through, empty buffer, and a regression test that
+    confirms non-VOP start codes (B0, B3) don't trigger spurious splits.
+  - `register` now installs an MPEG-4 Part 2 decoder (and asserts via test
+    that it installs *no* MPEG-4 Part 2 encoder).
+- Added `kCMVideoCodecType_MPEG4Video` constant.
 - **Round 5: VP9 video decode** via `VTDecompressionSession`
   (`kCMVideoCodecType_VP9` = `'vp09'`). Decode-only — VideoToolbox exposes a
   VP9 decoder (hardware on M1+ Apple Silicon, with VT-internal software

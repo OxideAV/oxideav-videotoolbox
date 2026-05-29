@@ -553,6 +553,11 @@ pub enum FrameSplit {
     /// MPEG-2 elementary stream: split on picture start codes, attaching any
     /// preceding sequence/GOP/extension headers to the following picture.
     Mpeg2Es,
+    /// MPEG-4 Part 2 elementary stream: split on VOP (Video Object Plane)
+    /// start codes, attaching any preceding VOS / Visual Object / VO / VOL /
+    /// GOV / user-data headers to the following VOP. Per ISO/IEC 14496-2,
+    /// start codes are `00 00 01 xx` and the VOP start code is `xx = B6`.
+    Mpeg4PartTwoEs,
 }
 
 /// Split an MPEG-2 elementary-stream buffer into per-picture access units.
@@ -595,6 +600,57 @@ fn split_mpeg2_access_units(buf: &[u8]) -> Vec<&[u8]> {
         // standard MPEG-2 access-unit shape.
         let unit_start = if idx == 0 { 0 } else { start };
         let unit_end = picture_starts.get(idx + 1).copied().unwrap_or(buf.len());
+        if unit_end > unit_start {
+            units.push(&buf[unit_start..unit_end]);
+        }
+    }
+    units
+}
+
+/// Split an MPEG-4 Part 2 elementary-stream buffer into per-VOP access units.
+///
+/// Per ISO/IEC 14496-2, start codes are `00 00 01 xx` and the VOP (Video
+/// Object Plane) start code is `xx = B6`. Other key codes that can precede a
+/// VOP and need to ride along on the first access unit:
+///
+/// * `B0` Visual Object Sequence (VOS) start
+/// * `B1` VOS end
+/// * `B5` Visual Object start
+/// * `00..1F` Video Object start (VO)
+/// * `20..2F` Video Object Layer start (VOL) — carries width/height/profile
+/// * `B3` Group of VOP (GOV) start
+/// * `B2` user data
+///
+/// VideoToolbox needs the VOL (or an equivalent extradata blob) to size the
+/// decoder, so we attach every leading header byte to the first VOP exactly
+/// as `split_mpeg2_access_units` does for sequence headers.
+fn split_mpeg4_part_two_access_units(buf: &[u8]) -> Vec<&[u8]> {
+    // Collect byte offsets of every VOP start code (00 00 01 B6).
+    let mut vop_starts: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && buf[i + 3] == 0xB6 {
+            vop_starts.push(i);
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+
+    if vop_starts.is_empty() {
+        return if buf.is_empty() {
+            Vec::new()
+        } else {
+            vec![buf]
+        };
+    }
+
+    let mut units: Vec<&[u8]> = Vec::new();
+    for (idx, &start) in vop_starts.iter().enumerate() {
+        // First VOP inherits every leading header byte so VT can size the
+        // decoder from the VOL embedded in the stream.
+        let unit_start = if idx == 0 { 0 } else { start };
+        let unit_end = vop_starts.get(idx + 1).copied().unwrap_or(buf.len());
         if unit_end > unit_start {
             units.push(&buf[unit_start..unit_end]);
         }
@@ -884,6 +940,16 @@ impl Decoder for BlobDecoder {
                 // rest get sequential synthetic timestamps so VT keeps a
                 // monotone presentation timeline.
                 let units = split_mpeg2_access_units(&packet.data);
+                for (idx, unit) in units.iter().enumerate() {
+                    let pts = if idx == 0 { packet.pts } else { None };
+                    self.submit_frame(unit, pts)?;
+                }
+            }
+            FrameSplit::Mpeg4PartTwoEs => {
+                // Carve the elementary stream into per-VOP access units (see
+                // `split_mpeg4_part_two_access_units`). PTS handling matches
+                // the MPEG-2 path.
+                let units = split_mpeg4_part_two_access_units(&packet.data);
                 for (idx, unit) in units.iter().enumerate() {
                     let pts = if idx == 0 { packet.pts } else { None };
                     self.submit_frame(unit, pts)?;
@@ -1323,6 +1389,13 @@ pub const K_CM_VIDEO_CODEC_TYPE_MPEG2_VIDEO: u32 = 0x6D703276;
 /// software fallback on Intel Macs that lack the dedicated VP9 IP.
 /// Decode-only (VideoToolbox exposes no VP9 compression session).
 pub const K_CM_VIDEO_CODEC_TYPE_VP9: u32 = 0x76703039;
+/// kCMVideoCodecType_MPEG4Video = 'mp4v' (0x6D703476). Documented in
+/// Apple's CoreMedia headers; this is MPEG-4 Part 2 (Visual / ASP / SP),
+/// distinct from MPEG-4 Part 10 (H.264 — `'avc1'`). Decode-only here:
+/// VideoToolbox exposes an MPEG-4 Part 2 *decoder* (used historically for
+/// DivX / Xvid playback) but no MPEG-4 Part 2 compression session, so the
+/// crate registers only a decoder.
+pub const K_CM_VIDEO_CODEC_TYPE_MPEG4_VIDEO: u32 = 0x6D703476;
 
 // ─────────────────────────── Public factories ────────────────────────────────
 
@@ -1382,9 +1455,53 @@ pub fn make_vp9_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     BlobDecoder::make("vp9", K_CM_VIDEO_CODEC_TYPE_VP9, params)
 }
 
+/// MPEG-4 Part 2 (Visual / ASP / SP) video decoder via VideoToolbox.
+///
+/// Decode-only: VideoToolbox exposes an MPEG-4 Part 2 *decoder*
+/// (`kCMVideoCodecType_MPEG4Video` = `'mp4v'`) — historically used for
+/// DivX / Xvid playback on macOS — but no MPEG-4 Part 2 compression
+/// session, so there is no matching `make_mpeg4_part_two_encoder`.
+///
+/// Input is an MPEG-4 Part 2 elementary stream (no container framing). The
+/// `FrameSplit::Mpeg4PartTwoEs` framer splits the buffer on VOP start codes
+/// (`00 00 01 B6`) into per-VOP access units, attaching any leading VOS /
+/// Visual Object / VO / VOL / GOV headers to the first VOP so the embedded
+/// VOL travels with it.
+///
+/// Codec id: `CodecId::new("mpeg4")` (matching the workspace's MPEG-4
+/// Part 2 software codec). Note this is **not** H.264 — H.264 is MPEG-4
+/// Part 10 and uses `kCMVideoCodecType_H264` (`'avc1'`).
+///
+/// ## Session-creation caveat
+///
+/// VideoToolbox's MPEG-4 Part 2 decoder typically requires the VOL
+/// configuration to be supplied via the format description extensions
+/// (the ESDS `DecoderSpecificInfo` / `kCMFormatDescriptionExtension_*`
+/// keys), *not* extracted from the elementary stream as it would be for
+/// MPEG-2. Building the format description from just
+/// `(codec_type, width, height)` — the blob path — will therefore return
+/// `kVTVideoDecoderBadDataErr` / `kVTVideoDecoderMalfunctionErr` on hosts
+/// where VT enforces that requirement. When that happens, the registry's
+/// SW-fallback path kicks in and the pure-Rust MPEG-4 Part 2 decoder
+/// (lower priority) handles the stream.
+///
+/// A follow-up round can extract the VOL from the leading bytes of the
+/// elementary stream and pass it via
+/// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms` to
+/// enable hardware decode on hosts where the VOL-in-extradata shape is
+/// required.
+pub fn make_mpeg4_part_two_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    BlobDecoder::make_with_framer(
+        "mpeg4",
+        K_CM_VIDEO_CODEC_TYPE_MPEG4_VIDEO,
+        FrameSplit::Mpeg4PartTwoEs,
+        params,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split_mpeg2_access_units;
+    use super::{split_mpeg2_access_units, split_mpeg4_part_two_access_units};
 
     // Start codes: B3 = sequence header, B8 = GOP, 00 = picture, B5 = ext.
     const SEQ: &[u8] = &[0x00, 0x00, 0x01, 0xB3, 0xAA];
@@ -1432,5 +1549,65 @@ mod tests {
     #[test]
     fn empty_buffer_yields_nothing() {
         assert!(split_mpeg2_access_units(&[]).is_empty());
+    }
+
+    // ── MPEG-4 Part 2 splitter ───────────────────────────────────────────────
+
+    // MPEG-4 Part 2 start codes (ISO/IEC 14496-2):
+    //   B0 = VOS (Visual Object Sequence), B5 = Visual Object, 01..1F = VO,
+    //   20..2F = VOL (Video Object Layer), B3 = GOV (Group of VOP), B6 = VOP,
+    //   B2 = user data.
+    const VOS: &[u8] = &[0x00, 0x00, 0x01, 0xB0, 0xAA]; // VOS start + profile byte
+    const VOB: &[u8] = &[0x00, 0x00, 0x01, 0xB5, 0xBB]; // Visual Object start
+    const VOL: &[u8] = &[0x00, 0x00, 0x01, 0x20, 0xCC]; // VOL (one of 20..2F)
+    const GOV: &[u8] = &[0x00, 0x00, 0x01, 0xB3, 0xDD]; // GOV start
+    const VOP: &[u8] = &[0x00, 0x00, 0x01, 0xB6, 0xEE]; // VOP start
+    const M4_SLICE: &[u8] = &[0x00, 0x00, 0x01, 0x01, 0xFF];
+
+    #[test]
+    fn mpeg4_single_vop_with_headers() {
+        // VOS + VOB + VOL + GOV + VOP + slice → one access unit covering all.
+        let buf = cat(&[VOS, VOB, VOL, GOV, VOP, M4_SLICE]);
+        let units = split_mpeg4_part_two_access_units(&buf);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0], &buf[..]);
+    }
+
+    #[test]
+    fn mpeg4_two_vops_first_keeps_headers() {
+        // VOS + VOL + VOP1 + slice + VOP2 + slice → two access units; the
+        // first inherits the leading VOS / VOL headers.
+        let vop1 = cat(&[VOS, VOL, VOP, M4_SLICE]);
+        let vop2 = cat(&[VOP, M4_SLICE]);
+        let buf = cat(&[&vop1, &vop2]);
+        let units = split_mpeg4_part_two_access_units(&buf);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0], &vop1[..]);
+        assert_eq!(units[1], &vop2[..]);
+    }
+
+    #[test]
+    fn mpeg4_no_vop_start_code_returns_whole() {
+        // A buffer with only VOS + VOL (no VOP) is handed through intact.
+        let buf = cat(&[VOS, VOL]);
+        let units = split_mpeg4_part_two_access_units(&buf);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0], &buf[..]);
+    }
+
+    #[test]
+    fn mpeg4_empty_buffer_yields_nothing() {
+        assert!(split_mpeg4_part_two_access_units(&[]).is_empty());
+    }
+
+    #[test]
+    fn mpeg4_does_not_confuse_other_start_codes() {
+        // GOV (B3) and VOS (B0) are not VOP starts — only B6 is. A buffer
+        // with leading GOV+VOS but no VOP must return the whole buffer (no
+        // VOP found path), not split mid-stream on the non-VOP codes.
+        let buf = cat(&[GOV, VOS, &[0x11, 0x22]]);
+        let units = split_mpeg4_part_two_access_units(&buf);
+        assert_eq!(units.len(), 1, "non-VOP start codes must not trigger split");
+        assert_eq!(units[0], &buf[..]);
     }
 }
