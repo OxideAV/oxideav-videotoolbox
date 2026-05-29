@@ -21,11 +21,15 @@
 //! # Status
 //!
 //! H.264 + HEVC decode + encode and JPEG + ProRes decode + encode are wired
-//! via `VTDecompressionSession` / `VTCompressionSession`. Round 4 (this
-//! commit) adds **MPEG-2 video decode** (`kCMVideoCodecType_MPEG2Video`,
-//! decode-only — VideoToolbox has no MPEG-2 encoder), with an
-//! elementary-stream framer that carves per-picture access units. All codec
-//! ids register with `priority = 10` and `hardware_accelerated = true`.
+//! via `VTDecompressionSession` / `VTCompressionSession`. Round 4 added
+//! **MPEG-2 video decode** (`kCMVideoCodecType_MPEG2Video`, decode-only —
+//! VideoToolbox has no MPEG-2 encoder), with an elementary-stream framer
+//! that carves per-picture access units. Round 5 (this commit) adds **VP9
+//! decode** (`kCMVideoCodecType_VP9` = `'vp09'`, decode-only — VT has no
+//! VP9 encoder either); VP9 frames are container-framed (IVF / Matroska /
+//! MP4) so each demuxed `Packet` is one access unit and the existing blob
+//! `FrameSplit::Whole` path applies unchanged. All codec ids register with
+//! `priority = 10` and `hardware_accelerated = true`.
 //!
 //! # Workspace policy
 //!
@@ -44,10 +48,10 @@ pub mod decoder;
 pub mod encoder;
 
 /// Register VideoToolbox hardware factories: H.264 / HEVC / JPEG / ProRes
-/// decode + encode, plus MPEG-2 video decode (decode-only). If the framework
-/// cannot be loaded (older OS, sandboxed environment, non-macOS) the function
-/// logs and returns without registering anything — the runtime falls back to
-/// the pure-Rust impls.
+/// decode + encode, plus MPEG-2 video and VP9 decode (decode-only — neither
+/// has a VT encoder). If the framework cannot be loaded (older OS, sandboxed
+/// environment, non-macOS) the function logs and returns without registering
+/// anything — the runtime falls back to the pure-Rust impls.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
@@ -205,7 +209,32 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
             ]),
     );
 
-    let _ = (h264_caps, hevc_caps, jpeg_caps, prores_caps, mpeg2_caps); // suppress unused warnings
+    // ── VP9 decoder (decode-only — VT has no VP9 encoder) ───────────────────
+    let vp9_caps = CodecCapabilities::video("vp9_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("vp9"))
+            .capabilities(vp9_caps.clone().with_decode())
+            .decoder(blob::make_vp9_decoder)
+            .tags([
+                CodecTag::fourcc(b"vp09"),
+                CodecTag::fourcc(b"VP90"),
+                CodecTag::matroska("V_VP9"),
+            ]),
+    );
+
+    let _ = (
+        h264_caps,
+        hevc_caps,
+        jpeg_caps,
+        prores_caps,
+        mpeg2_caps,
+        vp9_caps,
+    ); // suppress unused warnings
 }
 
 #[cfg(feature = "registry")]

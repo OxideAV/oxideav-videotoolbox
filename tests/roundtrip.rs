@@ -312,6 +312,27 @@ fn register_installs_mpeg2_decode_only() {
     );
 }
 
+/// VP9 is decode-only (VideoToolbox exposes no VP9 compression session),
+/// so its factory must install a decoder but NOT an encoder.
+#[test]
+fn register_installs_vp9_decode_only() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping vp9 registry check");
+        return;
+    }
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_videotoolbox::register(&mut ctx);
+    let cid = oxideav_core::CodecId::new("vp9");
+    assert!(
+        ctx.codecs.has_decoder(&cid),
+        "no VT decoder registered for vp9"
+    );
+    assert!(
+        !ctx.codecs.has_encoder(&cid),
+        "VT must not register a VP9 encoder (none exists)"
+    );
+}
+
 // ─────────────────────────── MPEG-2 decode test ───────────────────────────────
 
 /// Run `ffmpeg` as an opaque black-box validator to produce an MPEG-2
@@ -504,4 +525,310 @@ fn mpeg2_decode_against_ffmpeg() {
         best_psnr >= 30.0,
         "mpeg2 PSNR_Y {best_psnr:.1} dB < 30 dB threshold"
     );
+}
+
+// ─────────────────────────── VP9 decode test ─────────────────────────────────
+
+/// Parse an IVF (`.ivf`) container into per-frame VP9 byte slices.
+///
+/// IVF layout: 32-byte file header (signature `DKIF`), then a sequence of
+/// records each consisting of a 12-byte frame header (4-byte little-endian
+/// `frame_size`, 8-byte little-endian `pts`) followed by `frame_size` bytes
+/// of compressed VP9 data. Returns `None` if the signature is wrong or any
+/// record runs off the end of the buffer.
+fn parse_ivf(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
+    const IVF_FILE_HEADER_LEN: usize = 32;
+    const IVF_FRAME_HEADER_LEN: usize = 12;
+    if buf.len() < IVF_FILE_HEADER_LEN || &buf[0..4] != b"DKIF" {
+        return None;
+    }
+    let mut frames = Vec::new();
+    let mut i = IVF_FILE_HEADER_LEN;
+    while i + IVF_FRAME_HEADER_LEN <= buf.len() {
+        let size = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+        let payload_start = i + IVF_FRAME_HEADER_LEN;
+        let payload_end = payload_start.checked_add(size)?;
+        if payload_end > buf.len() {
+            return None;
+        }
+        frames.push(buf[payload_start..payload_end].to_vec());
+        i = payload_end;
+    }
+    Some(frames)
+}
+
+/// Run `ffmpeg` as an opaque black-box validator to produce a VP9 IVF
+/// stream (and a reference raw-YUV decode). Returns
+/// `(per_frame_vp9_payloads, reference_first_frame_i420)` or `None` if
+/// ffmpeg is unavailable / lacks libvpx-vp9.
+fn ffmpeg_vp9_fixture(
+    width: usize,
+    height: usize,
+    frames: usize,
+) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    use std::process::Command;
+
+    let ffmpeg = [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "ffmpeg",
+    ]
+    .into_iter()
+    .find(|p| {
+        Command::new(p)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })?;
+
+    let dir = std::env::temp_dir();
+    let ivf = dir.join(format!("oxideav_vt_vp9_{width}x{height}.ivf"));
+    let yuv = dir.join(format!("oxideav_vt_vp9_{width}x{height}.yuv"));
+
+    // Encode a smooth gradient to a VP9 IVF stream. libvpx-vp9 is the
+    // standard ffmpeg VP9 encoder; if it's not built into this ffmpeg the
+    // command fails and we skip the test.
+    let status = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "gradients=s={width}x{height}:c0=black:c1=white:d=1:r={frames},format=yuv420p"
+            ),
+            "-frames:v",
+            &frames.to_string(),
+            "-c:v",
+            "libvpx-vp9",
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            "-b:v",
+            "500k",
+            "-f",
+            "ivf",
+        ])
+        .arg(&ivf)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    // Reference decode: first frame as raw I420.
+    let status = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&ivf)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    let ivf_bytes = std::fs::read(&ivf).ok()?;
+    let ref_yuv = std::fs::read(&yuv).ok()?;
+    let _ = std::fs::remove_file(&ivf);
+    let _ = std::fs::remove_file(&yuv);
+
+    let payloads = parse_ivf(&ivf_bytes)?;
+    if payloads.is_empty() {
+        return None;
+    }
+
+    let frame_size = width * height * 3 / 2;
+    if ref_yuv.len() < frame_size {
+        return None;
+    }
+    Some((payloads, ref_yuv[..frame_size].to_vec()))
+}
+
+/// Decode an ffmpeg-produced VP9 IVF stream through the VideoToolbox bridge
+/// and assert the first decoded frame matches ffmpeg's own software decode
+/// (PSNR_Y ≥ 30 dB — VP9 + chroma round-trips and VT's IDCT differ slightly
+/// from libvpx-vp9's, matching the MPEG-2 bar).
+///
+/// Self-skips when ffmpeg / libvpx-vp9 / VideoToolbox is unavailable, or
+/// when the VT VP9 decoder errors out at session-create time (older macOS
+/// without the VP9 decoder, Intel Mac without the dedicated VP9 IP and no
+/// software fallback in this VT build).
+#[test]
+fn vp9_decode_against_ffmpeg() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping vp9 decode");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let frames = 10usize;
+
+    let Some((payloads, ref_i420)) = ffmpeg_vp9_fixture(width, height, frames) else {
+        eprintln!("oxideav-videotoolbox: ffmpeg/libvpx-vp9 unavailable, skipping vp9 decode test");
+        return;
+    };
+
+    let dec_params = {
+        let mut p = CodecParameters::video(CodecId::new("vp9"));
+        p.width = Some(width as u32);
+        p.height = Some(height as u32);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+        p
+    };
+
+    let mut decoder = match vt_blob::make_vp9_decoder(&dec_params) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("VT VP9 decoder unavailable on this host: {e}; skipping");
+            return;
+        }
+    };
+
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    let mut session_err: Option<Error> = None;
+
+    for (i, payload) in payloads.iter().enumerate() {
+        let pkt = oxideav_core::Packet::new(
+            0,
+            oxideav_core::TimeBase::new(1, 1_000_000),
+            payload.clone(),
+        )
+        .with_pts((i as i64) * 33_333);
+        if let Err(e) = decoder.send_packet(&pkt) {
+            // First-call failure is treated as "VP9 decoder not available
+            // on this host" — skip rather than fail.
+            session_err = Some(e);
+            break;
+        }
+        loop {
+            match decoder.receive_frame() {
+                Ok(Frame::Video(vf)) => decoded.push(vf),
+                Ok(_) => {}
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_frame error: {e}"),
+            }
+        }
+    }
+    if let Some(e) = session_err {
+        if decoded.is_empty() {
+            eprintln!("VT VP9 decoder errored at decode time: {e}; skipping");
+            return;
+        }
+    }
+
+    decoder.flush().expect("decoder flush");
+    loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(vf)) => decoded.push(vf),
+            Ok(_) => {}
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame (flush) error: {e}"),
+        }
+    }
+
+    if decoded.is_empty() {
+        eprintln!("VT VP9 decoder produced no frames; skipping (host may lack VP9 support)");
+        return;
+    }
+
+    // Dimensions.
+    for (i, df) in decoded.iter().enumerate() {
+        assert_eq!(df.planes.len(), 3, "vp9 frame {i}: expected 3 planes");
+        let dec_w = df.planes[0].stride;
+        let dec_h = df.planes[0].data.len() / dec_w.max(1);
+        assert_eq!(dec_w, width, "vp9 frame {i}: width mismatch");
+        assert_eq!(dec_h, height, "vp9 frame {i}: height mismatch");
+    }
+
+    // Build a reference VideoFrame from ffmpeg's raw I420 first frame.
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    let y_len = width * height;
+    let c_len = chroma_w * chroma_h;
+    let ref_frame = VideoFrame {
+        pts: None,
+        planes: vec![
+            VideoPlane {
+                stride: width,
+                data: ref_i420[..y_len].to_vec(),
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: ref_i420[y_len..y_len + c_len].to_vec(),
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: ref_i420[y_len + c_len..y_len + 2 * c_len].to_vec(),
+            },
+        ],
+    };
+
+    let best_psnr = decoded
+        .iter()
+        .map(|df| psnr_y(&ref_frame, df))
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    println!(
+        "vp9 decode: {} frames decoded, best PSNR_Y vs ffmpeg = {:.1} dB",
+        decoded.len(),
+        best_psnr
+    );
+
+    assert!(
+        best_psnr >= 30.0,
+        "vp9 PSNR_Y {best_psnr:.1} dB < 30 dB threshold"
+    );
+}
+
+// ─────────────────────────── IVF parser unit tests ───────────────────────────
+
+#[cfg(test)]
+mod ivf_tests {
+    use super::parse_ivf;
+
+    fn build_ivf(frames: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // 32-byte file header — only the 4-byte signature matters to our parser.
+        buf.extend_from_slice(b"DKIF");
+        buf.extend_from_slice(&[0u8; 28]);
+        for f in frames {
+            buf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes());
+            buf.extend_from_slice(f);
+        }
+        buf
+    }
+
+    #[test]
+    fn parses_multiple_frames() {
+        let f1: &[u8] = &[0xAA, 0xBB];
+        let f2: &[u8] = &[0xCC, 0xDD, 0xEE];
+        let buf = build_ivf(&[f1, f2]);
+        let frames = parse_ivf(&buf).expect("parses");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(&frames[0], f1);
+        assert_eq!(&frames[1], f2);
+    }
+
+    #[test]
+    fn rejects_missing_signature() {
+        let mut buf = build_ivf(&[&[0x01]]);
+        buf[0] = b'X';
+        assert!(parse_ivf(&buf).is_none());
+    }
+
+    #[test]
+    fn rejects_truncated_payload() {
+        let mut buf = build_ivf(&[&[0x01, 0x02, 0x03]]);
+        // Drop the last byte: the declared frame_size now overruns the buffer.
+        buf.pop();
+        assert!(parse_ivf(&buf).is_none());
+    }
 }

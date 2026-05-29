@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 5: VP9 video decode** via `VTDecompressionSession`
+  (`kCMVideoCodecType_VP9` = `'vp09'`). Decode-only — VideoToolbox exposes a
+  VP9 decoder (hardware on M1+ Apple Silicon, with VT-internal software
+  fallback elsewhere) but no VP9 compression session, so `make_vp9_decoder`
+  registers a decoder against `CodecId::new("vp9")` and there is no encoder
+  factory.
+  - VP9 reuses the existing blob `FrameSplit::Whole` path: frames are
+    container-framed (IVF / Matroska / MP4) and arrive as one self-contained
+    payload per `Packet`. No in-codec splitter is needed (VP9 has no
+    Annex-B / picture-start-code mechanism).
+  - Codec tags: `vp09 / VP90` (fourcc) and `V_VP9` (Matroska). Registers
+    with `priority = 10`, `hardware_accelerated = true`.
+  - Decode validated against `ffmpeg -c:v libvpx-vp9 -f ivf` as a black-box
+    validator. The test parses the IVF container (32-byte file header +
+    per-frame 12-byte `(frame_size, pts)` header + payload) to recover
+    individual VP9 frames, feeds each through the VT decoder, and compares
+    to ffmpeg's own software decode (PSNR_Y ≥ 30 dB). The test self-skips
+    when ffmpeg, libvpx-vp9, the framework, or the VT VP9 decoder is
+    unavailable on the host.
+  - Three new unit tests cover the IVF parser (multi-frame parse, signature
+    rejection, truncated-payload rejection).
+  - `register` now installs a VP9 decoder (and asserts via test that it
+    installs *no* VP9 encoder).
+- Added `kCMVideoCodecType_VP9` constant.
 - **Round 4: MPEG-2 video decode** via `VTDecompressionSession`
   (`kCMVideoCodecType_MPEG2Video` = `'mp2v'`). Decode-only — VideoToolbox
   exposes an MPEG-2 decoder but no MPEG-2 encoder, so `make_mpeg2_decoder`

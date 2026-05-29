@@ -1318,6 +1318,11 @@ pub const K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444: u32 = 0x61703468;
 pub const K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444_XQ: u32 = 0x61703478;
 /// kCMVideoCodecType_MPEG2Video = 'mp2v' (0x6D703276).
 pub const K_CM_VIDEO_CODEC_TYPE_MPEG2_VIDEO: u32 = 0x6D703276;
+/// kCMVideoCodecType_VP9 = 'vp09' (0x76703039). Documented in Apple's
+/// CoreMedia headers; hardware decode lands on M1+ Apple Silicon, with
+/// software fallback on Intel Macs that lack the dedicated VP9 IP.
+/// Decode-only (VideoToolbox exposes no VP9 compression session).
+pub const K_CM_VIDEO_CODEC_TYPE_VP9: u32 = 0x76703039;
 
 // ─────────────────────────── Public factories ────────────────────────────────
 
@@ -1357,6 +1362,24 @@ pub fn make_mpeg2_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> 
         FrameSplit::Mpeg2Es,
         params,
     )
+}
+
+/// VP9 video decoder via VideoToolbox.
+///
+/// Decode-only: VideoToolbox exposes a VP9 *decoder*
+/// (`kCMVideoCodecType_VP9` = `'vp09'`) but no VP9 compression session,
+/// so there is no matching `make_vp9_encoder`. Hardware decode is wired
+/// on M1+ Apple Silicon; older Intel Macs that lack the dedicated VP9 IP
+/// either fall back to a software path inside VT or return a non-zero
+/// `OSStatus` at session creation (in which case the registry retries the
+/// next-priority impl, typically the pure-Rust VP9 decoder).
+///
+/// Framing: VP9 has no Annex-B / picture-start-code mechanism — frames are
+/// container-framed (IVF / Matroska / MP4), so each demuxed `Packet` is
+/// already exactly one VP9 superframe / frame and goes through unchanged.
+/// `FrameSplit::Whole` is therefore correct here.
+pub fn make_vp9_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    BlobDecoder::make("vp9", K_CM_VIDEO_CODEC_TYPE_VP9, params)
 }
 
 #[cfg(test)]

@@ -38,11 +38,17 @@ Users who want to force the pure-Rust path globally can pass `--no-hwaccel` to t
 | ProRes       | hardware          | hardware          | wired (≈ 52 dB PSNR_Y)  |
 | JPEG (MJPEG) | hardware          | hardware          | wired (≈ 36 dB PSNR_Y)  |
 | MPEG-2       | hardware          | — (no VT encoder) | wired (≈ 61 dB PSNR_Y, decode-only) |
+| VP9          | hardware (M1+)    | — (no VT encoder) | wired (decode-only)     |
 | MPEG-4 Pt 2  | hardware          | —                 | roadmap                 |
-| VP9          | hardware (M1+)    | —                 | roadmap                 |
 | AV1          | hardware (M3+)    | hardware (M3+)    | roadmap                 |
 
-Round 1: scaffolding. Round 2: H.264 + HEVC decode + encode. Round 3: JPEG (MJPEG) + ProRes decode + encode via a shared blob-codec module (`blob.rs`) — single-blob frames built on `CMVideoFormatDescriptionCreate(width, height, codecType)` rather than the parameter-set extraction H.264/HEVC need. **Round 4 (this commit): MPEG-2 video decode** (`kCMVideoCodecType_MPEG2Video`) — decode-only, since VideoToolbox exposes an MPEG-2 *decoder* but no encoder. An elementary-stream framer (`FrameSplit::Mpeg2Es`) carves the incoming bitstream into per-picture access units before each is handed to a `VTDecompressionSession`. Remaining roadmap: VP9 / AV1 / MPEG-4 Pt 2.
+Round 1: scaffolding. Round 2: H.264 + HEVC decode + encode. Round 3: JPEG (MJPEG) + ProRes decode + encode via a shared blob-codec module (`blob.rs`) — single-blob frames built on `CMVideoFormatDescriptionCreate(width, height, codecType)` rather than the parameter-set extraction H.264/HEVC need. Round 4: MPEG-2 video decode (`kCMVideoCodecType_MPEG2Video`) — decode-only, since VideoToolbox exposes an MPEG-2 *decoder* but no encoder; an elementary-stream framer (`FrameSplit::Mpeg2Es`) carves the incoming bitstream into per-picture access units. **Round 5 (this commit): VP9 decode** (`kCMVideoCodecType_VP9` = `'vp09'`) — decode-only (no VT VP9 encoder); hardware decode on M1+ Apple Silicon, with VT falling back to software on older Macs that lack the dedicated VP9 IP. VP9 frames are container-framed (IVF / Matroska / MP4) so `FrameSplit::Whole` applies unchanged — no per-picture splitter is needed. Remaining roadmap: AV1 / MPEG-4 Pt 2.
+
+### Round 5 implementation notes
+
+* **VP9 is decode-only.** VideoToolbox ships a VP9 decoder (M1+) but no VP9 compression session, so `make_vp9_decoder` registers a decoder against `CodecId::new("vp9")` (tags `vp09 / VP90 / V_VP9`) and there is deliberately no matching encoder factory.
+* **Container-framed, no in-codec splitter.** Unlike MPEG-2's elementary-stream input, VP9 has no Annex-B / picture-start-code mechanism — frames are framed by the surrounding container (IVF, Matroska, MP4) and arrive as one self-contained payload per `Packet`. `BlobDecoder` is therefore instantiated with `FrameSplit::Whole`; bytes flow straight from `Packet::data` into the `CMSampleBuffer` without any in-codec carving.
+* **Validated against ffmpeg.** The decode test asks `ffmpeg -c:v libvpx-vp9 -f ivf` to produce a 320×240 / 10-frame gradient stream, parses the IVF container (32-byte file header + per-frame 12-byte header + payload) to recover individual VP9 frames, feeds each as one `Packet`, and compares to ffmpeg's own software decode (PSNR_Y ≥ 30 dB threshold). The test self-skips when ffmpeg / libvpx-vp9 / the framework / the VT VP9 decoder is unavailable — older OS, Intel Macs without VP9 IP, ffmpeg builds without libvpx.
 
 ### Round 4 implementation notes
 
