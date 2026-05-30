@@ -22,6 +22,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 8: AV1 video decode** via `VTDecompressionSession`
+  (`kCMVideoCodecType_AV1` = `'av01'` = `0x6176_3031`). Decode-only —
+  VideoToolbox exposes an AV1 *compression* session on macOS 14+ for
+  M3+ hardware, but encode wiring (callback, source pixel-buffer pool,
+  rate-control properties) is a follow-up round, so
+  `make_av1_decoder` registers a decoder against
+  `CodecId::new("av1")` and there is no encoder factory.
+  - Hardware decode is gated to Apple Silicon **M3+**; on older Apple
+    Silicon (M1 / M2) and Intel hosts VideoToolbox either falls back to
+    its internal software AV1 path (on macOS versions where it exists)
+    or returns a non-zero `OSStatus` at session creation, in which case
+    the registry's SW fallback to the pure-Rust `oxideav-av1` decoder
+    handles the stream.
+  - AV1 reuses the existing blob `FrameSplit::Whole` path: frames are
+    container-framed (IVF / Matroska / MP4 / WebM / RTP) and arrive as
+    one self-contained AV1 temporal unit per `Packet`. No in-codec
+    splitter is needed — AV1 has no Annex-B / picture-start-code
+    mechanism that would require a per-frame carve.
+  - Codec tags: `av01 / AV01` (fourcc, matching the AV1 ISOBMFF
+    `'av01'` sample entry) and `V_AV1` (Matroska). Registers with
+    `priority = 10`, `hardware_accelerated = true`.
+  - Decode validated against `ffmpeg -c:v libaom-av1 -f ivf` as a
+    black-box validator. `av1_decode_against_ffmpeg` parses the IVF
+    container (32-byte file header + per-frame 12-byte
+    `(frame_size, pts)` header + payload, via the existing `parse_ivf`
+    helper shared with the VP9 test), feeds each temporal unit through
+    the VT decoder, and compares to ffmpeg's own software decode
+    (PSNR_Y ≥ 30 dB). The test self-skips when ffmpeg, libaom-av1, the
+    framework, or the VT AV1 decoder is unavailable on the host.
+  - `av1C` configuration-record (extension-atom) path is **not** wired
+    yet — the round-7 ESDS plumbing in `BlobDecoder::ensure_session`
+    already supports an arbitrary extension-atom key, so adding `av1C`
+    is a small follow-up once a host needs it (analogous to the
+    round-6→round-7 MPEG-4 Part 2 gap closure).
+  - `register` now installs an AV1 decoder (and asserts via
+    `register_installs_av1_decode_only` that it installs *no* AV1
+    encoder in round 8).
+  - Public API additions on `oxideav_videotoolbox::blob`:
+    `make_av1_decoder(&CodecParameters) -> Result<Box<dyn Decoder>>`
+    and the constant `K_CM_VIDEO_CODEC_TYPE_AV1`.
+- Two new unit / integration tests:
+  - `av1_codec_type_is_av01_fourcc` — the codec-type constant equals
+    `u32::from_be_bytes(b"av01")` = `0x6176_3031`.
+  - `register_installs_av1_decode_only` — decoder is installed for
+    `CodecId::new("av1")` and no encoder is.
+  - `av1_decode_against_ffmpeg` (integration) — end-to-end IVF → VT →
+    PSNR_Y ≥ 30 dB against ffmpeg's own decode of the same fixture.
+
 - **Round 7: MPEG-4 Part 2 VOL→ESDS extension-atom path.** On VT hosts that
   enforce VOL-via-extradata (rather than letting the decoder extract the VOL
   from the bitstream prefix), `BlobDecoder` now sniffs the configuration

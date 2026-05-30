@@ -40,8 +40,16 @@
 //! the result to `CMVideoFormatDescriptionCreate` via
 //! `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms = { "esds"
 //! : CFData }`. PSNR_Y vs ffmpeg's software decode reaches ≈ 72.8 dB
-//! (sample-exact within IDCT tolerance) on the integration fixture. All
-//! codec ids register with `priority = 10` and `hardware_accelerated = true`.
+//! (sample-exact within IDCT tolerance) on the integration fixture.
+//! **Round 8 (this commit) adds AV1 video decode** via
+//! `kCMVideoCodecType_AV1 = 'av01'`. Decode-only — AV1 hardware decode
+//! is gated to Apple Silicon M3+, and VT falls back to its internal SW
+//! AV1 path elsewhere where available; an encoder factory is a
+//! follow-up round (VT's AV1 encode session is M3+ / macOS 14+ only).
+//! AV1 frames are container-framed (IVF / Matroska / MP4) so each
+//! demuxed `Packet` is one temporal unit and the blob
+//! `FrameSplit::Whole` path applies unchanged. All codec ids register
+//! with `priority = 10` and `hardware_accelerated = true`.
 //!
 //! # Workspace policy
 //!
@@ -60,11 +68,13 @@ pub mod decoder;
 pub mod encoder;
 
 /// Register VideoToolbox hardware factories: H.264 / HEVC / JPEG / ProRes
-/// decode + encode, plus MPEG-2 video, VP9, and MPEG-4 Part 2 decode
-/// (decode-only — none of the three has a VT encoder). If the framework
-/// cannot be loaded (older OS, sandboxed environment, non-macOS) the function
-/// logs and returns without registering anything — the runtime falls back to
-/// the pure-Rust impls.
+/// decode + encode, plus MPEG-2 video, VP9, MPEG-4 Part 2, and AV1 decode
+/// (the last four are decode-only — VideoToolbox exposes no MPEG-2 / VP9 /
+/// MPEG-4 Part 2 compression session at all, and the AV1 compression
+/// session is a follow-up round). If the framework cannot be loaded
+/// (older OS, sandboxed environment, non-macOS) the function logs and
+/// returns without registering anything — the runtime falls back to the
+/// pure-Rust impls.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
@@ -271,6 +281,30 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
             ]),
     );
 
+    // ── AV1 decoder (decode-only — VT AV1 encoder is M3+/macOS 14+, future round)
+    //
+    // AV1 hardware decode is gated to Apple Silicon M3+ chips. On older
+    // hardware VideoToolbox falls back to its internal software AV1 path
+    // on macOS versions where it exists, and otherwise returns a non-zero
+    // `OSStatus` at session creation — the registry's SW fallback to the
+    // pure-Rust `oxideav-av1` decoder handles that case.
+    let av1_caps = CodecCapabilities::video("av1_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("av1"))
+            .capabilities(av1_caps.clone().with_decode())
+            .decoder(blob::make_av1_decoder)
+            .tags([
+                CodecTag::fourcc(b"av01"),
+                CodecTag::fourcc(b"AV01"),
+                CodecTag::matroska("V_AV1"),
+            ]),
+    );
+
     let _ = (
         h264_caps,
         hevc_caps,
@@ -279,6 +313,7 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
         mpeg2_caps,
         vp9_caps,
         mpeg4_caps,
+        av1_caps,
     ); // suppress unused warnings
 }
 

@@ -1583,6 +1583,19 @@ pub const K_CM_VIDEO_CODEC_TYPE_VP9: u32 = 0x76703039;
 /// DivX / Xvid playback) but no MPEG-4 Part 2 compression session, so the
 /// crate registers only a decoder.
 pub const K_CM_VIDEO_CODEC_TYPE_MPEG4_VIDEO: u32 = 0x6D703476;
+/// kCMVideoCodecType_AV1 = 'av01' (0x61763031). Documented in Apple's
+/// CoreMedia headers as the AV1 codec-type identifier (matches the
+/// `av01` sample-entry fourcc defined by the AV1 ISOBMFF mapping at
+/// `docs/container/mpeg4/av1-isobmff/`). Hardware decode is gated to
+/// Apple Silicon M3+ chips; on older hardware VideoToolbox falls back
+/// to its internal software AV1 decoder where available, and returns a
+/// non-zero `OSStatus` at session creation when it isn't (the
+/// registry's SW fallback to `oxideav-av1` covers that case).
+/// **Decode-only here** — round 8 wires the decoder; an encoder
+/// factory is a future-round item (VT exposes a `'av01'` *compression*
+/// session on macOS 14+ for hosts with the M3+ hardware encoder, but
+/// the encode path needs its own callback/pixel-buffer wiring).
+pub const K_CM_VIDEO_CODEC_TYPE_AV1: u32 = 0x61763031;
 
 // ─────────────────────────── Public factories ────────────────────────────────
 
@@ -1691,6 +1704,47 @@ pub fn make_mpeg4_part_two_decoder(params: &CodecParameters) -> Result<Box<dyn D
         FrameSplit::Mpeg4PartTwoEs,
         params,
     )
+}
+
+/// AV1 video decoder via VideoToolbox.
+///
+/// Decode-only here: VideoToolbox exposes an AV1 *decoder*
+/// (`kCMVideoCodecType_AV1` = `'av01'`) on macOS 11+, with hardware
+/// acceleration gated to Apple Silicon M3+ chips. On older hardware
+/// (Intel Macs, M1 / M2) VideoToolbox falls back to its internal
+/// software AV1 path on macOS versions where that path exists, or
+/// returns a non-zero `OSStatus` at session creation otherwise. The
+/// registry's SW fallback to the pure-Rust `oxideav-av1` decoder
+/// covers the latter case.
+///
+/// ## Framing
+///
+/// AV1 access units are container-framed in IVF / Matroska / MP4 /
+/// WebM / RTP. Each `Packet` carries one AV1 temporal unit (one or
+/// more OBUs that together compose a single decoded frame) end-to-end,
+/// so `FrameSplit::Whole` is correct here — there is no in-codec
+/// access-unit splitter analogous to MPEG-2's or MPEG-4 Part 2's start
+/// code carve. (AV1 OBUs do have `obu_size` fields, but the demuxer
+/// has already produced exactly one temporal unit per `Packet`.)
+///
+/// ## Configuration record (av1C)
+///
+/// AV1 in MP4 / Matroska carries an `av1C` configuration record whose
+/// payload is the AV1 Sequence Header OBU (per the AV1 ISOBMFF mapping
+/// at `docs/container/mpeg4/av1-isobmff/`). On hosts where VT requires
+/// the Sequence Header via the format description's
+/// `SampleDescriptionExtensionAtoms` rather than extracted from the
+/// first packet, supplying the `av1C` blob via the extension atoms is
+/// the same pattern as MPEG-4 Part 2's ESDS extension wired in round 7
+/// — a follow-up round can carry it once a host needs it; the round-8
+/// `(codec_type, width, height)` path covers the common case.
+///
+/// ## Codec id
+///
+/// `CodecId::new("av1")`, matching the workspace's pure-Rust `oxideav-av1`
+/// codec id.
+pub fn make_av1_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    BlobDecoder::make("av1", K_CM_VIDEO_CODEC_TYPE_AV1, params)
 }
 
 #[cfg(test)]
@@ -1930,5 +1984,17 @@ mod tests {
             .expect("SLConfigDescriptor tag present");
         let slc_payload = esds[slc_pos + 5];
         assert_eq!(slc_payload, 0x02);
+    }
+
+    // ── AV1 codec-type identifier ────────────────────────────────────────────
+
+    /// `kCMVideoCodecType_AV1` must match the four-character code `'av01'`
+    /// (the same fourcc carried in the AV1 ISOBMFF `av01` sample entry).
+    /// The constant is `0x61763031` = `b'a' b'v' b'0' b'1'`.
+    #[test]
+    fn av1_codec_type_is_av01_fourcc() {
+        let expected = u32::from_be_bytes(*b"av01");
+        assert_eq!(super::K_CM_VIDEO_CODEC_TYPE_AV1, expected);
+        assert_eq!(super::K_CM_VIDEO_CODEC_TYPE_AV1, 0x6176_3031);
     }
 }

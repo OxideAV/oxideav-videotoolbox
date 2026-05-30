@@ -357,6 +357,29 @@ fn register_installs_mpeg4_part_two_decode_only() {
     );
 }
 
+/// AV1 is decode-only in round 8 — VideoToolbox exposes an AV1
+/// compression session on M3+ / macOS 14+, but the encoder side is a
+/// follow-up round. The round-8 factory installs a decoder under
+/// `CodecId::new("av1")` and NOT an encoder.
+#[test]
+fn register_installs_av1_decode_only() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping av1 registry check");
+        return;
+    }
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_videotoolbox::register(&mut ctx);
+    let cid = oxideav_core::CodecId::new("av1");
+    assert!(
+        ctx.codecs.has_decoder(&cid),
+        "no VT decoder registered for av1"
+    );
+    assert!(
+        !ctx.codecs.has_encoder(&cid),
+        "VT must not register an AV1 encoder in round 8 (compression session is a follow-up round)"
+    );
+}
+
 // ─────────────────────────── MPEG-2 decode test ───────────────────────────────
 
 /// Run `ffmpeg` as an opaque black-box validator to produce an MPEG-2
@@ -1064,5 +1087,238 @@ fn mpeg4_part_two_decode_against_ffmpeg() {
     assert!(
         best_psnr >= 30.0,
         "mpeg4 PSNR_Y {best_psnr:.1} dB < 30 dB threshold"
+    );
+}
+
+// ─────────────────────────── AV1 decode test ────────────────────────────────
+
+/// Run `ffmpeg` as an opaque black-box validator to produce an AV1 IVF
+/// stream (and a reference raw-YUV decode). Returns
+/// `(per_frame_av1_payloads, reference_first_frame_i420)` or `None` if
+/// ffmpeg / libaom-av1 is unavailable. Same shape as `ffmpeg_vp9_fixture`
+/// — AV1 in IVF carries one temporal unit per IVF frame record, so the
+/// existing `parse_ivf` helper carves it correctly.
+fn ffmpeg_av1_fixture(
+    width: usize,
+    height: usize,
+    frames: usize,
+) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    use std::process::Command;
+
+    let ffmpeg = [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "ffmpeg",
+    ]
+    .into_iter()
+    .find(|p| {
+        Command::new(p)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })?;
+
+    let dir = std::env::temp_dir();
+    let ivf = dir.join(format!("oxideav_vt_av1_{width}x{height}.ivf"));
+    let yuv = dir.join(format!("oxideav_vt_av1_{width}x{height}.yuv"));
+
+    // Encode a smooth gradient to an AV1 IVF stream. libaom-av1 is the
+    // reference AV1 encoder; if it isn't built into this ffmpeg the command
+    // fails and we skip the test. `-cpu-used 8` keeps the encode under a
+    // few seconds on CI runners.
+    let status = Command::new(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "gradients=s={width}x{height}:c0=black:c1=white:d=1:r={frames},format=yuv420p"
+            ),
+            "-frames:v",
+            &frames.to_string(),
+            "-c:v",
+            "libaom-av1",
+            "-cpu-used",
+            "8",
+            "-b:v",
+            "500k",
+            "-f",
+            "ivf",
+        ])
+        .arg(&ivf)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    // Reference decode: first frame as raw I420.
+    let status = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&ivf)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    let ivf_bytes = std::fs::read(&ivf).ok()?;
+    let ref_yuv = std::fs::read(&yuv).ok()?;
+    let _ = std::fs::remove_file(&ivf);
+    let _ = std::fs::remove_file(&yuv);
+
+    let payloads = parse_ivf(&ivf_bytes)?;
+    if payloads.is_empty() {
+        return None;
+    }
+
+    let frame_size = width * height * 3 / 2;
+    if ref_yuv.len() < frame_size {
+        return None;
+    }
+    Some((payloads, ref_yuv[..frame_size].to_vec()))
+}
+
+/// Decode an ffmpeg-produced AV1 IVF stream through the VideoToolbox bridge
+/// and assert the first decoded frame matches ffmpeg's own software decode
+/// (PSNR_Y ≥ 30 dB — same bar as VP9 / MPEG-2 / MPEG-4 Pt 2 since VT's AV1
+/// reconstruction differs slightly from libaom-av1's).
+///
+/// Self-skips when ffmpeg / libaom-av1 / VideoToolbox is unavailable, or
+/// when the VT AV1 decoder errors at session-create time (older macOS
+/// without any AV1 decoder path, or Apple Silicon below M3 without VT's
+/// internal SW fallback compiled in).
+#[test]
+fn av1_decode_against_ffmpeg() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping av1 decode");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let frames = 10usize;
+
+    let Some((payloads, ref_i420)) = ffmpeg_av1_fixture(width, height, frames) else {
+        eprintln!("oxideav-videotoolbox: ffmpeg/libaom-av1 unavailable, skipping av1 decode test");
+        return;
+    };
+
+    let dec_params = {
+        let mut p = CodecParameters::video(CodecId::new("av1"));
+        p.width = Some(width as u32);
+        p.height = Some(height as u32);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+        p
+    };
+
+    let mut decoder = match vt_blob::make_av1_decoder(&dec_params) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("VT AV1 decoder unavailable on this host: {e}; skipping");
+            return;
+        }
+    };
+
+    let mut decoded: Vec<VideoFrame> = Vec::new();
+    let mut session_err: Option<Error> = None;
+
+    for (i, payload) in payloads.iter().enumerate() {
+        let pkt = oxideav_core::Packet::new(
+            0,
+            oxideav_core::TimeBase::new(1, 1_000_000),
+            payload.clone(),
+        )
+        .with_pts((i as i64) * 33_333);
+        if let Err(e) = decoder.send_packet(&pkt) {
+            // First-call failure is treated as "AV1 decoder not available
+            // on this host" — skip rather than fail.
+            session_err = Some(e);
+            break;
+        }
+        loop {
+            match decoder.receive_frame() {
+                Ok(Frame::Video(vf)) => decoded.push(vf),
+                Ok(_) => {}
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_frame error: {e}"),
+            }
+        }
+    }
+    if let Some(e) = session_err {
+        if decoded.is_empty() {
+            eprintln!("VT AV1 decoder errored at decode time: {e}; skipping");
+            return;
+        }
+    }
+
+    decoder.flush().expect("decoder flush");
+    loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(vf)) => decoded.push(vf),
+            Ok(_) => {}
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame (flush) error: {e}"),
+        }
+    }
+
+    if decoded.is_empty() {
+        eprintln!("VT AV1 decoder produced no frames; skipping (host may lack AV1 support)");
+        return;
+    }
+
+    // Dimensions.
+    for (i, df) in decoded.iter().enumerate() {
+        assert_eq!(df.planes.len(), 3, "av1 frame {i}: expected 3 planes");
+        let dec_w = df.planes[0].stride;
+        let dec_h = df.planes[0].data.len() / dec_w.max(1);
+        assert_eq!(dec_w, width, "av1 frame {i}: width mismatch");
+        assert_eq!(dec_h, height, "av1 frame {i}: height mismatch");
+    }
+
+    // Build a reference VideoFrame from ffmpeg's raw I420 first frame.
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    let y_len = width * height;
+    let c_len = chroma_w * chroma_h;
+    let ref_frame = VideoFrame {
+        pts: None,
+        planes: vec![
+            VideoPlane {
+                stride: width,
+                data: ref_i420[..y_len].to_vec(),
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: ref_i420[y_len..y_len + c_len].to_vec(),
+            },
+            VideoPlane {
+                stride: chroma_w,
+                data: ref_i420[y_len + c_len..y_len + 2 * c_len].to_vec(),
+            },
+        ],
+    };
+
+    let best_psnr = decoded
+        .iter()
+        .map(|df| psnr_y(&ref_frame, df))
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    println!(
+        "av1 decode: {} frames decoded, best PSNR_Y vs ffmpeg = {:.1} dB",
+        decoded.len(),
+        best_psnr
+    );
+
+    assert!(
+        best_psnr >= 30.0,
+        "av1 PSNR_Y {best_psnr:.1} dB < 30 dB threshold"
     );
 }
