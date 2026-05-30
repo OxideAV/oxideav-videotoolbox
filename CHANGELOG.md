@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.2...v0.0.3) - 2026-05-30
+
+### Other
+
+- round 7: MPEG-4 Part 2 VOL→ESDS extension-atom path
+- round 6: MPEG-4 Part 2 video decode via VideoToolbox (decode-only)
+- round 5: VP9 video decode via VideoToolbox (decode-only)
+- unit-cover the MPEG-2 elementary-stream access-unit splitter
+- round 4: MPEG-2 video decode via VideoToolbox (decode-only)
+- handle ProRes 'v216' format on macos-latest CI runner
+- round 3: MJPEG + ProRes decode + encode via VideoToolbox
+- add .gitignore + drop committed Cargo.lock
+
 ### Added
 
 - **Round 7: MPEG-4 Part 2 VOL→ESDS extension-atom path.** On VT hosts that
