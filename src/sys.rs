@@ -26,6 +26,7 @@ pub type CFAllocatorRef = *mut c_void;
 pub type CFStringRef = *mut c_void;
 pub type CFNumberRef = *mut c_void;
 pub type CFArrayRef = *mut c_void;
+pub type CFDataRef = *mut c_void;
 
 pub type CMFormatDescriptionRef = *mut c_void;
 pub type CMVideoFormatDescriptionRef = CMFormatDescriptionRef;
@@ -378,6 +379,12 @@ pub type FnCFNumberCreate = unsafe extern "C" fn(
 pub type FnCFStringCreateWithCString =
     unsafe extern "C" fn(alloc: CFAllocatorRef, c_str: *const u8, encoding: u32) -> CFStringRef;
 
+/// `CFDataCreate(allocator, bytes, length)` — copies `bytes[0..length]`
+/// into a fresh `CFData`. Used to wrap the ESDS / VOL configuration blob
+/// for `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms`.
+pub type FnCFDataCreate =
+    unsafe extern "C" fn(alloc: CFAllocatorRef, bytes: *const u8, length: i64) -> CFDataRef;
+
 pub type FnCFRelease = unsafe extern "C" fn(cf: CFTypeRef);
 pub type FnCFRetain = unsafe extern "C" fn(cf: CFTypeRef) -> CFTypeRef;
 
@@ -444,6 +451,7 @@ pub struct Vtable {
     pub cf_dict_create: FnCFDictionaryCreate,
     pub cf_number_create: FnCFNumberCreate,
     pub cf_string_create: FnCFStringCreateWithCString,
+    pub cf_data_create: FnCFDataCreate,
     pub cf_release: FnCFRelease,
     pub cf_retain: FnCFRetain,
     // Keep libraries alive
@@ -671,6 +679,7 @@ fn load_vtable() -> Result<Vtable, String> {
         cf_dict_create: sym!(cf, "CFDictionaryCreate", FnCFDictionaryCreate),
         cf_number_create: sym!(cf, "CFNumberCreate", FnCFNumberCreate),
         cf_string_create: sym!(cf, "CFStringCreateWithCString", FnCFStringCreateWithCString),
+        cf_data_create: sym!(cf, "CFDataCreate", FnCFDataCreate),
         cf_release: sym!(cf, "CFRelease", FnCFRelease),
         cf_retain: sym!(cf, "CFRetain", FnCFRetain),
         _vt: vt,
@@ -715,6 +724,21 @@ pub unsafe fn cf_number_i32(vt: &Vtable, v: i32) -> CFNumberRef {
             &v as *const i32 as *const _,
         )
     }
+}
+
+/// Create a `CFData` containing a copy of `bytes`.
+///
+/// Used to wrap the MPEG-4 Part 2 ESDS configuration blob (or any other
+/// format-description-extension atom payload) into the form
+/// `CMVideoFormatDescriptionCreate` accepts under its `extensions`
+/// dictionary.
+///
+/// # Safety
+/// Caller must call `cf_release` on the returned value when done. `bytes`
+/// must be a valid byte slice; CoreFoundation copies the buffer so the
+/// slice need not outlive the returned `CFData`.
+pub unsafe fn cf_data(vt: &Vtable, bytes: &[u8]) -> CFDataRef {
+    unsafe { (vt.cf_data_create)(std::ptr::null_mut(), bytes.as_ptr(), bytes.len() as i64) }
 }
 
 /// Create an empty CFDictionary (no entries) via the vtable.

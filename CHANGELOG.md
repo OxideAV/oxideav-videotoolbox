@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 7: MPEG-4 Part 2 VOL→ESDS extension-atom path.** On VT hosts that
+  enforce VOL-via-extradata (rather than letting the decoder extract the VOL
+  from the bitstream prefix), `BlobDecoder` now sniffs the configuration
+  prefix from the first packet's leading bytes (everything up to but not
+  including the first VOP start code `00 00 01 B6`), wraps it in a full
+  ISO/IEC 14496-1 ESDS descriptor, and supplies it to
+  `CMVideoFormatDescriptionCreate` via
+  `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms = { "esds":
+  CFData }`. ESDS structure (per ISO/IEC 14496-1 §7.2.6 + ISO/IEC 14496-14
+  §5.6):
+  - `ES_Descriptor` (tag `0x03`) — `ES_ID = 0`, flags = `0`.
+  - `DecoderConfigDescriptor` (tag `0x04`) — `ObjectTypeIndication = 0x20`
+    (MPEG-4 Visual / Part 2), `streamType << 2 | upStream | reserved =
+    (0x04 << 2) | 0 | 1 = 0x11` (VisualStream).
+  - `DecoderSpecificInfo` (tag `0x05`) — VOL bytes verbatim.
+  - `SLConfigDescriptor` (tag `0x06`) — 1-byte `predefined = 0x02` (mp4 file).
+  The `mpeg4_part_two_decode_against_ffmpeg` integration test now reaches
+  ≈ 72.8 dB PSNR_Y vs ffmpeg's software decode on the gradient fixture
+  (10/10 frames returned). Other framers (Whole / Mpeg2Es) skip the
+  extension dictionary entirely so their session-creation calls are
+  byte-for-byte unchanged.
+  - Public API additions on `oxideav_videotoolbox::blob`:
+    `extract_mpeg4_part_two_vol(&[u8]) -> Option<&[u8]>` and
+    `build_mpeg4_part_two_esds(vol: &[u8]) -> Vec<u8>`. Available for the
+    auditor / tests / future codecs that need a documented ESDS shape.
+  - New `cf_data(vt, &[u8])` helper in `sys` (resolves `CFDataCreate` via
+    the cached vtable).
+- Added `CFDataRef` opaque type and `FnCFDataCreate` to `sys.rs`.
+- Ten new unit tests:
+  - `mpeg4_extract_vol_returns_prefix_before_vop`
+  - `mpeg4_extract_vol_includes_gov_user_data`
+  - `mpeg4_extract_vol_none_when_no_vop`
+  - `mpeg4_extract_vol_none_when_starts_with_vop`
+  - `mpeg4_extract_vol_empty_buffer`
+  - `esds_has_full_box_header`
+  - `esds_es_descriptor_tag_0x03`
+  - `esds_decoder_config_descriptor_tag_and_oti`
+  - `esds_decoder_specific_info_carries_vol`
+  - `esds_sl_config_descriptor_predefined_2`
 - **Round 6: MPEG-4 Part 2 video decode** via `VTDecompressionSession`
   (`kCMVideoCodecType_MPEG4Video` = `'mp4v'`). Decode-only — VideoToolbox
   exposes an MPEG-4 Part 2 decoder (historically used for DivX / Xvid

@@ -658,6 +658,110 @@ fn split_mpeg4_part_two_access_units(buf: &[u8]) -> Vec<&[u8]> {
     units
 }
 
+/// Extract the MPEG-4 Part 2 configuration prefix (VOS / Visual Object / VO /
+/// VOL / optionally GOV / user-data) from the leading bytes of an elementary
+/// stream — everything up to (but not including) the first VOP start code
+/// (`00 00 01 B6`).
+///
+/// Returns `None` if no VOP start code is found, or if the buffer begins with
+/// a VOP (no configuration to extract). The returned slice is suitable as the
+/// `DecoderSpecificInfo` payload of an MPEG-4 Part 2 ESDS configuration.
+///
+/// Per ISO/IEC 14496-2, the configuration headers a hardware decoder needs
+/// are the VOS (`B0`) and at minimum one VOL (`20..2F`); GOV (`B3`),
+/// user-data (`B2`), and the Visual Object (`B5`) headers are commonly
+/// included in the same prefix and ride along.
+pub fn extract_mpeg4_part_two_vol(buf: &[u8]) -> Option<&[u8]> {
+    let mut i = 0usize;
+    while i + 4 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && buf[i + 3] == 0xB6 {
+            return if i == 0 { None } else { Some(&buf[..i]) };
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Append a 4-byte BER length (always 4-byte form so the resulting blob is a
+/// stable length per ISO/IEC 14496-1).
+fn append_ber_length(out: &mut Vec<u8>, mut value: u32) {
+    let mut bytes = [0u8; 4];
+    for i in (0..4).rev() {
+        bytes[i] = (value & 0x7F) as u8;
+        value >>= 7;
+    }
+    for b in &mut bytes[..3] {
+        *b |= 0x80;
+    }
+    out.extend_from_slice(&bytes);
+}
+
+/// Wrap an MPEG-4 Part 2 VOL configuration blob in a complete `esds` atom
+/// payload (the inner bytes that go inside the ISO BMFF `esds` box) per
+/// ISO/IEC 14496-1 §7.2.6 + ISO/IEC 14496-14 §5.6.
+///
+/// Structure:
+///
+/// * 4 bytes: FullBox version (`0`) + flags (`0`).
+/// * `ES_Descriptor` (tag `0x03`)
+///   * `ES_ID` (2 bytes BE) + flags (1 byte) — both zero (no OCR, no URL,
+///     no dependsOn).
+///   * `DecoderConfigDescriptor` (tag `0x04`)
+///     * `ObjectTypeIndication` = `0x20` (MPEG-4 Visual / Part 2).
+///     * `streamType<<2 | upStream | reserved` =
+///       `(0x04<<2) | 0 | 1` = `0x11` (`streamType = 4` is VisualStream).
+///     * `bufferSizeDB` (3 bytes BE) = `0`.
+///     * `maxBitrate` (4 bytes BE) = `0`.
+///     * `avgBitrate` (4 bytes BE) = `0`.
+///     * `DecoderSpecificInfo` (tag `0x05`)
+///       * VOL bytes (the elementary-stream prefix passed in).
+///   * `SLConfigDescriptor` (tag `0x06`)
+///     * 1 byte `predefined` = `0x02` (mp4-file SL config — VT accepts it).
+///
+/// VideoToolbox's MPEG-4 Part 2 decoder picks this up via
+/// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms`
+/// keyed by the four-character atom name `"esds"`.
+pub fn build_mpeg4_part_two_esds(vol: &[u8]) -> Vec<u8> {
+    // DecoderSpecificInfo (tag 0x05): length = vol.len()
+    let mut dsi = Vec::with_capacity(5 + vol.len());
+    dsi.push(0x05);
+    append_ber_length(&mut dsi, vol.len() as u32);
+    dsi.extend_from_slice(vol);
+
+    // DecoderConfigDescriptor (tag 0x04): 13 bytes header + DSI
+    let mut dcd = Vec::with_capacity(5 + 13 + dsi.len());
+    dcd.push(0x04);
+    let dcd_payload_len = 13 + dsi.len() as u32;
+    append_ber_length(&mut dcd, dcd_payload_len);
+    dcd.push(0x20); // ObjectTypeIndication: MPEG-4 Visual (Part 2)
+    dcd.push((0x04 << 2) | 0x01); // streamType=4 (VisualStream), upStream=0, reserved=1
+    dcd.extend_from_slice(&[0, 0, 0]); // bufferSizeDB (24-bit)
+    dcd.extend_from_slice(&[0, 0, 0, 0]); // maxBitrate
+    dcd.extend_from_slice(&[0, 0, 0, 0]); // avgBitrate
+    dcd.extend_from_slice(&dsi);
+
+    // SLConfigDescriptor (tag 0x06): 1 byte predefined=2 (mp4 file)
+    let mut slc = Vec::with_capacity(6);
+    slc.push(0x06);
+    append_ber_length(&mut slc, 1);
+    slc.push(0x02);
+
+    // ES_Descriptor (tag 0x03): 3-byte header + DCD + SLC
+    let mut esd = Vec::with_capacity(5 + 3 + dcd.len() + slc.len());
+    esd.push(0x03);
+    let esd_payload_len = 3 + dcd.len() as u32 + slc.len() as u32;
+    append_ber_length(&mut esd, esd_payload_len);
+    esd.extend_from_slice(&[0, 0, 0]); // ES_ID (2 bytes) + flags (1 byte)
+    esd.extend_from_slice(&dcd);
+    esd.extend_from_slice(&slc);
+
+    // esds FullBox payload: 4 bytes version/flags + ES_Descriptor.
+    let mut esds = Vec::with_capacity(4 + esd.len());
+    esds.extend_from_slice(&[0, 0, 0, 0]);
+    esds.extend_from_slice(&esd);
+    esds
+}
+
 // ─────────────────────────── Decoder ─────────────────────────────────────────
 
 /// Blob-style VTDecompressionSession decoder.
@@ -672,6 +776,12 @@ pub struct BlobDecoder {
     width: usize,
     height: usize,
     framer: FrameSplit,
+    /// Optional ESDS atom payload (as built by
+    /// [`build_mpeg4_part_two_esds`]) supplied to VT via
+    /// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms` /
+    /// `"esds"`. Set lazily on the first packet for the MPEG-4 Part 2
+    /// framer by extracting the VOL prefix from the elementary stream.
+    extradata_esds: Option<Vec<u8>>,
     session: sys::VTDecompressionSessionRef,
     fmt_desc: sys::CMVideoFormatDescriptionRef,
     state: Arc<Mutex<DecCallbackState>>,
@@ -713,6 +823,7 @@ impl BlobDecoder {
             width,
             height,
             framer,
+            extradata_esds: None,
             session: std::ptr::null_mut(),
             fmt_desc: std::ptr::null_mut(),
             state: DecCallbackState::new(),
@@ -728,7 +839,49 @@ impl BlobDecoder {
         }
         let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
 
-        // Build format description from (codec_type, width, height).
+        // Build the optional extensions dictionary. When `extradata_esds` is
+        // present (MPEG-4 Part 2 path after the first packet has been seen),
+        // wrap the ESDS bytes in
+        // `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms =
+        // { "esds": CFData }`. Otherwise pass NULL — the blob path
+        // `(codec_type, width, height)` covers JPEG / ProRes / MPEG-2 / VP9.
+        let mut extensions: sys::CFDictionaryRef = std::ptr::null_mut();
+        let mut ext_inner_dict: sys::CFDictionaryRef = std::ptr::null_mut();
+        let mut ext_inner_key: sys::CFStringRef = std::ptr::null_mut();
+        let mut ext_inner_val: sys::CFDataRef = std::ptr::null_mut();
+        let mut ext_outer_key: sys::CFStringRef = std::ptr::null_mut();
+        if let Some(esds) = &self.extradata_esds {
+            unsafe {
+                ext_inner_val = sys::cf_data(vt, esds);
+                ext_inner_key = sys::cf_string(vt, "esds");
+                let inner_keys: [*const c_void; 1] = [ext_inner_key as *const c_void];
+                let inner_vals: [*const c_void; 1] = [ext_inner_val as *const c_void];
+                ext_inner_dict = (vt.cf_dict_create)(
+                    std::ptr::null_mut(),
+                    inner_keys.as_ptr(),
+                    inner_vals.as_ptr(),
+                    1,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                ext_outer_key = sys::cf_string(vt, "SampleDescriptionExtensionAtoms");
+                let outer_keys: [*const c_void; 1] = [ext_outer_key as *const c_void];
+                let outer_vals: [*const c_void; 1] = [ext_inner_dict as *const c_void];
+                extensions = (vt.cf_dict_create)(
+                    std::ptr::null_mut(),
+                    outer_keys.as_ptr(),
+                    outer_vals.as_ptr(),
+                    1,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+            }
+        }
+
+        // Build format description from (codec_type, width, height) with the
+        // optional extension dictionary attached. VT consumes the dictionary
+        // by copying it into the resulting CMVideoFormatDescription; we
+        // release our refs immediately after the call returns.
         let mut fmt_desc: sys::CMVideoFormatDescriptionRef = std::ptr::null_mut();
         let st = unsafe {
             (vt.cm_video_fmt_create)(
@@ -736,10 +889,27 @@ impl BlobDecoder {
                 self.codec_type,
                 self.width as i32,
                 self.height as i32,
-                std::ptr::null_mut(),
+                extensions,
                 &mut fmt_desc,
             )
         };
+        unsafe {
+            if !extensions.is_null() {
+                (vt.cf_release)(extensions);
+            }
+            if !ext_outer_key.is_null() {
+                (vt.cf_release)(ext_outer_key);
+            }
+            if !ext_inner_dict.is_null() {
+                (vt.cf_release)(ext_inner_dict);
+            }
+            if !ext_inner_key.is_null() {
+                (vt.cf_release)(ext_inner_key);
+            }
+            if !ext_inner_val.is_null() {
+                (vt.cf_release)(ext_inner_val);
+            }
+        }
         if st != K_OS_STATUS_NO_ERROR {
             return Err(Error::other(format!(
                 "CMVideoFormatDescriptionCreate (codec 0x{:08x}): {st}",
@@ -927,6 +1097,23 @@ impl Decoder for BlobDecoder {
             .and_then(|g| g.error.as_ref().map(|s| Error::other(s.clone())))
         {
             return Err(e);
+        }
+
+        // For MPEG-4 Part 2: before the session exists, sniff the VOL prefix
+        // out of the first packet's leading bytes and wrap it in an ESDS
+        // configuration. VT's MPEG-4 Part 2 decoder enforces VOL-via-
+        // extension-atoms on some hosts; supplying it here lets those hosts
+        // create the session successfully even when the bitstream prefix
+        // alone wasn't enough.
+        if self.framer == FrameSplit::Mpeg4PartTwoEs
+            && self.session.is_null()
+            && self.extradata_esds.is_none()
+        {
+            if let Some(vol) = extract_mpeg4_part_two_vol(&packet.data) {
+                if !vol.is_empty() {
+                    self.extradata_esds = Some(build_mpeg4_part_two_esds(vol));
+                }
+            }
         }
 
         self.ensure_session()?;
@@ -1472,24 +1659,31 @@ pub fn make_vp9_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 /// Part 2 software codec). Note this is **not** H.264 — H.264 is MPEG-4
 /// Part 10 and uses `kCMVideoCodecType_H264` (`'avc1'`).
 ///
-/// ## Session-creation caveat
+/// ## VOL→ESDS extension-atom path (round 7)
 ///
-/// VideoToolbox's MPEG-4 Part 2 decoder typically requires the VOL
-/// configuration to be supplied via the format description extensions
-/// (the ESDS `DecoderSpecificInfo` / `kCMFormatDescriptionExtension_*`
-/// keys), *not* extracted from the elementary stream as it would be for
-/// MPEG-2. Building the format description from just
-/// `(codec_type, width, height)` — the blob path — will therefore return
-/// `kVTVideoDecoderBadDataErr` / `kVTVideoDecoderMalfunctionErr` on hosts
-/// where VT enforces that requirement. When that happens, the registry's
-/// SW-fallback path kicks in and the pure-Rust MPEG-4 Part 2 decoder
-/// (lower priority) handles the stream.
+/// VideoToolbox's MPEG-4 Part 2 decoder enforces that the VOL configuration
+/// be supplied via the format description extensions (the ESDS
+/// `DecoderSpecificInfo` / `kCMFormatDescriptionExtension_*` keys), *not*
+/// extracted from the elementary stream as it would be for MPEG-2. The
+/// round-7 path closes that gap: on the first packet, `BlobDecoder` calls
+/// [`extract_mpeg4_part_two_vol`] to harvest the configuration prefix
+/// (everything from offset 0 up to but not including the first VOP start
+/// code `00 00 01 B6`), wraps the bytes in a complete ESDS descriptor via
+/// [`build_mpeg4_part_two_esds`], and supplies the resulting blob to
+/// `CMVideoFormatDescriptionCreate` under the
+/// `SampleDescriptionExtensionAtoms` → `"esds"` key.
 ///
-/// A follow-up round can extract the VOL from the leading bytes of the
-/// elementary stream and pass it via
-/// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms` to
-/// enable hardware decode on hosts where the VOL-in-extradata shape is
-/// required.
+/// On hosts where the bitstream prefix alone would have been sufficient,
+/// the extra extension atom is harmless. On hosts that require the ESDS
+/// shape, this is the difference between hardware decode and a
+/// `kVTVideoDecoderBadDataErr` fallback to the pure-Rust impl.
+///
+/// If the first packet has no configuration prefix to extract (e.g. a VOP
+/// start code at offset 0, or no VOP start code at all), the extractor
+/// returns `None` and the decoder reverts to the round-6 plain
+/// `(codec_type, width, height)` path. The pure-Rust MPEG-4 Part 2 decoder
+/// remains in the registry as a lower-priority fallback for any host
+/// where session creation still fails.
 pub fn make_mpeg4_part_two_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     BlobDecoder::make_with_framer(
         "mpeg4",
@@ -1501,7 +1695,10 @@ pub fn make_mpeg4_part_two_decoder(params: &CodecParameters) -> Result<Box<dyn D
 
 #[cfg(test)]
 mod tests {
-    use super::{split_mpeg2_access_units, split_mpeg4_part_two_access_units};
+    use super::{
+        build_mpeg4_part_two_esds, extract_mpeg4_part_two_vol, split_mpeg2_access_units,
+        split_mpeg4_part_two_access_units,
+    };
 
     // Start codes: B3 = sequence header, B8 = GOP, 00 = picture, B5 = ext.
     const SEQ: &[u8] = &[0x00, 0x00, 0x01, 0xB3, 0xAA];
@@ -1609,5 +1806,129 @@ mod tests {
         let units = split_mpeg4_part_two_access_units(&buf);
         assert_eq!(units.len(), 1, "non-VOP start codes must not trigger split");
         assert_eq!(units[0], &buf[..]);
+    }
+
+    // ── MPEG-4 Part 2 VOL extraction ─────────────────────────────────────────
+
+    #[test]
+    fn mpeg4_extract_vol_returns_prefix_before_vop() {
+        // VOS + VOL + VOP + slice → VOL extraction returns VOS + VOL only,
+        // dropping the VOP and everything after it.
+        let prefix = cat(&[VOS, VOL]);
+        let buf = cat(&[&prefix, VOP, M4_SLICE]);
+        let vol = extract_mpeg4_part_two_vol(&buf).expect("vol present");
+        assert_eq!(vol, &prefix[..]);
+    }
+
+    #[test]
+    fn mpeg4_extract_vol_includes_gov_user_data() {
+        // VOS + VOL + GOV + VOP → VOL extraction returns VOS + VOL + GOV.
+        let prefix = cat(&[VOS, VOL, GOV]);
+        let buf = cat(&[&prefix, VOP, M4_SLICE]);
+        let vol = extract_mpeg4_part_two_vol(&buf).expect("vol present");
+        assert_eq!(vol, &prefix[..]);
+    }
+
+    #[test]
+    fn mpeg4_extract_vol_none_when_no_vop() {
+        // A buffer with only the headers (no VOP start) has no extraction
+        // boundary — return None and let the caller skip the ESDS path.
+        let buf = cat(&[VOS, VOL]);
+        assert!(extract_mpeg4_part_two_vol(&buf).is_none());
+    }
+
+    #[test]
+    fn mpeg4_extract_vol_none_when_starts_with_vop() {
+        // A buffer that opens with a VOP start code has no preceding
+        // configuration to extract.
+        let buf = cat(&[VOP, M4_SLICE]);
+        assert!(extract_mpeg4_part_two_vol(&buf).is_none());
+    }
+
+    #[test]
+    fn mpeg4_extract_vol_empty_buffer() {
+        assert!(extract_mpeg4_part_two_vol(&[]).is_none());
+    }
+
+    // ── MPEG-4 Part 2 ESDS construction ──────────────────────────────────────
+
+    /// Decode the 4-byte BER length form `build_mpeg4_part_two_esds` always
+    /// emits (always 4 bytes for stable parsing).
+    fn read_ber_length_4(buf: &[u8]) -> u32 {
+        let mut v = 0u32;
+        for b in &buf[..4] {
+            v = (v << 7) | (b & 0x7F) as u32;
+        }
+        v
+    }
+
+    #[test]
+    fn esds_has_full_box_header() {
+        // 4-byte version/flags prefix = 0.
+        let esds = build_mpeg4_part_two_esds(&[0xAA, 0xBB]);
+        assert!(esds.len() >= 4);
+        assert_eq!(&esds[..4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn esds_es_descriptor_tag_0x03() {
+        // Byte 4 (right after the FullBox header) is the ES_Descriptor tag.
+        let esds = build_mpeg4_part_two_esds(&[0xAA]);
+        assert_eq!(esds[4], 0x03);
+        // Bytes 5..9 are the BER length; bytes 9..12 are ES_ID(2) + flags(1)
+        // (all zero in our build).
+        assert_eq!(&esds[9..12], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn esds_decoder_config_descriptor_tag_and_oti() {
+        // After the ES_Descriptor's 3-byte ES_ID+flags, the next descriptor
+        // is the DecoderConfigDescriptor (tag 0x04). Then 1 byte ObjectType
+        // (0x20 = MPEG-4 Visual) and 1 byte streamType<<2|upStream|reserved
+        // = (4<<2)|0|1 = 0x11.
+        let esds = build_mpeg4_part_two_esds(&[0xAA]);
+        // FullBox(4) + ESD tag(1) + ESD len(4) + ES_ID+flags(3) = 12
+        let dcd_tag_pos =
+            4 /* FullBox */ + 1 /* ESD tag */ + 4 /* ESD len */ + 3 /* ES_ID+flags */;
+        assert_eq!(esds[dcd_tag_pos], 0x04);
+        let dcd_len_pos = dcd_tag_pos + 1;
+        let _dcd_len = read_ber_length_4(&esds[dcd_len_pos..dcd_len_pos + 4]);
+        let oti_pos = dcd_len_pos + 4;
+        assert_eq!(esds[oti_pos], 0x20, "ObjectTypeIndication = MPEG-4 Visual");
+        assert_eq!(
+            esds[oti_pos + 1],
+            0x11,
+            "streamType=VisualStream + reserved bit"
+        );
+    }
+
+    #[test]
+    fn esds_decoder_specific_info_carries_vol() {
+        // Inside DecoderConfigDescriptor at the 13-byte fixed header offset,
+        // the DecoderSpecificInfo (tag 0x05) contains the VOL bytes verbatim.
+        let vol: &[u8] = &[0x00, 0x00, 0x01, 0x20, 0xAA, 0xBB, 0xCC];
+        let esds = build_mpeg4_part_two_esds(vol);
+        let dsi_tag_pos =
+            4 /* FullBox */ + 1 /* ESD tag */ + 4 /* ESD len */ + 3 /* ES_ID+flags */
+            + 1 /* DCD tag */ + 4 /* DCD len */ + 13 /* DCD fixed */;
+        assert_eq!(esds[dsi_tag_pos], 0x05, "DecoderSpecificInfo tag");
+        let dsi_len = read_ber_length_4(&esds[dsi_tag_pos + 1..dsi_tag_pos + 5]);
+        assert_eq!(dsi_len as usize, vol.len());
+        let dsi_payload_pos = dsi_tag_pos + 5;
+        assert_eq!(&esds[dsi_payload_pos..dsi_payload_pos + vol.len()], vol);
+    }
+
+    #[test]
+    fn esds_sl_config_descriptor_predefined_2() {
+        // The SLConfigDescriptor (tag 0x06) sits after the DCD; its 1-byte
+        // payload is `predefined = 2` (mp4 file SL config).
+        let esds = build_mpeg4_part_two_esds(&[0xAA]);
+        // SLC sits at the end; find tag 0x06 from the back.
+        let slc_pos = esds
+            .iter()
+            .rposition(|&b| b == 0x06)
+            .expect("SLConfigDescriptor tag present");
+        let slc_payload = esds[slc_pos + 5];
+        assert_eq!(slc_payload, 0x02);
     }
 }
