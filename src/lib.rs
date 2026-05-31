@@ -41,7 +41,7 @@
 //! `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms = { "esds"
 //! : CFData }`. PSNR_Y vs ffmpeg's software decode reaches ≈ 72.8 dB
 //! (sample-exact within IDCT tolerance) on the integration fixture.
-//! **Round 8 (this commit) adds AV1 video decode** via
+//! Round 8 added AV1 video decode via
 //! `kCMVideoCodecType_AV1 = 'av01'`. Decode-only — AV1 hardware decode
 //! is gated to Apple Silicon M3+, and VT falls back to its internal SW
 //! AV1 path elsewhere where available; an encoder factory is a
@@ -50,6 +50,18 @@
 //! demuxed `Packet` is one temporal unit and the blob
 //! `FrameSplit::Whole` path applies unchanged. All codec ids register
 //! with `priority = 10` and `hardware_accelerated = true`.
+//! **Round 9 (this commit) wires encoder knobs across all four VT
+//! encoders.** `CodecParameters::bit_rate` now flows into
+//! `kVTCompressionPropertyKey_AverageBitRate`;
+//! `params.options["quality"]` (Float32 `[0.0, 1.0]`) flows into
+//! `kVTCompressionPropertyKey_Quality`; `params.options["profile"]`
+//! short aliases (`baseline` / `main` / `high` / `extended` for H.264,
+//! `main` / `main10` / `main4_2_2_10` for HEVC) flow into
+//! `kVTCompressionPropertyKey_ProfileLevel`; and the ProRes encoder's
+//! `params.tag` selects one of the six `kCMVideoCodecType_AppleProRes*`
+//! flavours (`apco` / `apcs` / `apcn` [default] / `apch` / `ap4h` /
+//! `ap4x`). Unset / out-of-range values keep the previous defaults so
+//! every existing call site is byte-for-byte unchanged.
 //!
 //! # Workspace policy
 //!

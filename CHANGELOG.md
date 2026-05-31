@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 9: encoder knobs across all four VT encoders.** Until round 8 the
+  H.264 / HEVC / MJPEG / ProRes compression sessions configured only
+  `RealTime = true`, `AllowFrameReordering = false`, and a hardcoded H.264
+  Baseline / HEVC Main `ProfileLevel`. Round 9 turns three of the public
+  `CodecParameters` fields into live properties:
+  - `params.bit_rate: Option<u64>` flows into
+    `kVTCompressionPropertyKey_AverageBitRate` (CFNumber-i32, saturating-
+    clamped to `i32::MAX`) for H.264 / HEVC / MJPEG. ProRes accepts and
+    silently ignores the property (each ProRes profile is fixed-CBR).
+  - `params.options["quality"]` parses as a Float32 in `[0.0, 1.0]`
+    (validated finite) and flows into `kVTCompressionPropertyKey_Quality`
+    (CFNumber-Float32). The MJPEG encoder treats it as its primary
+    quality lever; H.264 / HEVC / ProRes accept it as a hint that
+    interacts with the rate-control mode.
+  - `params.options["profile"]` accepts the short aliases `baseline` /
+    `main` / `high` / `extended` (H.264) and `main` / `main10` /
+    `main4_2_2_10` (HEVC), case-insensitively, and maps each to the
+    canonical `kVTProfileLevel_*_AutoLevel` string Apple's VideoToolbox
+    expects on `kVTCompressionPropertyKey_ProfileLevel`. Empty / unknown
+    values keep the codec's built-in default — every existing call site
+    sees no behaviour change.
+- **ProRes profile selection in the factory.** `make_prores_encoder` now
+  reads `params.tag` and dispatches to one of the six
+  `kCMVideoCodecType_AppleProRes*` constants (`apco` Proxy, `apcs` LT,
+  `apcn` 422 [default], `apch` HQ, `ap4h` 4444, `ap4x` 4444 XQ) via a new
+  public helper `prores_codec_type_for_tag(Option<&CodecTag>) -> Option<u32>`.
+  Missing / non-ProRes tags fall back to ProRes 422 (the round-3 default)
+  so existing callers see no change.
+- `K_CF_NUMBER_FLOAT_32_TYPE = 5` constant and `cf_number_f32(vt, v)`
+  helper in `sys.rs` (per Apple's `CFNumber.h` enum order). Used by the
+  new `Quality` plumbing; the prior `cf_number_i32` is unchanged.
+- Five new unit tests:
+  - `h264_profile_aliases` — every documented alias maps to the canonical
+    `kVTProfileLevel_H264_*_AutoLevel` string; empty / unknown returns
+    `None`.
+  - `hevc_profile_aliases` — same for HEVC's `Main` / `Main10` /
+    `Main4_2_2_10` flavours.
+  - `prores_codec_type_constants_match_fourcc` — every
+    `K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_*` equals its documented fourcc.
+  - `prores_tag_dispatch_each_fourcc` — walks every ProRes fourcc
+    through `prores_codec_type_for_tag`.
+  - `prores_tag_dispatch_falls_back_on_unknown` — covers the unknown
+    fourcc / non-Fourcc / `None` paths.
+- One new integration test (`encoder_knobs_round_trip_without_regression`)
+  exercises the live property writes against the macOS VT session for
+  H.264 (`bit_rate` + `profile` + `quality`) and ProRes LT (tag-driven
+  profile selection) and verifies the round-trip still produces packets.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.2...v0.0.3) - 2026-05-30
 
 ### Other

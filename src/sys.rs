@@ -128,6 +128,11 @@ pub const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
 
 pub const K_CF_NUMBER_SI_NT32_TYPE: i32 = 3;
 pub const K_CF_NUMBER_SI_NT64_TYPE: i32 = 4;
+/// `kCFNumberFloat32Type` per Apple's `CFNumber.h` enum order
+/// (kCFNumberSInt8Type = 1 .. kCFNumberFloat32Type = 5,
+/// kCFNumberFloat64Type = 6). Used to wrap the
+/// `kVTCompressionPropertyKey_Quality` value (CFNumber 0.0..1.0).
+pub const K_CF_NUMBER_FLOAT_32_TYPE: i32 = 5;
 
 // ─────────────────────────── kCVPixelFormatType constants ─────────────────────
 
@@ -722,6 +727,23 @@ pub unsafe fn cf_number_i32(vt: &Vtable, v: i32) -> CFNumberRef {
             std::ptr::null_mut(),
             K_CF_NUMBER_SI_NT32_TYPE,
             &v as *const i32 as *const _,
+        )
+    }
+}
+
+/// Create a CFNumber (Float32) via the vtable. Used to wrap the
+/// `kVTCompressionPropertyKey_Quality` CFNumber, documented by Apple
+/// as a Float in `[0.0, 1.0]` where higher values request higher
+/// quality.
+///
+/// # Safety
+/// Caller must call `cf_release` on the returned value when done.
+pub unsafe fn cf_number_f32(vt: &Vtable, v: f32) -> CFNumberRef {
+    unsafe {
+        (vt.cf_number_create)(
+            std::ptr::null_mut(),
+            K_CF_NUMBER_FLOAT_32_TYPE,
+            &v as *const f32 as *const _,
         )
     }
 }

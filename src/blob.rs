@@ -1304,6 +1304,41 @@ impl BlobEncoder {
             (vt.cf_release)(bool_true);
         }
 
+        // AverageBitRate — caller-supplied `bit_rate` (bits per second) is
+        // forwarded as a CFNumber-i32 to `kVTCompressionPropertyKey_AverageBitRate`.
+        // VT's JPEG encoder honours it (rate-capped quality); VT's ProRes
+        // encoder does not (ProRes is fixed-CBR per profile) and silently
+        // ignores the property. Failure to set is non-fatal.
+        if let Some(bps) = params.bit_rate {
+            let clamped = bps.min(i32::MAX as u64) as i32;
+            let br_val = unsafe { cf_number_i32(vt, clamped) };
+            let br_key = unsafe { cf_string(vt, "AverageBitRate") };
+            unsafe {
+                (vt.vt_session_set_property)(session, br_key, br_val);
+                (vt.cf_release)(br_key);
+                (vt.cf_release)(br_val);
+            }
+        }
+
+        // Quality — `options["quality"]` as a Float32 in `[0.0, 1.0]`.
+        // The MJPEG encoder uses this as its primary knob (it maps onto
+        // the JPEG quality scale that drives the standard quant tables).
+        // The ProRes encoder accepts the property but treats it as a
+        // hint; profile selection (via codec type) is the main lever.
+        if let Some(q_raw) = params.options.get("quality") {
+            if let Ok(q) = q_raw.parse::<f32>() {
+                if q.is_finite() && (0.0..=1.0).contains(&q) {
+                    let q_val = unsafe { sys::cf_number_f32(vt, q) };
+                    let q_key = unsafe { cf_string(vt, "Quality") };
+                    unsafe {
+                        (vt.vt_session_set_property)(session, q_key, q_val);
+                        (vt.cf_release)(q_key);
+                        (vt.cf_release)(q_val);
+                    }
+                }
+            }
+        }
+
         // Prepare (non-fatal on older macOS).
         let _ = unsafe { (vt.vt_comp_prepare)(session) };
 
@@ -1616,9 +1651,39 @@ pub fn make_prores_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>>
 }
 
 pub fn make_prores_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    // Default-encode as ProRes 422 (apcn). Profile-selection via params.tag
-    // is a future-round item.
-    BlobEncoder::make("prores", K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422, params)
+    // Profile selection: caller picks a flavour by setting
+    // `CodecParameters::tag = Some(CodecTag::fourcc(b"apch"))` (HQ),
+    // `"apco"` (Proxy), `"apcs"` (LT), `"apcn"` (422), `"ap4h"` (4444),
+    // or `"ap4x"` (4444 XQ). Unset / unrecognised fourccs default to
+    // ProRes 422 (`'apcn'`) — the most common deliverable. The format
+    // description's codec-type drives VT's internal flavour selection;
+    // pure-bitrate knobs do not apply (each ProRes profile is fixed-CBR).
+    let codec_type = prores_codec_type_for_tag(params.tag.as_ref())
+        .unwrap_or(K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422);
+    BlobEncoder::make("prores", codec_type, params)
+}
+
+/// Map a `CodecTag::Fourcc` to the matching `kCMVideoCodecType_AppleProRes*`
+/// constant. Returns `None` when the tag isn't a ProRes fourcc (the caller
+/// then falls back to the default ProRes 422 codec type).
+pub fn prores_codec_type_for_tag(tag: Option<&oxideav_core::CodecTag>) -> Option<u32> {
+    let fcc = match tag? {
+        oxideav_core::CodecTag::Fourcc(f) => f,
+        _ => return None,
+    };
+    // CodecTag::fourcc() upper-cases ASCII letters at construction, so we
+    // match upper-case bytes here. The Apple constants themselves are the
+    // historical lower-case-ish fourccs (`'apcn'` etc.) — they are decoded
+    // through the equality of the four BE bytes either way.
+    match fcc {
+        b"APCO" => Some(K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_PROXY),
+        b"APCS" => Some(K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_LT),
+        b"APCN" => Some(K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422),
+        b"APCH" => Some(K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_HQ),
+        b"AP4H" => Some(K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444),
+        b"AP4X" => Some(K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444_XQ),
+        _ => None,
+    }
 }
 
 /// MPEG-2 video decoder via VideoToolbox.
@@ -1996,5 +2061,76 @@ mod tests {
         let expected = u32::from_be_bytes(*b"av01");
         assert_eq!(super::K_CM_VIDEO_CODEC_TYPE_AV1, expected);
         assert_eq!(super::K_CM_VIDEO_CODEC_TYPE_AV1, 0x6176_3031);
+    }
+
+    // ── ProRes profile selection (round 9) ────────────────────────────────
+
+    /// Every ProRes codec-type constant must equal its documented fourcc.
+    /// `'apco'` = ProRes Proxy, `'apcs'` = LT, `'apcn'` = 422,
+    /// `'apch'` = HQ, `'ap4h'` = 4444, `'ap4x'` = 4444 XQ.
+    #[test]
+    fn prores_codec_type_constants_match_fourcc() {
+        assert_eq!(
+            super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_PROXY,
+            u32::from_be_bytes(*b"apco")
+        );
+        assert_eq!(
+            super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_LT,
+            u32::from_be_bytes(*b"apcs")
+        );
+        assert_eq!(
+            super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422,
+            u32::from_be_bytes(*b"apcn")
+        );
+        assert_eq!(
+            super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_HQ,
+            u32::from_be_bytes(*b"apch")
+        );
+        assert_eq!(
+            super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444,
+            u32::from_be_bytes(*b"ap4h")
+        );
+        assert_eq!(
+            super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444_XQ,
+            u32::from_be_bytes(*b"ap4x")
+        );
+    }
+
+    /// `prores_codec_type_for_tag` must dispatch every ProRes fourcc to
+    /// the matching `kCMVideoCodecType_AppleProRes*` constant.
+    #[test]
+    fn prores_tag_dispatch_each_fourcc() {
+        use oxideav_core::CodecTag;
+        for (tag_bytes, expected) in [
+            (b"apco", super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_PROXY),
+            (b"apcs", super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_LT),
+            (b"apcn", super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422),
+            (b"apch", super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_HQ),
+            (b"ap4h", super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444),
+            (b"ap4x", super::K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444_XQ),
+        ] {
+            let tag = CodecTag::fourcc(tag_bytes);
+            let got = super::prores_codec_type_for_tag(Some(&tag));
+            assert_eq!(
+                got,
+                Some(expected),
+                "tag {:?} → expected codec type 0x{expected:08x}",
+                std::str::from_utf8(tag_bytes).unwrap()
+            );
+        }
+    }
+
+    /// Unknown / non-fourcc tags must return `None` so the factory falls
+    /// back to its default (ProRes 422).
+    #[test]
+    fn prores_tag_dispatch_falls_back_on_unknown() {
+        use oxideav_core::CodecTag;
+        assert_eq!(super::prores_codec_type_for_tag(None), None);
+        // Non-ProRes fourcc.
+        let xvid = CodecTag::fourcc(b"xvid");
+        assert_eq!(super::prores_codec_type_for_tag(Some(&xvid)), None);
+        // Non-fourcc tag variant.
+        let mkv = CodecTag::matroska("V_PRORES");
+        assert_eq!(super::prores_codec_type_for_tag(Some(&mkv)), None);
     }
 }

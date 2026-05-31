@@ -28,17 +28,46 @@ const K_CM_VIDEO_CODEC_TYPE_HEVC: u32 = 0x68766331;
 
 // kVTCompressionPropertyKey_RealTime
 const K_VT_REAL_TIME: &str = "RealTime";
-// kVTCompressionPropertyKey_AverageBitRate (reserved for future use)
-#[allow(dead_code)]
+// kVTCompressionPropertyKey_AverageBitRate (CFNumber, target bits-per-second)
 const K_VT_AVERAGE_BIT_RATE: &str = "AverageBitRate";
 // kVTCompressionPropertyKey_AllowFrameReordering
 const K_VT_ALLOW_FRAME_REORDER: &str = "AllowFrameReordering";
-// kVTCompressionPropertyKey_ProfileLevel (H.264)
+// kVTCompressionPropertyKey_ProfileLevel (H.264 / HEVC)
 const K_VT_PROFILE_LEVEL: &str = "ProfileLevel";
+// kVTCompressionPropertyKey_Quality (CFNumber Float, 0.0..1.0)
+const K_VT_QUALITY: &str = "Quality";
 // kVTProfileLevel_H264_Baseline_AutoLevel
 const K_VT_H264_BASELINE: &str = "H264_Baseline_AutoLevel";
 // kVTProfileLevel_HEVC_Main_AutoLevel
 const K_VT_HEVC_MAIN: &str = "HEVC_Main_AutoLevel";
+
+/// Translate a free-form `options["profile"]` string to the canonical
+/// `kVTProfileLevel_*` string Apple's VideoToolbox understands. The mapping
+/// covers the public set documented in `VTProfessionalVideoWorkflow.h` /
+/// `VTVideoEncoderList`. Returns `None` for empty / unrecognised input so
+/// the caller falls back to its built-in default.
+fn h264_profile_string(opt: &str) -> Option<&'static str> {
+    match opt.to_ascii_lowercase().as_str() {
+        "baseline" | "baseline_auto" | "baseline_autolevel" => Some("H264_Baseline_AutoLevel"),
+        "main" | "main_auto" | "main_autolevel" => Some("H264_Main_AutoLevel"),
+        "high" | "high_auto" | "high_autolevel" => Some("H264_High_AutoLevel"),
+        "extended" | "extended_auto" | "extended_autolevel" => Some("H264_Extended_AutoLevel"),
+        "" => None,
+        // Unknown alias: pass through verbatim — Apple accepts the literal
+        // `H264_<Profile>_<Level>` form too (e.g. `"H264_High_5_1"`).
+        _ => None,
+    }
+}
+
+fn hevc_profile_string(opt: &str) -> Option<&'static str> {
+    match opt.to_ascii_lowercase().as_str() {
+        "main" | "main_auto" | "main_autolevel" => Some("HEVC_Main_AutoLevel"),
+        "main10" | "main_10" | "main10_auto" | "main10_autolevel" => Some("HEVC_Main10_AutoLevel"),
+        "main4_2_2_10" | "main422_10" => Some("HEVC_Main4_2_2_10_AutoLevel"),
+        "" => None,
+        _ => None,
+    }
+}
 
 // kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange = '420v'
 const K_CV_PIXEL_FORMAT_NV12: u32 = 0x34323076;
@@ -363,13 +392,42 @@ impl VtEncoder {
             (vt.cf_release)(bool_false);
         }
 
-        // Profile level.
-        let profile_cf = unsafe { sys::cf_string(vt, profile_level) };
+        // Profile level — `options["profile"]` (case-insensitive) overrides
+        // the codec's built-in default. Unknown / empty falls back to the
+        // default the caller passed (`profile_level`).
+        let resolved_profile = params
+            .options
+            .get("profile")
+            .and_then(|p| {
+                if is_hevc {
+                    hevc_profile_string(p)
+                } else {
+                    h264_profile_string(p)
+                }
+            })
+            .unwrap_or(profile_level);
+        let profile_cf = unsafe { sys::cf_string(vt, resolved_profile) };
         let profile_key = unsafe { sys::cf_string(vt, K_VT_PROFILE_LEVEL) };
         unsafe {
             (vt.vt_session_set_property)(session, profile_key, profile_cf);
             (vt.cf_release)(profile_key);
             (vt.cf_release)(profile_cf);
+        }
+
+        // AverageBitRate — when the caller sets `CodecParameters::bit_rate`,
+        // forward it to `kVTCompressionPropertyKey_AverageBitRate` as a
+        // CFNumber-i32 (bits per second). Saturating cast keeps values
+        // > 2^31 clamped to `i32::MAX`. Apple's H.264 / HEVC encoders
+        // accept the property; failure is non-fatal.
+        if let Some(bps) = params.bit_rate {
+            let clamped = bps.min(i32::MAX as u64) as i32;
+            let br_val = unsafe { sys::cf_number_i32(vt, clamped) };
+            let br_key = unsafe { sys::cf_string(vt, K_VT_AVERAGE_BIT_RATE) };
+            unsafe {
+                (vt.vt_session_set_property)(session, br_key, br_val);
+                (vt.cf_release)(br_key);
+                (vt.cf_release)(br_val);
+            }
         }
 
         // Real-time = true (kCFBooleanTrue = a special CF singleton, but VT
@@ -380,6 +438,25 @@ impl VtEncoder {
             (vt.vt_session_set_property)(session, rt_key, bool_true);
             (vt.cf_release)(rt_key);
             (vt.cf_release)(bool_true);
+        }
+
+        // Quality knob — `options["quality"]` parsed as a Float32 in
+        // `[0.0, 1.0]`. Out-of-range / unparseable values are ignored.
+        // Apple's H.264 / HEVC encoders document this as a hint that
+        // interacts with the rate-control mode (it is the primary knob
+        // in constant-quality mode and biases the encoder otherwise).
+        if let Some(q_raw) = params.options.get("quality") {
+            if let Ok(q) = q_raw.parse::<f32>() {
+                if q.is_finite() && (0.0..=1.0).contains(&q) {
+                    let q_val = unsafe { sys::cf_number_f32(vt, q) };
+                    let q_key = unsafe { sys::cf_string(vt, K_VT_QUALITY) };
+                    unsafe {
+                        (vt.vt_session_set_property)(session, q_key, q_val);
+                        (vt.cf_release)(q_key);
+                        (vt.cf_release)(q_val);
+                    }
+                }
+            }
         }
 
         // Prepare.
@@ -652,4 +729,47 @@ pub fn make_h264_encoder(params: &CodecParameters) -> Result<Box<dyn oxideav_cor
 
 pub fn make_hevc_encoder(params: &CodecParameters) -> Result<Box<dyn oxideav_core::Encoder>> {
     VtEncoder::new_hevc(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{h264_profile_string, hevc_profile_string};
+
+    /// `h264_profile_string` accepts the documented short aliases
+    /// case-insensitively and maps each to the canonical
+    /// `kVTProfileLevel_H264_*_AutoLevel` string.
+    #[test]
+    fn h264_profile_aliases() {
+        assert_eq!(
+            h264_profile_string("Baseline"),
+            Some("H264_Baseline_AutoLevel")
+        );
+        assert_eq!(h264_profile_string("MAIN"), Some("H264_Main_AutoLevel"));
+        assert_eq!(h264_profile_string("high"), Some("H264_High_AutoLevel"));
+        assert_eq!(
+            h264_profile_string("extended"),
+            Some("H264_Extended_AutoLevel")
+        );
+        assert_eq!(h264_profile_string(""), None);
+        assert_eq!(h264_profile_string("not-a-profile"), None);
+    }
+
+    /// `hevc_profile_string` accepts the documented short aliases
+    /// case-insensitively and maps each to the canonical
+    /// `kVTProfileLevel_HEVC_*_AutoLevel` string.
+    #[test]
+    fn hevc_profile_aliases() {
+        assert_eq!(hevc_profile_string("Main"), Some("HEVC_Main_AutoLevel"));
+        assert_eq!(hevc_profile_string("MAIN10"), Some("HEVC_Main10_AutoLevel"));
+        assert_eq!(
+            hevc_profile_string("main_10"),
+            Some("HEVC_Main10_AutoLevel")
+        );
+        assert_eq!(
+            hevc_profile_string("main4_2_2_10"),
+            Some("HEVC_Main4_2_2_10_AutoLevel")
+        );
+        assert_eq!(hevc_profile_string(""), None);
+        assert_eq!(hevc_profile_string("bogus"), None);
+    }
 }
