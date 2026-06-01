@@ -699,7 +699,7 @@ fn parse_ivf(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// Run `ffmpeg` as an opaque black-box validator to produce a VP9 IVF
 /// stream (and a reference raw-YUV decode). Returns
 /// `(per_frame_vp9_payloads, reference_first_frame_i420)` or `None` if
-/// ffmpeg is unavailable / lacks libvpx-vp9.
+/// ffmpeg is unavailable / lacks the VP9 reference encoder.
 fn ffmpeg_vp9_fixture(
     width: usize,
     height: usize,
@@ -725,9 +725,9 @@ fn ffmpeg_vp9_fixture(
     let ivf = dir.join(format!("oxideav_vt_vp9_{width}x{height}.ivf"));
     let yuv = dir.join(format!("oxideav_vt_vp9_{width}x{height}.yuv"));
 
-    // Encode a smooth gradient to a VP9 IVF stream. libvpx-vp9 is the
-    // standard ffmpeg VP9 encoder; if it's not built into this ffmpeg the
-    // command fails and we skip the test.
+    // Encode a smooth gradient to a VP9 IVF stream via ffmpeg's standard
+    // VP9 reference encoder; if the encoder isn't built into this ffmpeg
+    // the command fails and we skip the test.
     let status = Command::new(ffmpeg)
         .args([
             "-hide_banner",
@@ -792,12 +792,12 @@ fn ffmpeg_vp9_fixture(
 /// Decode an ffmpeg-produced VP9 IVF stream through the VideoToolbox bridge
 /// and assert the first decoded frame matches ffmpeg's own software decode
 /// (PSNR_Y ≥ 30 dB — VP9 + chroma round-trips and VT's IDCT differ slightly
-/// from libvpx-vp9's, matching the MPEG-2 bar).
+/// from the reference VP9 encoder's, matching the MPEG-2 bar).
 ///
-/// Self-skips when ffmpeg / libvpx-vp9 / VideoToolbox is unavailable, or
-/// when the VT VP9 decoder errors out at session-create time (older macOS
-/// without the VP9 decoder, Intel Mac without the dedicated VP9 IP and no
-/// software fallback in this VT build).
+/// Self-skips when ffmpeg / its VP9 reference encoder / VideoToolbox is
+/// unavailable, or when the VT VP9 decoder errors out at session-create
+/// time (older macOS without the VP9 decoder, Intel Mac without the
+/// dedicated VP9 IP and no software fallback in this VT build).
 #[test]
 fn vp9_decode_against_ffmpeg() {
     if oxideav_videotoolbox::sys::vtable().is_err() {
@@ -810,7 +810,9 @@ fn vp9_decode_against_ffmpeg() {
     let frames = 10usize;
 
     let Some((payloads, ref_i420)) = ffmpeg_vp9_fixture(width, height, frames) else {
-        eprintln!("oxideav-videotoolbox: ffmpeg/libvpx-vp9 unavailable, skipping vp9 decode test");
+        eprintln!(
+            "oxideav-videotoolbox: ffmpeg / its VP9 reference encoder unavailable, skipping vp9 decode test"
+        );
         return;
     };
 
@@ -1187,9 +1189,9 @@ fn mpeg4_part_two_decode_against_ffmpeg() {
 /// Run `ffmpeg` as an opaque black-box validator to produce an AV1 IVF
 /// stream (and a reference raw-YUV decode). Returns
 /// `(per_frame_av1_payloads, reference_first_frame_i420)` or `None` if
-/// ffmpeg / libaom-av1 is unavailable. Same shape as `ffmpeg_vp9_fixture`
-/// — AV1 in IVF carries one temporal unit per IVF frame record, so the
-/// existing `parse_ivf` helper carves it correctly.
+/// ffmpeg / its AV1 reference encoder is unavailable. Same shape as
+/// `ffmpeg_vp9_fixture` — AV1 in IVF carries one temporal unit per IVF
+/// frame record, so the existing `parse_ivf` helper carves it correctly.
 fn ffmpeg_av1_fixture(
     width: usize,
     height: usize,
@@ -1215,8 +1217,8 @@ fn ffmpeg_av1_fixture(
     let ivf = dir.join(format!("oxideav_vt_av1_{width}x{height}.ivf"));
     let yuv = dir.join(format!("oxideav_vt_av1_{width}x{height}.yuv"));
 
-    // Encode a smooth gradient to an AV1 IVF stream. libaom-av1 is the
-    // reference AV1 encoder; if it isn't built into this ffmpeg the command
+    // Encode a smooth gradient to an AV1 IVF stream via ffmpeg's reference
+    // AV1 encoder; if the encoder isn't built into this ffmpeg the command
     // fails and we skip the test. `-cpu-used 8` keeps the encode under a
     // few seconds on CI runners.
     let status = Command::new(ffmpeg)
@@ -1281,12 +1283,12 @@ fn ffmpeg_av1_fixture(
 /// Decode an ffmpeg-produced AV1 IVF stream through the VideoToolbox bridge
 /// and assert the first decoded frame matches ffmpeg's own software decode
 /// (PSNR_Y ≥ 30 dB — same bar as VP9 / MPEG-2 / MPEG-4 Pt 2 since VT's AV1
-/// reconstruction differs slightly from libaom-av1's).
+/// reconstruction differs slightly from the reference AV1 encoder's).
 ///
-/// Self-skips when ffmpeg / libaom-av1 / VideoToolbox is unavailable, or
-/// when the VT AV1 decoder errors at session-create time (older macOS
-/// without any AV1 decoder path, or Apple Silicon below M3 without VT's
-/// internal SW fallback compiled in).
+/// Self-skips when ffmpeg / its AV1 reference encoder / VideoToolbox is
+/// unavailable, or when the VT AV1 decoder errors at session-create time
+/// (older macOS without any AV1 decoder path, or Apple Silicon below M3
+/// without VT's internal SW fallback compiled in).
 #[test]
 fn av1_decode_against_ffmpeg() {
     if oxideav_videotoolbox::sys::vtable().is_err() {
@@ -1299,7 +1301,9 @@ fn av1_decode_against_ffmpeg() {
     let frames = 10usize;
 
     let Some((payloads, ref_i420)) = ffmpeg_av1_fixture(width, height, frames) else {
-        eprintln!("oxideav-videotoolbox: ffmpeg/libaom-av1 unavailable, skipping av1 decode test");
+        eprintln!(
+            "oxideav-videotoolbox: ffmpeg / its AV1 reference encoder unavailable, skipping av1 decode test"
+        );
         return;
     };
 

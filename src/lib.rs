@@ -67,8 +67,8 @@
 //!
 //! Calling a system OS framework via FFI is the same shape as calling
 //! `libc::malloc` — it's the platform, not a copied algorithm. The
-//! workspace's clean-room rule (no embedding source from libvpx,
-//! libwebp, libjxl, etc.) doesn't apply here.
+//! workspace's clean-room rule (no embedding third-party codec source)
+//! does not apply to bridging a system OS framework.
 
 pub mod sys;
 

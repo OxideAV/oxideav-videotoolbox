@@ -9,6 +9,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 10: AV1 `av1C` extension-atom path** — AV1 Sequence Header OBU
+  → `AV1CodecConfigurationRecord` wrapper supplied to VT via
+  `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms`. Round
+  8 wired the AV1 decoder against `(codec_type, width, height)` only —
+  fine on hosts where the VT AV1 decoder is lenient about extracting the
+  Sequence Header from the first temporal unit, but on stricter hosts
+  session creation returned a non-zero `OSStatus`. Round 10 closes that
+  gap by mirroring the round-7 MPEG-4 Part 2 ESDS pattern:
+  - A new `FrameSplit::Av1Whole` framer (semantically `Whole`, with a
+    first-packet sniffer) walks the leading temporal unit's OBU list,
+    locates the OBU whose `obu_type == OBU_SEQUENCE_HEADER` (= 1, per
+    AV1 spec §6.2.2), and builds an av1C record from it.
+  - `AV1CodecConfigurationRecord` layout per the AV1 ISO Base Media
+    File Format Binding Specification §2.3.3:
+    - Byte 0: `marker(1) = 1`, `version(7) = 1` → `0x81`.
+    - Byte 1: `seq_profile(3)` + `seq_level_idx_0(5)`.
+    - Byte 2: `seq_tier_0(1)` + `high_bitdepth(1)` + `twelve_bit(1)` +
+      `monochrome(1)` + `chroma_subsampling_x(1)` +
+      `chroma_subsampling_y(1)` + `chroma_sample_position(2)`.
+    - Byte 3: `reserved(3) = 0` + `initial_presentation_delay_present(1)
+      = 0` + `reserved(4) = 0`.
+    - Bytes 4..: `configOBUs[]` — the Sequence Header OBU verbatim.
+      The binding spec §2.3.4 mandates the Sequence Header be the first
+      OBU in `configOBUs` when present.
+  - `parse_av1_seq_header_fields` is a small MSB-first bit-reader that
+    walks the Sequence Header OBU payload per AV1 spec §5.5.1 + §5.5.2
+    to recover `seq_profile`, `seq_level_idx_0`, `seq_tier_0`,
+    `high_bitdepth`, `twelve_bit`, `monochrome`,
+    `chroma_subsampling_{x,y}`, and `chroma_sample_position`. The walker
+    bails to `Av1SeqHeaderFields::defaults()` (8-bit 4:2:0 main-profile)
+    on any short read or any path that would require a uvlc decode —
+    the `configOBUs` field still carries the Sequence Header verbatim,
+    which per the binding spec §2.3.4 is the authoritative source for
+    consumers that re-derive the record body.
+  - Extension-atom storage generalised: round 7's
+    `BlobDecoder::extradata_esds: Option<Vec<u8>>` is now
+    `extradata: Option<(&'static str, Vec<u8>)>` so the same
+    `ensure_session` plumbing supports both `"esds"` (MPEG-4 Part 2)
+    and `"av1C"` (AV1). No behavioural change on the MPEG-4 Part 2 path
+    — the new field is identical in shape, just typed.
+  - `find_av1_obu` walks an AV1 low-overhead-bitstream temporal unit's
+    OBU list per spec §5.3.2 (1-byte header, optional 1-byte extension
+    header, uleb128 `obu_size`, payload). The low-overhead bitstream
+    format requires `obu_has_size_field = 1` on every OBU (spec §5.2);
+    the walker refuses any header without that bit and any header whose
+    `obu_forbidden_bit` is set. `read_uleb128` decodes the AV1 uleb128
+    form (spec §4.10.5 / §5.3.1) with a strict 8-continuation-byte and
+    32-bit-value cap.
+  - Public API additions on `oxideav_videotoolbox::blob`:
+    `extract_av1_sequence_header_obu(&[u8]) -> Option<&[u8]>`,
+    `build_av1c_config_record(&[u8]) -> Vec<u8>`,
+    `parse_av1_seq_header_fields(&[u8]) -> Av1SeqHeaderFields`, and the
+    `Av1SeqHeaderFields` struct (9 `u8` fields covering `seq_profile`,
+    `seq_level_idx_0`, `seq_tier_0`, plus the colour-config quintet).
+  - `make_av1_decoder` now dispatches through `FrameSplit::Av1Whole`
+    instead of `FrameSplit::Whole`; existing callers see no API change.
+- Eleven new unit tests covering the round-10 paths:
+  - OBU walker — `av1_extract_sequence_header_obu_returns_full_obu_bytes`,
+    `av1_extract_sequence_header_obu_none_when_absent`,
+    `av1_extract_sequence_header_obu_rejects_forbidden_bit`,
+    `av1_extract_sequence_header_obu_requires_size_field`,
+    `av1_extract_sequence_header_obu_rejects_truncated_payload`.
+  - av1C builder — `av1c_marker_and_version_byte_is_0x81`,
+    `av1c_byte_3_is_zero_reserved`,
+    `av1c_configobus_includes_sequence_header_obu_verbatim`,
+    `av1c_byte_1_packs_seq_profile_and_level`.
+  - Sequence Header field parser —
+    `av1_seq_header_fields_reduced_still_picture_header`,
+    `av1_seq_header_fields_defaults_on_empty`.
+
 - **Round 9: encoder knobs across all four VT encoders.** Until round 8 the
   H.264 / HEVC / MJPEG / ProRes compression sessions configured only
   `RealTime = true`, `AllowFrameReordering = false`, and a hardcoded H.264
@@ -93,14 +163,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Codec tags: `av01 / AV01` (fourcc, matching the AV1 ISOBMFF
     `'av01'` sample entry) and `V_AV1` (Matroska). Registers with
     `priority = 10`, `hardware_accelerated = true`.
-  - Decode validated against `ffmpeg -c:v libaom-av1 -f ivf` as a
-    black-box validator. `av1_decode_against_ffmpeg` parses the IVF
-    container (32-byte file header + per-frame 12-byte
+  - Decode validated against ffmpeg (selecting the AV1 reference
+    encoder) as a black-box validator. `av1_decode_against_ffmpeg`
+    parses the IVF container (32-byte file header + per-frame 12-byte
     `(frame_size, pts)` header + payload, via the existing `parse_ivf`
     helper shared with the VP9 test), feeds each temporal unit through
     the VT decoder, and compares to ffmpeg's own software decode
-    (PSNR_Y ≥ 30 dB). The test self-skips when ffmpeg, libaom-av1, the
-    framework, or the VT AV1 decoder is unavailable on the host.
+    (PSNR_Y ≥ 30 dB). The test self-skips when ffmpeg, its AV1
+    reference encoder, the framework, or the VT AV1 decoder is
+    unavailable on the host.
   - `av1C` configuration-record (extension-atom) path is **not** wired
     yet — the round-7 ESDS plumbing in `BlobDecoder::ensure_session`
     already supports an arbitrary extension-atom key, so adding `av1C`
@@ -202,13 +273,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Annex-B / picture-start-code mechanism).
   - Codec tags: `vp09 / VP90` (fourcc) and `V_VP9` (Matroska). Registers
     with `priority = 10`, `hardware_accelerated = true`.
-  - Decode validated against `ffmpeg -c:v libvpx-vp9 -f ivf` as a black-box
-    validator. The test parses the IVF container (32-byte file header +
-    per-frame 12-byte `(frame_size, pts)` header + payload) to recover
-    individual VP9 frames, feeds each through the VT decoder, and compares
-    to ffmpeg's own software decode (PSNR_Y ≥ 30 dB). The test self-skips
-    when ffmpeg, libvpx-vp9, the framework, or the VT VP9 decoder is
-    unavailable on the host.
+  - Decode validated against ffmpeg (selecting the VP9 reference encoder) as
+    a black-box validator. The test parses the IVF container (32-byte file
+    header + per-frame 12-byte `(frame_size, pts)` header + payload) to
+    recover individual VP9 frames, feeds each through the VT decoder, and
+    compares to ffmpeg's own software decode (PSNR_Y ≥ 30 dB). The test
+    self-skips when ffmpeg, its VP9 reference encoder, the framework, or
+    the VT VP9 decoder is unavailable on the host.
   - Three new unit tests cover the IVF parser (multi-frame parse, signature
     rejection, truncated-payload rejection).
   - `register` now installs a VP9 decoder (and asserts via test that it

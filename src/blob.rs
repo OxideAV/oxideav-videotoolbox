@@ -558,6 +558,15 @@ pub enum FrameSplit {
     /// GOV / user-data headers to the following VOP. Per ISO/IEC 14496-2,
     /// start codes are `00 00 01 xx` and the VOP start code is `xx = B6`.
     Mpeg4PartTwoEs,
+    /// AV1 temporal-unit `Packet`s — submitted verbatim (one temporal unit
+    /// per packet) like [`FrameSplit::Whole`], but with an additional
+    /// sniffer that extracts the AV1 Sequence Header OBU from the first
+    /// packet and wraps it in an `av1C` `AV1CodecConfigurationRecord` for
+    /// supply via `SampleDescriptionExtensionAtoms`. VT on some hosts
+    /// requires the Sequence Header out-of-band; supplying av1C here lets
+    /// those hosts open the session even when the bitstream alone wouldn't
+    /// have been sufficient (analogous to the MPEG-4 Part 2 ESDS path).
+    Av1Whole,
 }
 
 /// Split an MPEG-2 elementary-stream buffer into per-picture access units.
@@ -762,6 +771,518 @@ pub fn build_mpeg4_part_two_esds(vol: &[u8]) -> Vec<u8> {
     esds
 }
 
+// ─────────────────────────── AV1 av1C helpers ────────────────────────────────
+
+/// `OBU_SEQUENCE_HEADER` — AV1 spec §6.2.2 obu_type = 1.
+pub(crate) const AV1_OBU_SEQUENCE_HEADER: u8 = 1;
+
+/// Read a uleb128-encoded value from `buf[off..]`, returning
+/// `(value, bytes_consumed)`. The AV1 low-overhead bitstream format uses
+/// uleb128 for `obu_size` (per AV1 spec §4.10.5 / §5.3.1). Returns `None`
+/// if the buffer ends mid-value or the encoded value would overflow 32
+/// bits (the spec caps obu_size at 32 bits, see §4.10.5).
+fn read_uleb128(buf: &[u8], off: usize) -> Option<(u32, usize)> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    let mut i = off;
+    // Maximum of 8 continuation bytes (each carrying 7 value bits) covers
+    // 56 bits; we additionally bound the final value at u32 because the
+    // AV1 spec caps obu_size at 2^32 - 1.
+    for _ in 0..8 {
+        if i >= buf.len() {
+            return None;
+        }
+        let b = buf[i];
+        i += 1;
+        value |= ((b & 0x7F) as u64) << shift;
+        if value > u32::MAX as u64 {
+            return None;
+        }
+        if (b & 0x80) == 0 {
+            return Some((value as u32, i - off));
+        }
+        shift += 7;
+    }
+    None
+}
+
+/// Locate the first OBU of type `target_obu_type` in `buf` (the bytes of
+/// one AV1 low-overhead-bitstream temporal unit, per spec §5.2). Returns
+/// the slice covering the full OBU (header byte(s) + uleb128 size field +
+/// payload), or `None` if no matching OBU is found or the buffer is
+/// malformed.
+///
+/// AV1's low-overhead bitstream format (the shape produced by IVF /
+/// Matroska / MP4 demuxers, per the AV1 ISOBMFF binding spec §2.4) sets
+/// `obu_has_size_field = 1` on every OBU. The OBU layout per spec §5.3.2
+/// is therefore: 1-byte header, optional 1-byte extension header (when
+/// `obu_extension_flag = 1`), uleb128 `obu_size`, then `obu_size` payload
+/// bytes.
+fn find_av1_obu(buf: &[u8], target_obu_type: u8) -> Option<&[u8]> {
+    let mut i = 0usize;
+    while i < buf.len() {
+        let header = buf[i];
+        // obu_forbidden_bit must be 0 (AV1 spec §6.2.2). If not, the buffer
+        // is not a valid OBU stream — bail out.
+        if (header & 0x80) != 0 {
+            return None;
+        }
+        let obu_type = (header >> 3) & 0x0F;
+        let extension_flag = (header & 0x04) != 0;
+        let has_size_field = (header & 0x02) != 0;
+        // Low-overhead bitstream requires has_size_field = 1 (spec §5.2).
+        // Without it we can't walk the buffer safely; the round-8 path
+        // (no extension atom) takes over.
+        if !has_size_field {
+            return None;
+        }
+        let mut cursor = i + 1;
+        if extension_flag {
+            if cursor >= buf.len() {
+                return None;
+            }
+            cursor += 1;
+        }
+        let (obu_size, consumed) = read_uleb128(buf, cursor)?;
+        cursor += consumed;
+        let payload_end = cursor.checked_add(obu_size as usize)?;
+        if payload_end > buf.len() {
+            return None;
+        }
+        if obu_type == target_obu_type {
+            return Some(&buf[i..payload_end]);
+        }
+        i = payload_end;
+    }
+    None
+}
+
+/// Extract the AV1 Sequence Header OBU (full bytes including the 1-or-2
+/// byte header, uleb128 size field, and payload) from `buf`, which is the
+/// bytes of an AV1 low-overhead-bitstream temporal unit.
+///
+/// Returns the OBU slice exactly as it appears in the input — suitable for
+/// inclusion verbatim in the `configOBUs` field of an
+/// `AV1CodecConfigurationRecord` (see AV1 ISOBMFF binding spec §2.3.4,
+/// which states `configOBUs SHALL contain at most one Sequence Header OBU
+/// and if present, it SHALL be the first OBU`).
+///
+/// Returns `None` if no Sequence Header OBU is present in `buf`, or if the
+/// OBU framing is invalid (forbidden-bit set, `obu_has_size_field = 0`,
+/// truncated uleb128, payload exceeds buffer).
+pub fn extract_av1_sequence_header_obu(buf: &[u8]) -> Option<&[u8]> {
+    find_av1_obu(buf, AV1_OBU_SEQUENCE_HEADER)
+}
+
+/// Parsed subset of the AV1 Sequence Header OBU fields needed for
+/// `AV1CodecConfigurationRecord` (per AV1 ISOBMFF binding spec §2.3.4).
+///
+/// The Sequence Header OBU bit syntax is laid out in AV1 spec §5.5.1
+/// (general sequence header) + §5.5.2 (color config). This struct holds
+/// only the fields the av1C record requires; the rest of the sequence
+/// header travels along verbatim inside `configOBUs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Av1SeqHeaderFields {
+    pub seq_profile: u8,
+    pub seq_level_idx_0: u8,
+    pub seq_tier_0: u8,
+    pub high_bitdepth: u8,
+    pub twelve_bit: u8,
+    pub monochrome: u8,
+    pub chroma_subsampling_x: u8,
+    pub chroma_subsampling_y: u8,
+    pub chroma_sample_position: u8,
+}
+
+impl Av1SeqHeaderFields {
+    /// Conservative defaults used when the Sequence Header OBU payload
+    /// can't be fully parsed: 8-bit 4:2:0 main-profile colour layout. The
+    /// `configOBUs` field still carries the Sequence Header verbatim so a
+    /// fully-spec-compliant consumer re-derives the precise values.
+    pub fn defaults() -> Self {
+        Self {
+            seq_profile: 0,
+            seq_level_idx_0: 0,
+            seq_tier_0: 0,
+            high_bitdepth: 0,
+            twelve_bit: 0,
+            monochrome: 0,
+            chroma_subsampling_x: 1,
+            chroma_subsampling_y: 1,
+            chroma_sample_position: 0,
+        }
+    }
+}
+
+/// Strict MSB-first bit reader over a byte slice. Returns `None` on
+/// exhaustion. Used only to walk the Sequence Header OBU payload to
+/// recover the fields needed for `AV1CodecConfigurationRecord` —
+/// arithmetic coding and entropy stuff are out of scope here.
+struct BitReader<'a> {
+    buf: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, bit_pos: 0 }
+    }
+
+    fn read(&mut self, n: u32) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte_idx = self.bit_pos >> 3;
+            if byte_idx >= self.buf.len() {
+                return None;
+            }
+            let bit_idx = 7 - (self.bit_pos & 7);
+            let b = (self.buf[byte_idx] >> bit_idx) & 1;
+            v = (v << 1) | b as u32;
+            self.bit_pos += 1;
+        }
+        Some(v)
+    }
+}
+
+/// Parse the subset of Sequence Header OBU fields needed for the av1C
+/// record (per AV1 spec §5.5.1 + §5.5.2). `payload` is the OBU payload
+/// (the bytes after the OBU header and uleb128 size field).
+///
+/// Returns `Av1SeqHeaderFields::defaults()` if the payload is too short to
+/// reach a field — av1C will still be built with the Sequence Header OBU
+/// in `configOBUs`, which is the authoritative source per the binding
+/// spec §2.3.4.
+pub fn parse_av1_seq_header_fields(payload: &[u8]) -> Av1SeqHeaderFields {
+    let mut out = Av1SeqHeaderFields::defaults();
+    let mut br = BitReader::new(payload);
+
+    let Some(sp) = br.read(3) else {
+        return out;
+    };
+    out.seq_profile = sp as u8;
+    let Some(_still_picture) = br.read(1) else {
+        return out;
+    };
+    let Some(reduced) = br.read(1) else {
+        return out;
+    };
+
+    if reduced == 1 {
+        // reduced_still_picture_header path: only seq_level_idx[0] is
+        // signalled; seq_tier[0] = 0 by definition (spec §5.5.1).
+        let Some(lvl) = br.read(5) else { return out };
+        out.seq_level_idx_0 = lvl as u8;
+        out.seq_tier_0 = 0;
+    } else {
+        // Full path: skip the optional timing/decoder-model and operating-
+        // point structures we don't need. We only need operating point 0.
+        let Some(timing_present) = br.read(1) else {
+            return out;
+        };
+        let mut decoder_model_present = 0u32;
+        if timing_present == 1 {
+            // timing_info(): num_units_in_display_tick u(32) +
+            // time_scale u(32) + equal_picture_interval u(1); if set, then
+            // uvlc num_ticks_per_picture_minus_1. We don't read uvlc so
+            // bail to defaults if it's set (rare for live VT input).
+            let Some(_num_units) = br.read(32) else {
+                return out;
+            };
+            let Some(_time_scale) = br.read(32) else {
+                return out;
+            };
+            let Some(equal_pic) = br.read(1) else {
+                return out;
+            };
+            if equal_pic == 1 {
+                // uvlc encoding — give up and rely on configOBUs verbatim.
+                return out;
+            }
+            let Some(dmp) = br.read(1) else { return out };
+            decoder_model_present = dmp;
+            if decoder_model_present == 1 {
+                // decoder_model_info(): 5 + 32 + 10 + 5 = 52 bits. Skip.
+                if br.read(52).is_none() {
+                    return out;
+                }
+            }
+        }
+        let Some(initial_display_present) = br.read(1) else {
+            return out;
+        };
+        let Some(op_cnt_minus_1) = br.read(5) else {
+            return out;
+        };
+
+        for i in 0..=op_cnt_minus_1 {
+            // operating_point_idc[i] u(12)
+            let Some(_op_idc) = br.read(12) else {
+                return out;
+            };
+            let Some(lvl) = br.read(5) else { return out };
+            let mut tier = 0u32;
+            if lvl > 7 {
+                let Some(t) = br.read(1) else { return out };
+                tier = t;
+            }
+            if i == 0 {
+                out.seq_level_idx_0 = lvl as u8;
+                out.seq_tier_0 = tier as u8;
+            }
+            if decoder_model_present == 1 {
+                let Some(dm_for_op) = br.read(1) else {
+                    return out;
+                };
+                if dm_for_op == 1 {
+                    // operating_parameters_info(i): 2 * (bitrate_minus_1
+                    // uvlc) + buffer_size_minus_1 uvlc + ...; we don't
+                    // walk uvlc — give up.
+                    return out;
+                }
+            }
+            if initial_display_present == 1 {
+                let Some(idp_for_op) = br.read(1) else {
+                    return out;
+                };
+                if idp_for_op == 1 {
+                    let Some(_idd_minus_1) = br.read(4) else {
+                        return out;
+                    };
+                }
+            }
+        }
+    }
+
+    // Skip to color_config: walk past frame size / id / superblock /
+    // filter-intra / intra-edge-filter / [non-reduced flags] / superres /
+    // cdef / restoration. We only need the bits up to and including
+    // color_config; if any read fails we fall back to defaults.
+    let Some(fwb) = br.read(4) else { return out };
+    let Some(fhb) = br.read(4) else { return out };
+    let n_w = fwb + 1;
+    let n_h = fhb + 1;
+    if br.read(n_w).is_none() {
+        return out;
+    }
+    if br.read(n_h).is_none() {
+        return out;
+    }
+
+    let mut frame_id_present = 0u32;
+    if reduced == 0 {
+        let Some(fid) = br.read(1) else { return out };
+        frame_id_present = fid;
+    }
+    if frame_id_present == 1 {
+        if br.read(4).is_none() {
+            return out;
+        }
+        if br.read(3).is_none() {
+            return out;
+        }
+    }
+    // use_128x128_superblock, enable_filter_intra, enable_intra_edge_filter.
+    if br.read(3).is_none() {
+        return out;
+    }
+    if reduced == 0 {
+        // enable_interintra_compound, enable_masked_compound,
+        // enable_warped_motion, enable_dual_filter, enable_order_hint.
+        let Some(flags5) = br.read(5) else { return out };
+        let enable_order_hint = flags5 & 1;
+        if enable_order_hint == 1 {
+            // enable_jnt_comp + enable_ref_frame_mvs.
+            if br.read(2).is_none() {
+                return out;
+            }
+        }
+        let Some(seq_choose_sct) = br.read(1) else {
+            return out;
+        };
+        let mut seq_force_sct = 2u32; // SELECT_SCREEN_CONTENT_TOOLS = 2.
+        if seq_choose_sct == 0 {
+            let Some(s) = br.read(1) else { return out };
+            seq_force_sct = s;
+        }
+        if seq_force_sct > 0 {
+            let Some(seq_choose_imv) = br.read(1) else {
+                return out;
+            };
+            if seq_choose_imv == 0 && br.read(1).is_none() {
+                return out;
+            }
+        }
+        if enable_order_hint == 1 && br.read(3).is_none() {
+            return out;
+        }
+    }
+    // enable_superres, enable_cdef, enable_restoration.
+    if br.read(3).is_none() {
+        return out;
+    }
+
+    // color_config (spec §5.5.2).
+    let Some(hbd) = br.read(1) else { return out };
+    out.high_bitdepth = hbd as u8;
+    if out.seq_profile == 2 && out.high_bitdepth == 1 {
+        let Some(tb) = br.read(1) else { return out };
+        out.twelve_bit = tb as u8;
+    }
+    if out.seq_profile == 1 {
+        out.monochrome = 0;
+    } else {
+        let Some(mc) = br.read(1) else { return out };
+        out.monochrome = mc as u8;
+    }
+    let Some(cdp) = br.read(1) else { return out };
+    if cdp == 1 {
+        // color_primaries(8) + transfer_characteristics(8) +
+        // matrix_coefficients(8).
+        if br.read(24).is_none() {
+            return out;
+        }
+    }
+    if out.monochrome == 1 {
+        if br.read(1).is_none() {
+            // color_range
+            return out;
+        }
+        out.chroma_subsampling_x = 1;
+        out.chroma_subsampling_y = 1;
+        out.chroma_sample_position = 0;
+        return out;
+    }
+    // color_range path: subsampling depends on seq_profile + BitDepth.
+    if br.read(1).is_none() {
+        return out;
+    }
+    let bit_depth = if out.seq_profile == 2 && out.high_bitdepth == 1 {
+        if out.twelve_bit == 1 {
+            12
+        } else {
+            10
+        }
+    } else if out.high_bitdepth == 1 {
+        10
+    } else {
+        8
+    };
+    if out.seq_profile == 0 {
+        out.chroma_subsampling_x = 1;
+        out.chroma_subsampling_y = 1;
+    } else if out.seq_profile == 1 {
+        out.chroma_subsampling_x = 0;
+        out.chroma_subsampling_y = 0;
+    } else if bit_depth == 12 {
+        let Some(sx) = br.read(1) else { return out };
+        out.chroma_subsampling_x = sx as u8;
+        if out.chroma_subsampling_x == 1 {
+            let Some(sy) = br.read(1) else { return out };
+            out.chroma_subsampling_y = sy as u8;
+        } else {
+            out.chroma_subsampling_y = 0;
+        }
+    } else {
+        out.chroma_subsampling_x = 1;
+        out.chroma_subsampling_y = 0;
+    }
+    if out.chroma_subsampling_x == 1 && out.chroma_subsampling_y == 1 {
+        if let Some(csp) = br.read(2) {
+            out.chroma_sample_position = csp as u8;
+        }
+    }
+    out
+}
+
+/// Build an `AV1CodecConfigurationRecord` from a Sequence Header OBU,
+/// per the AV1 ISOBMFF binding spec §2.3.3.
+///
+/// The byte layout (all big-endian, bit-packed from the MSB):
+///
+/// * Byte 0: `marker(1) = 1`, `version(7) = 1` → `0x81`.
+/// * Byte 1: `seq_profile(3)`, `seq_level_idx_0(5)`.
+/// * Byte 2: `seq_tier_0(1)`, `high_bitdepth(1)`, `twelve_bit(1)`,
+///   `monochrome(1)`, `chroma_subsampling_x(1)`,
+///   `chroma_subsampling_y(1)`, `chroma_sample_position(2)`.
+/// * Byte 3: `reserved(3) = 0`, `initial_presentation_delay_present(1) = 0`,
+///   `reserved(4) = 0`.
+/// * Bytes 4..: `configOBUs[]` — the Sequence Header OBU verbatim.
+///
+/// We always set `initial_presentation_delay_present = 0` because our
+/// extension-atom path produces a record valid for the entire decode
+/// stream and the spec leaves the `initial_display_delay_minus_1[0]`
+/// signalling inside the Sequence Header OBU.
+///
+/// VideoToolbox picks this record up via
+/// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms` keyed
+/// by the four-character atom name `"av1C"`.
+pub fn build_av1c_config_record(sequence_header_obu: &[u8]) -> Vec<u8> {
+    // Try to extract the Sequence Header payload — i.e. strip the OBU
+    // header + uleb128 size field — so we can pull the seq_profile /
+    // level / tier / colour-config fields per the binding spec. If
+    // anything looks malformed we fall back to the defaults; the
+    // configOBUs field always carries the OBU verbatim so consumers can
+    // re-derive everything.
+    let fields = sequence_header_payload(sequence_header_obu)
+        .map(parse_av1_seq_header_fields)
+        .unwrap_or_else(Av1SeqHeaderFields::defaults);
+
+    let mut out = Vec::with_capacity(4 + sequence_header_obu.len());
+    // Byte 0: marker = 1 in bit 7, version = 1 in bits 6..0.
+    out.push(0x81);
+    // Byte 1: seq_profile in bits 7..5, seq_level_idx_0 in bits 4..0.
+    out.push(((fields.seq_profile & 0x07) << 5) | (fields.seq_level_idx_0 & 0x1F));
+    // Byte 2: seq_tier_0 bit 7, high_bitdepth bit 6, twelve_bit bit 5,
+    // monochrome bit 4, chroma_subsampling_x bit 3,
+    // chroma_subsampling_y bit 2, chroma_sample_position bits 1..0.
+    let mut b2 = 0u8;
+    b2 |= (fields.seq_tier_0 & 1) << 7;
+    b2 |= (fields.high_bitdepth & 1) << 6;
+    b2 |= (fields.twelve_bit & 1) << 5;
+    b2 |= (fields.monochrome & 1) << 4;
+    b2 |= (fields.chroma_subsampling_x & 1) << 3;
+    b2 |= (fields.chroma_subsampling_y & 1) << 2;
+    b2 |= fields.chroma_sample_position & 0x03;
+    out.push(b2);
+    // Byte 3: reserved(3)=0, initial_presentation_delay_present(1)=0,
+    // reserved(4)=0.
+    out.push(0);
+    // configOBUs: Sequence Header OBU verbatim.
+    out.extend_from_slice(sequence_header_obu);
+    out
+}
+
+/// Strip the OBU header + uleb128 size field off a Sequence Header OBU,
+/// returning the payload slice. Mirrors `find_av1_obu`'s framing.
+fn sequence_header_payload(obu: &[u8]) -> Option<&[u8]> {
+    if obu.is_empty() {
+        return None;
+    }
+    let header = obu[0];
+    if (header & 0x80) != 0 {
+        return None;
+    }
+    let extension_flag = (header & 0x04) != 0;
+    let has_size_field = (header & 0x02) != 0;
+    if !has_size_field {
+        return None;
+    }
+    let mut cursor = 1usize;
+    if extension_flag {
+        if cursor >= obu.len() {
+            return None;
+        }
+        cursor += 1;
+    }
+    let (obu_size, consumed) = read_uleb128(obu, cursor)?;
+    cursor += consumed;
+    let end = cursor.checked_add(obu_size as usize)?;
+    if end > obu.len() {
+        return None;
+    }
+    Some(&obu[cursor..end])
+}
+
 // ─────────────────────────── Decoder ─────────────────────────────────────────
 
 /// Blob-style VTDecompressionSession decoder.
@@ -776,12 +1297,16 @@ pub struct BlobDecoder {
     width: usize,
     height: usize,
     framer: FrameSplit,
-    /// Optional ESDS atom payload (as built by
-    /// [`build_mpeg4_part_two_esds`]) supplied to VT via
-    /// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms` /
-    /// `"esds"`. Set lazily on the first packet for the MPEG-4 Part 2
-    /// framer by extracting the VOL prefix from the elementary stream.
-    extradata_esds: Option<Vec<u8>>,
+    /// Optional configuration-record atom supplied to VT via
+    /// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms`.
+    /// The pair is `(atom_key, payload)` where `atom_key` is the
+    /// four-character atom name (`"esds"` for MPEG-4 Part 2, `"av1C"`
+    /// for AV1) and `payload` is the raw atom bytes. Set lazily on the
+    /// first packet by the relevant framer (`Mpeg4PartTwoEs` sniffs the
+    /// VOL prefix; `Av1Whole` sniffs the Sequence Header OBU). Other
+    /// framers leave the field at `None` and the bare
+    /// `(codec_type, width, height)` path covers them.
+    extradata: Option<(&'static str, Vec<u8>)>,
     session: sys::VTDecompressionSessionRef,
     fmt_desc: sys::CMVideoFormatDescriptionRef,
     state: Arc<Mutex<DecCallbackState>>,
@@ -823,7 +1348,7 @@ impl BlobDecoder {
             width,
             height,
             framer,
-            extradata_esds: None,
+            extradata: None,
             session: std::ptr::null_mut(),
             fmt_desc: std::ptr::null_mut(),
             state: DecCallbackState::new(),
@@ -839,21 +1364,21 @@ impl BlobDecoder {
         }
         let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
 
-        // Build the optional extensions dictionary. When `extradata_esds` is
-        // present (MPEG-4 Part 2 path after the first packet has been seen),
-        // wrap the ESDS bytes in
+        // Build the optional extensions dictionary. When `extradata` is
+        // present (MPEG-4 Part 2 ESDS or AV1 av1C after the first packet has
+        // been seen), wrap the bytes in
         // `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms =
-        // { "esds": CFData }`. Otherwise pass NULL — the blob path
+        // { atom_key: CFData }`. Otherwise pass NULL — the blob path
         // `(codec_type, width, height)` covers JPEG / ProRes / MPEG-2 / VP9.
         let mut extensions: sys::CFDictionaryRef = std::ptr::null_mut();
         let mut ext_inner_dict: sys::CFDictionaryRef = std::ptr::null_mut();
         let mut ext_inner_key: sys::CFStringRef = std::ptr::null_mut();
         let mut ext_inner_val: sys::CFDataRef = std::ptr::null_mut();
         let mut ext_outer_key: sys::CFStringRef = std::ptr::null_mut();
-        if let Some(esds) = &self.extradata_esds {
+        if let Some((atom_key, atom_bytes)) = &self.extradata {
             unsafe {
-                ext_inner_val = sys::cf_data(vt, esds);
-                ext_inner_key = sys::cf_string(vt, "esds");
+                ext_inner_val = sys::cf_data(vt, atom_bytes);
+                ext_inner_key = sys::cf_string(vt, atom_key);
                 let inner_keys: [*const c_void; 1] = [ext_inner_key as *const c_void];
                 let inner_vals: [*const c_void; 1] = [ext_inner_val as *const c_void];
                 ext_inner_dict = (vt.cf_dict_create)(
@@ -1099,26 +1624,47 @@ impl Decoder for BlobDecoder {
             return Err(e);
         }
 
-        // For MPEG-4 Part 2: before the session exists, sniff the VOL prefix
-        // out of the first packet's leading bytes and wrap it in an ESDS
-        // configuration. VT's MPEG-4 Part 2 decoder enforces VOL-via-
-        // extension-atoms on some hosts; supplying it here lets those hosts
-        // create the session successfully even when the bitstream prefix
-        // alone wasn't enough.
-        if self.framer == FrameSplit::Mpeg4PartTwoEs
-            && self.session.is_null()
-            && self.extradata_esds.is_none()
-        {
-            if let Some(vol) = extract_mpeg4_part_two_vol(&packet.data) {
-                if !vol.is_empty() {
-                    self.extradata_esds = Some(build_mpeg4_part_two_esds(vol));
+        // Before the session exists, sniff the codec's configuration record
+        // out of the first packet so it can be supplied to VT as a
+        // SampleDescriptionExtensionAtoms entry. Two paths today:
+        //
+        // * MPEG-4 Part 2: VT enforces VOL-via-extension-atoms on some hosts.
+        //   Extract the VOL prefix (bytes before the first VOP start code)
+        //   and wrap it in an ESDS atom.
+        // * AV1: VT on some hosts enforces the Sequence Header OBU be
+        //   supplied via av1C extension atoms rather than extracted from the
+        //   first temporal unit. Extract the Sequence Header OBU and wrap it
+        //   in an AV1CodecConfigurationRecord (av1C atom).
+        //
+        // Both paths share the `extradata: Option<(atom_key, bytes)>` field;
+        // `ensure_session` plumbs whichever is present into the
+        // SampleDescriptionExtensionAtoms dictionary.
+        if self.session.is_null() && self.extradata.is_none() {
+            match self.framer {
+                FrameSplit::Mpeg4PartTwoEs => {
+                    if let Some(vol) = extract_mpeg4_part_two_vol(&packet.data) {
+                        if !vol.is_empty() {
+                            self.extradata = Some(("esds", build_mpeg4_part_two_esds(vol)));
+                        }
+                    }
                 }
+                FrameSplit::Av1Whole => {
+                    if let Some(sh) = extract_av1_sequence_header_obu(&packet.data) {
+                        if !sh.is_empty() {
+                            self.extradata = Some(("av1C", build_av1c_config_record(sh)));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
         self.ensure_session()?;
         match self.framer {
-            FrameSplit::Whole => {
+            FrameSplit::Whole | FrameSplit::Av1Whole => {
+                // AV1 packets are container-framed: one temporal unit per
+                // `Packet`. Submit verbatim, exactly like the `Whole` path
+                // used by JPEG / ProRes / VP9.
                 self.submit_frame(&packet.data, packet.pts)?;
             }
             FrameSplit::Mpeg2Es => {
@@ -1792,31 +2338,53 @@ pub fn make_mpeg4_part_two_decoder(params: &CodecParameters) -> Result<Box<dyn D
 /// code carve. (AV1 OBUs do have `obu_size` fields, but the demuxer
 /// has already produced exactly one temporal unit per `Packet`.)
 ///
-/// ## Configuration record (av1C)
+/// ## Configuration record (av1C) — round 10 path
 ///
-/// AV1 in MP4 / Matroska carries an `av1C` configuration record whose
-/// payload is the AV1 Sequence Header OBU (per the AV1 ISOBMFF mapping
-/// at `docs/container/mpeg4/av1-isobmff/`). On hosts where VT requires
-/// the Sequence Header via the format description's
-/// `SampleDescriptionExtensionAtoms` rather than extracted from the
-/// first packet, supplying the `av1C` blob via the extension atoms is
-/// the same pattern as MPEG-4 Part 2's ESDS extension wired in round 7
-/// — a follow-up round can carry it once a host needs it; the round-8
-/// `(codec_type, width, height)` path covers the common case.
+/// AV1 in MP4 / Matroska / WebM carries an `av1C` configuration record
+/// (per the AV1 ISO Base Media File Format Binding Specification §2.3)
+/// whose body is the [`AV1CodecConfigurationRecord`] — a 4-byte fixed
+/// header (`marker`, `version`, `seq_profile`, `seq_level_idx_0`,
+/// `seq_tier_0`, colour-config flags, `initial_presentation_delay_*`)
+/// followed by a `configOBUs[]` field that SHALL contain at most one
+/// Sequence Header OBU as the first OBU.
+///
+/// On hosts where VT requires the Sequence Header out-of-band, supplying
+/// the av1C blob via `kCMFormatDescriptionExtension_SampleDescription`
+/// `ExtensionAtoms = { "av1C": CFData }` is the same pattern wired in
+/// round 7 for MPEG-4 Part 2's ESDS. The round-10 path closes that gap:
+/// on the first packet, [`BlobDecoder`] calls
+/// [`extract_av1_sequence_header_obu`] to harvest the OBU, builds the
+/// av1C record via [`build_av1c_config_record`] (with the bit-fields
+/// parsed by [`parse_av1_seq_header_fields`]; the OBU itself is included
+/// verbatim in `configOBUs`), and supplies the blob to
+/// `CMVideoFormatDescriptionCreate`.
+///
+/// If the first packet has no Sequence Header OBU (e.g. mid-stream
+/// random-access entry where the decoder context already exists) the
+/// extractor returns `None` and the decoder reverts to the round-8 plain
+/// `(codec_type, width, height)` path. The pure-Rust `oxideav-av1`
+/// decoder remains in the registry as a lower-priority fallback for any
+/// host where session creation still fails.
 ///
 /// ## Codec id
 ///
 /// `CodecId::new("av1")`, matching the workspace's pure-Rust `oxideav-av1`
 /// codec id.
 pub fn make_av1_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    BlobDecoder::make("av1", K_CM_VIDEO_CODEC_TYPE_AV1, params)
+    BlobDecoder::make_with_framer(
+        "av1",
+        K_CM_VIDEO_CODEC_TYPE_AV1,
+        FrameSplit::Av1Whole,
+        params,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_mpeg4_part_two_esds, extract_mpeg4_part_two_vol, split_mpeg2_access_units,
-        split_mpeg4_part_two_access_units,
+        build_av1c_config_record, build_mpeg4_part_two_esds, extract_av1_sequence_header_obu,
+        extract_mpeg4_part_two_vol, parse_av1_seq_header_fields, split_mpeg2_access_units,
+        split_mpeg4_part_two_access_units, Av1SeqHeaderFields,
     };
 
     // Start codes: B3 = sequence header, B8 = GOP, 00 = picture, B5 = ext.
@@ -2132,5 +2700,200 @@ mod tests {
         // Non-fourcc tag variant.
         let mkv = CodecTag::matroska("V_PRORES");
         assert_eq!(super::prores_codec_type_for_tag(Some(&mkv)), None);
+    }
+
+    // ── AV1 av1C extension-atom path (round 10) ──────────────────────────────
+
+    /// Build one OBU header byte with `(obu_type, ext_flag, has_size_field)`
+    /// per AV1 spec §5.3.2. obu_forbidden_bit and obu_reserved_1bit are 0.
+    fn av1_obu_header(obu_type: u8, ext_flag: bool, has_size_field: bool) -> u8 {
+        let mut b = (obu_type & 0x0F) << 3;
+        if ext_flag {
+            b |= 0x04;
+        }
+        if has_size_field {
+            b |= 0x02;
+        }
+        b
+    }
+
+    /// Encode a uleb128 value to bytes (canonical, terminating byte has
+    /// MSB clear). Used to build synthetic OBU streams for the tests.
+    fn av1_uleb128(mut value: u32) -> Vec<u8> {
+        if value == 0 {
+            return vec![0];
+        }
+        let mut out = Vec::new();
+        while value > 0 {
+            let mut b = (value & 0x7F) as u8;
+            value >>= 7;
+            if value > 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+        }
+        out
+    }
+
+    /// Build a synthetic AV1 temporal unit of `[Temporal Delimiter] +
+    /// [Sequence Header obu_type=1 with given payload] + [Frame Header
+    /// obu_type=3 with empty payload]`. Used to exercise the OBU walker.
+    fn av1_synth_temporal_unit(seq_header_payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // OBU_TEMPORAL_DELIMITER (type 2), has_size_field=1, payload empty.
+        out.push(av1_obu_header(2, false, true));
+        out.extend_from_slice(&av1_uleb128(0));
+        // OBU_SEQUENCE_HEADER (type 1), has_size_field=1, payload as given.
+        out.push(av1_obu_header(1, false, true));
+        out.extend_from_slice(&av1_uleb128(seq_header_payload.len() as u32));
+        out.extend_from_slice(seq_header_payload);
+        // OBU_FRAME_HEADER (type 3), has_size_field=1, payload empty.
+        out.push(av1_obu_header(3, false, true));
+        out.extend_from_slice(&av1_uleb128(0));
+        out
+    }
+
+    /// `extract_av1_sequence_header_obu` returns the full Sequence Header
+    /// OBU (header byte + uleb128 size + payload) — bytes exactly as they
+    /// appear in the input temporal unit.
+    #[test]
+    fn av1_extract_sequence_header_obu_returns_full_obu_bytes() {
+        let sh_payload = [0xAA, 0xBB, 0xCC];
+        let tu = av1_synth_temporal_unit(&sh_payload);
+        let sh = extract_av1_sequence_header_obu(&tu).expect("seq header present");
+        // OBU header byte = type=1, has_size=1 → 0x0A.
+        assert_eq!(sh[0], 0x0A);
+        // Then uleb128(3) = single byte 0x03.
+        assert_eq!(sh[1], 0x03);
+        // Then payload verbatim.
+        assert_eq!(&sh[2..], &sh_payload);
+        // Total = 1 (header) + 1 (uleb) + 3 (payload) = 5 bytes.
+        assert_eq!(sh.len(), 5);
+    }
+
+    /// When the temporal unit carries no Sequence Header OBU,
+    /// `extract_av1_sequence_header_obu` returns `None` and the decoder
+    /// falls back to the round-8 (codec_type, width, height) path.
+    #[test]
+    fn av1_extract_sequence_header_obu_none_when_absent() {
+        let mut tu = Vec::new();
+        // Only a Temporal Delimiter and a Frame Header — no Sequence Header.
+        tu.push(av1_obu_header(2, false, true));
+        tu.extend_from_slice(&av1_uleb128(0));
+        tu.push(av1_obu_header(3, false, true));
+        tu.extend_from_slice(&av1_uleb128(0));
+        assert!(extract_av1_sequence_header_obu(&tu).is_none());
+    }
+
+    /// An obu_forbidden_bit set to 1 means the buffer is not a valid OBU
+    /// stream — the extractor must refuse rather than mis-walk it.
+    #[test]
+    fn av1_extract_sequence_header_obu_rejects_forbidden_bit() {
+        // Header with obu_forbidden_bit (MSB) set.
+        let buf = [0x80u8, 0x00];
+        assert!(extract_av1_sequence_header_obu(&buf).is_none());
+    }
+
+    /// `obu_has_size_field = 0` means the low-overhead bitstream format
+    /// isn't in use; the walker can't safely advance and returns `None`.
+    #[test]
+    fn av1_extract_sequence_header_obu_requires_size_field() {
+        // OBU_SEQUENCE_HEADER (type 1) with has_size_field=0.
+        let buf = [av1_obu_header(1, false, false), 0xAA];
+        assert!(extract_av1_sequence_header_obu(&buf).is_none());
+    }
+
+    /// A Sequence Header OBU whose payload's uleb128 size points past the
+    /// buffer end must be rejected (no out-of-bounds read).
+    #[test]
+    fn av1_extract_sequence_header_obu_rejects_truncated_payload() {
+        let mut buf = Vec::new();
+        buf.push(av1_obu_header(1, false, true));
+        buf.extend_from_slice(&av1_uleb128(99)); // claims 99 bytes...
+        buf.extend_from_slice(&[0xAA, 0xBB]); // ...but only 2 follow.
+        assert!(extract_av1_sequence_header_obu(&buf).is_none());
+    }
+
+    /// `build_av1c_config_record` lays out the av1C body per AV1 ISOBMFF
+    /// binding spec §2.3.3: first byte `marker=1, version=1` (= `0x81`),
+    /// then 3 bytes of packed bit-fields, then `configOBUs` containing
+    /// the Sequence Header OBU verbatim.
+    #[test]
+    fn av1c_marker_and_version_byte_is_0x81() {
+        let sh = [0x0A, 0x01, 0x00]; // minimal SH OBU (header + uleb128(1) + 1 byte payload).
+        let av1c = build_av1c_config_record(&sh);
+        assert_eq!(
+            av1c[0], 0x81,
+            "marker=1 in bit 7, version=1 in bits 6..0 = 0x81"
+        );
+    }
+
+    /// av1C header byte 3 must be `0` — reserved(3) + iPDP(1)=0 +
+    /// reserved(4). We never signal initial_presentation_delay here.
+    #[test]
+    fn av1c_byte_3_is_zero_reserved() {
+        let sh = [0x0A, 0x01, 0x00];
+        let av1c = build_av1c_config_record(&sh);
+        assert!(av1c.len() >= 4);
+        assert_eq!(av1c[3], 0);
+    }
+
+    /// av1C `configOBUs` field (bytes 4..) must equal the Sequence Header
+    /// OBU bytes passed in, verbatim. The binding spec §2.3.4 mandates the
+    /// Sequence Header be the first OBU in `configOBUs` when present.
+    #[test]
+    fn av1c_configobus_includes_sequence_header_obu_verbatim() {
+        let sh: Vec<u8> = (0..7).collect();
+        let av1c = build_av1c_config_record(&sh);
+        assert_eq!(&av1c[4..], &sh);
+    }
+
+    /// Header bit-fields for `seq_profile = 1, seq_level_idx = 5` (a
+    /// reduced-still-picture-header SH) must land in the right bit
+    /// positions of byte 1. byte1 = (1<<5) | 5 = 0x25.
+    #[test]
+    fn av1c_byte_1_packs_seq_profile_and_level() {
+        // Build a synthetic SH payload: seq_profile=1 (3 bits), still=0,
+        // reduced_still=1, seq_level_idx[0]=5 (5 bits). MSB-packed:
+        // 001 0 1 00101 = 00101 00101 padded with zeros.
+        // Bits: 0_0_1 (profile=1) | 0 (still) | 1 (reduced) | 00101 (level)
+        // = 0010_1001_01 + padding → 0x29, 0x40.
+        let sh_payload = [0b0010_1001u8, 0b0100_0000u8];
+        let mut tu = Vec::new();
+        tu.push(av1_obu_header(1, false, true));
+        tu.extend_from_slice(&av1_uleb128(sh_payload.len() as u32));
+        tu.extend_from_slice(&sh_payload);
+
+        let sh_obu = extract_av1_sequence_header_obu(&tu).expect("seq header present");
+        let av1c = build_av1c_config_record(sh_obu);
+        // byte 1: profile in bits 7..5, level in bits 4..0.
+        assert_eq!(av1c[1] >> 5, 1, "seq_profile = 1");
+        assert_eq!(av1c[1] & 0x1F, 5, "seq_level_idx_0 = 5");
+    }
+
+    /// `parse_av1_seq_header_fields` on a reduced-still-picture-header
+    /// payload must recover `seq_profile` and `seq_level_idx_0`, with
+    /// `seq_tier_0 = 0` per the spec.
+    #[test]
+    fn av1_seq_header_fields_reduced_still_picture_header() {
+        // profile=2, still=1, reduced=1, level=12.
+        // 010 1 1 01100 = 0101_1011_00 + padding → 0x5B, 0x00.
+        let payload = [0b0101_1011u8, 0b0000_0000u8];
+        let f = parse_av1_seq_header_fields(&payload);
+        assert_eq!(f.seq_profile, 2);
+        assert_eq!(f.seq_level_idx_0, 12);
+        assert_eq!(f.seq_tier_0, 0);
+    }
+
+    /// Defaults must be 8-bit 4:2:0 main-profile when the payload is empty
+    /// or unparseable — `configOBUs` then carries the SH OBU verbatim.
+    #[test]
+    fn av1_seq_header_fields_defaults_on_empty() {
+        let f = parse_av1_seq_header_fields(&[]);
+        let d = Av1SeqHeaderFields::defaults();
+        assert_eq!(f, d);
+        assert_eq!(d.high_bitdepth, 0);
+        assert_eq!(d.chroma_subsampling_x, 1);
+        assert_eq!(d.chroma_subsampling_y, 1);
     }
 }
