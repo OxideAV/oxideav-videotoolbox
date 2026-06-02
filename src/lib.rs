@@ -50,8 +50,8 @@
 //! demuxed `Packet` is one temporal unit and the blob
 //! `FrameSplit::Whole` path applies unchanged. All codec ids register
 //! with `priority = 10` and `hardware_accelerated = true`.
-//! **Round 9 (this commit) wires encoder knobs across all four VT
-//! encoders.** `CodecParameters::bit_rate` now flows into
+//! Round 9 wired encoder knobs across all four VT encoders:
+//! `CodecParameters::bit_rate` flows into
 //! `kVTCompressionPropertyKey_AverageBitRate`;
 //! `params.options["quality"]` (Float32 `[0.0, 1.0]`) flows into
 //! `kVTCompressionPropertyKey_Quality`; `params.options["profile"]`
@@ -60,8 +60,21 @@
 //! `kVTCompressionPropertyKey_ProfileLevel`; and the ProRes encoder's
 //! `params.tag` selects one of the six `kCMVideoCodecType_AppleProRes*`
 //! flavours (`apco` / `apcs` / `apcn` [default] / `apch` / `ap4h` /
-//! `ap4x`). Unset / out-of-range values keep the previous defaults so
-//! every existing call site is byte-for-byte unchanged.
+//! `ap4x`). Round 10 closed the AV1 av1C extension-atom path. **Round 11
+//! (this commit) adds VVC (H.266) video decode** via
+//! `kCMVideoCodecType_VVC = 'vvc1'` — decode-only (no VVC compression
+//! session yet exposed by VideoToolbox). A new `FrameSplit::VvcEs` framer
+//! splits a VVC Annex-B elementary stream into per-access-unit payloads on
+//! AUD / PH / VCL boundaries per H.266 Annex B, and on the first packet
+//! the leading non-VCL NAL units (DCI / OPI / VPS / SPS / PPS /
+//! PREFIX_APS) are wrapped in a `VvcDecoderConfigurationRecord` (per
+//! ISO/IEC 14496-15 §11.2.4.2.2, `ptl_present_flag = 0` /
+//! `LengthSizeMinusOne = 3` form) and supplied to
+//! `CMVideoFormatDescriptionCreate` via
+//! `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms = {
+//! "vvcC": CFData }`. Hardware decode is gated to Apple Silicon M3+ on
+//! macOS 26+; older hosts fall back through the registry to the pure-Rust
+//! `oxideav-h266` decoder.
 //!
 //! # Workspace policy
 //!
@@ -80,13 +93,13 @@ pub mod decoder;
 pub mod encoder;
 
 /// Register VideoToolbox hardware factories: H.264 / HEVC / JPEG / ProRes
-/// decode + encode, plus MPEG-2 video, VP9, MPEG-4 Part 2, and AV1 decode
-/// (the last four are decode-only — VideoToolbox exposes no MPEG-2 / VP9 /
-/// MPEG-4 Part 2 compression session at all, and the AV1 compression
-/// session is a follow-up round). If the framework cannot be loaded
-/// (older OS, sandboxed environment, non-macOS) the function logs and
-/// returns without registering anything — the runtime falls back to the
-/// pure-Rust impls.
+/// decode + encode, plus MPEG-2 video, VP9, MPEG-4 Part 2, AV1, and VVC
+/// (H.266) decode (the last five are decode-only — VideoToolbox exposes no
+/// MPEG-2 / VP9 / MPEG-4 Part 2 / VVC compression session at all, and the
+/// AV1 compression session is a follow-up round). If the framework cannot
+/// be loaded (older OS, sandboxed environment, non-macOS) the function
+/// logs and returns without registering anything — the runtime falls back
+/// to the pure-Rust impls.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag};
@@ -317,6 +330,33 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
             ]),
     );
 
+    // ── VVC (H.266) decoder (decode-only — VT has no VVC encoder yet) ──────
+    //
+    // VVC hardware decode lands on Apple Silicon M3+ via macOS 26+. On older
+    // hosts VideoToolbox either falls back to its internal software VVC path
+    // on macOS versions where it exists, or returns a non-zero `OSStatus` at
+    // session creation — the registry's SW fallback to the pure-Rust
+    // `oxideav-h266` decoder handles that case.
+    let h266_caps = CodecCapabilities::video("h266_videotoolbox")
+        .with_lossy(true)
+        .with_intra_only(false)
+        .with_hardware(true)
+        .with_priority(10);
+
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("h266"))
+            .capabilities(h266_caps.clone().with_decode())
+            .decoder(blob::make_vvc_decoder)
+            .tags([
+                CodecTag::fourcc(b"vvc1"),
+                CodecTag::fourcc(b"vvi1"),
+                CodecTag::fourcc(b"VVC1"),
+                CodecTag::fourcc(b"H266"),
+                CodecTag::fourcc(b"h266"),
+                CodecTag::matroska("V_MPEGI/ISO/VVC"),
+            ]),
+    );
+
     let _ = (
         h264_caps,
         hevc_caps,
@@ -326,6 +366,7 @@ pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
         vp9_caps,
         mpeg4_caps,
         av1_caps,
+        h266_caps,
     ); // suppress unused warnings
 }
 

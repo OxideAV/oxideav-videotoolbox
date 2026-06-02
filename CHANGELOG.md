@@ -9,6 +9,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 11: VVC (H.266) video decode** via `VTDecompressionSession`
+  (`kCMVideoCodecType_VVC` = `'vvc1'` = `0x7676_6331`). Decode-only —
+  VideoToolbox does not yet expose a VVC compression session at the time
+  of this round, so `make_vvc_decoder` registers a decoder against
+  `CodecId::new("h266")` (matching the workspace's pure-Rust
+  `oxideav-h266` codec id) and there is no encoder factory.
+  - Hardware decode is gated to Apple Silicon **M3+** on macOS 26+; on
+    older OS / hardware VideoToolbox either falls back to its internal
+    software VVC path (where available) or returns a non-zero
+    `OSStatus` at session creation, in which case the registry's SW
+    fallback to the pure-Rust `oxideav-h266` decoder handles the stream.
+  - New `FrameSplit::VvcEs` framer on `BlobDecoder`. Splits an incoming
+    VVC Annex-B elementary stream into per-access-unit payloads per
+    H.266 §7.4.2.4 / Annex B. Recognises both 3-byte (`00 00 01`) and
+    4-byte (`00 00 00 01`) start code prefixes. Opens a new access unit
+    at the next `AUD_NUT` (= 20), the next `PH_NUT` (= 19), or the next
+    VCL NAL when no `PH_NUT` has been seen since the previous boundary.
+    Leading non-VCL NAL units (DCI / OPI / VPS / SPS / PPS /
+    PREFIX_APS) preceding the first VCL ride with the first access
+    unit so the configuration travels with it. Existing
+    Whole / Mpeg2Es / Mpeg4PartTwoEs / Av1Whole framers unchanged.
+  - vvcC configuration-record path. On the first packet, `BlobDecoder`
+    calls `extract_vvc_config_prefix` to harvest the leading non-VCL
+    NAL units (DCI / OPI / VPS / SPS / PPS / PREFIX_APS), wraps them in
+    a `VvcDecoderConfigurationRecord` via
+    `build_vvc_decoder_config_record` (per ISO/IEC 14496-15 §11.2.4.2.2),
+    and supplies the blob to `CMVideoFormatDescriptionCreate` via
+    `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms = {
+    "vvcC": CFData }`. Same shape as round 7's MPEG-4 Part 2 ESDS and
+    round 10's AV1 av1C paths — the round-10 `extradata:
+    Option<(&'static str, Vec<u8>)>` storage form already supports the
+    new `"vvcC"` atom key with no plumbing change.
+  - VvcDecoderConfigurationRecord layout (`ptl_present_flag = 0` form,
+    `LengthSizeMinusOne = 3` — VT re-extracts PTL from the SPS):
+    - Byte 0: `reserved(5) = 0b11111` | `LengthSizeMinusOne(2) = 3` |
+      `ptl_present_flag(1) = 0` → `0b11111110` = `0xFE`.
+    - Byte 1: `num_of_arrays`.
+    - Bytes 2..: per array (in the spec-recommended order DCI, OPI, VPS,
+      SPS, PPS, PREFIX_APS — empty arrays omitted) —
+      `array_completeness(1) = 0 | reserved(2) = 0 | NAL_unit_type(5)`;
+      then (when `NAL_unit_type` is neither `DCI_NUT` nor `OPI_NUT`) a
+      `u16 num_nalus`; then per NAL unit a `u16 nal_unit_length` and
+      `nal_unit_length` raw NAL bytes (header + RBSP, no start code
+      prefix).
+  - VVC NAL header decode per H.266 §7.3.1.2: `forbidden_zero_bit(1) |
+    nuh_reserved_zero_bit(1) | nuh_layer_id(6)` in byte 0,
+    `nal_unit_type(5) | nuh_temporal_id_plus1(3)` in byte 1. The
+    `vvc_nal_unit_type` helper refuses non-zero values in the top two
+    bits of byte 0 (per §7.4.2.2 those must always be 0) and short
+    inputs.
+  - Codec tags: `vvc1 / vvi1 / VVC1 / H266 / h266` (fourcc) and
+    `V_MPEGI/ISO/VVC` (Matroska). Registers with `priority = 10`,
+    `hardware_accelerated = true`.
+  - Public API additions on `oxideav_videotoolbox::blob`:
+    - `K_CM_VIDEO_CODEC_TYPE_VVC = 0x7676_6331`.
+    - NAL-unit-type constants from H.266 Table 5: `VVC_NUT_TRAIL`,
+      `VVC_NUT_STSA`, `VVC_NUT_RADL`, `VVC_NUT_RASL`,
+      `VVC_NUT_IDR_W_RADL`, `VVC_NUT_IDR_N_LP`, `VVC_NUT_CRA`,
+      `VVC_NUT_GDR`, `VVC_NUT_OPI`, `VVC_NUT_DCI`, `VVC_NUT_VPS`,
+      `VVC_NUT_SPS`, `VVC_NUT_PPS`, `VVC_NUT_PREFIX_APS`,
+      `VVC_NUT_SUFFIX_APS`, `VVC_NUT_PH`, `VVC_NUT_AUD`, `VVC_NUT_EOS`,
+      `VVC_NUT_EOB`, `VVC_NUT_PREFIX_SEI`, `VVC_NUT_SUFFIX_SEI`,
+      `VVC_NUT_FD`.
+    - `vvc_nal_unit_type(&[u8]) -> Option<u8>` (decode `nal_unit_type`).
+    - `vvc_is_vcl_nut(u8) -> bool` (Table 5 VCL classification: types
+      0..11).
+    - `split_vvc_nal_units(&[u8]) -> Vec<(usize, usize)>` (Annex B byte
+      stream → list of `(offset, length)` NAL ranges, both 3-byte and
+      4-byte start codes).
+    - `extract_vvc_nals_of_type(&[u8], u8) -> Vec<&[u8]>` (filter by
+      NAL unit type).
+    - `extract_vvc_config_prefix(&[u8]) -> Option<&[u8]>` (slice from
+      offset 0 up to the start code prefix of the first VCL NAL unit;
+      `None` when the stream starts with a VCL or contains no start
+      codes).
+    - `build_vvc_decoder_config_record(&[u8]) -> Vec<u8>`.
+    - `split_vvc_access_units(&[u8]) -> Vec<&[u8]>`.
+    - `make_vvc_decoder(&CodecParameters) -> Result<Box<dyn Decoder>>`.
+  - `register` now installs a VVC decoder (and asserts via
+    `register_installs_vvc_decode_only` that it installs *no* VVC
+    encoder).
+  - **No `vvc_decode_against_ffmpeg` integration test yet.** ffmpeg
+    ships a VVC *decoder* but no VVC *encoder*, so this round cannot
+    synthesise a fixture in-process the way the AV1 / VP9 / MPEG-2 /
+    MPEG-4 Pt 2 rounds did. A follow-up round can either commit a
+    pre-extracted clean-room VVC bitstream as a test fixture (no
+    encoder dependency) or invoke a vendor encoder binary as an opaque
+    black-box validator. The wiring is complete; only the encoder-side
+    of the integration fixture is missing.
+- Twenty new unit tests covering the VVC paths:
+  - NAL header decoder — `vvc_nal_unit_type_extracts_5_bit_field`,
+    `vvc_nal_unit_type_rejects_nonzero_top_bits`,
+    `vvc_nal_unit_type_short_input_is_none`,
+    `vvc_vcl_classification_matches_table_5`.
+  - Annex-B walker — `vvc_split_nal_units_three_byte_start_codes`,
+    `vvc_split_nal_units_four_byte_start_codes`,
+    `vvc_extract_nals_of_type_returns_only_matching`.
+  - Config-prefix extractor —
+    `vvc_extract_config_prefix_stops_at_first_vcl`,
+    `vvc_extract_config_prefix_none_when_starts_with_vcl`,
+    `vvc_extract_config_prefix_none_on_empty_or_no_start_codes`.
+  - vvcC builder — `vvc_decoder_config_record_byte_0_is_0xfe`,
+    `vvc_decoder_config_record_lists_only_present_arrays`,
+    `vvc_decoder_config_record_array_layout`,
+    `vvc_decoder_config_record_dci_array_omits_num_nalus`.
+  - Access-unit splitter —
+    `vvc_split_access_units_single_picture_with_param_sets`,
+    `vvc_split_access_units_two_pictures_first_keeps_param_sets`,
+    `vvc_split_access_units_aud_starts_new_unit`,
+    `vvc_split_access_units_ph_starts_new_unit`,
+    `vvc_split_access_units_empty_buffer_yields_nothing`.
+  - Codec-type constant — `vvc_codec_type_is_vvc1_fourcc`.
+- Three new integration tests in `tests/roundtrip.rs`:
+  - `register_installs_vvc_decode_only` — decoder registered for
+    `CodecId::new("h266")` and no encoder.
+  - `vvc_codec_type_equals_vvc1_fourcc` — the public
+    `K_CM_VIDEO_CODEC_TYPE_VVC` constant equals
+    `u32::from_be_bytes(b"vvc1")` = `0x7676_6331`.
+  - `vvc_make_decoder_requires_width_height` — `make_vvc_decoder`
+    rejects calls without explicit width / height in `CodecParameters`,
+    matching the other blob decoders.
+
 - **Round 10: AV1 `av1C` extension-atom path** — AV1 Sequence Header OBU
   → `AV1CodecConfigurationRecord` wrapper supplied to VT via
   `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms`. Round

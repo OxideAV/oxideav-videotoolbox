@@ -472,6 +472,68 @@ fn register_installs_av1_decode_only() {
     );
 }
 
+/// VVC (H.266) is decode-only in round 11 — VideoToolbox does not expose
+/// a VVC compression session at the time of this round, so the factory
+/// installs a decoder under `CodecId::new("h266")` and NOT an encoder.
+/// Hardware decode is gated to Apple Silicon M3+ on macOS 26+; older OS
+/// versions either fall back to a VT-internal software path or to the
+/// registry's pure-Rust `oxideav-h266` decoder at lower priority.
+#[test]
+fn register_installs_vvc_decode_only() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping vvc registry check");
+        return;
+    }
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_videotoolbox::register(&mut ctx);
+    let cid = oxideav_core::CodecId::new("h266");
+    assert!(
+        ctx.codecs.has_decoder(&cid),
+        "no VT decoder registered for h266 (VVC)"
+    );
+    assert!(
+        !ctx.codecs.has_encoder(&cid),
+        "VT must not register a VVC encoder (no VVC compression session is exposed yet)"
+    );
+}
+
+/// `kCMVideoCodecType_VVC` is the FOURCC `'vvc1'` per Apple's CoreMedia
+/// headers and ISO/IEC 14496-15 §11.x — same shape as the H.264 / HEVC /
+/// AV1 / VP9 / MPEG-2 / MPEG-4 Pt 2 / JPEG / ProRes constants. The
+/// crate's `K_CM_VIDEO_CODEC_TYPE_VVC` constant must equal
+/// `u32::from_be_bytes(b"vvc1") = 0x76766331`.
+#[test]
+fn vvc_codec_type_equals_vvc1_fourcc() {
+    let expected = u32::from_be_bytes(*b"vvc1");
+    assert_eq!(
+        oxideav_videotoolbox::blob::K_CM_VIDEO_CODEC_TYPE_VVC,
+        expected
+    );
+    assert_eq!(
+        oxideav_videotoolbox::blob::K_CM_VIDEO_CODEC_TYPE_VVC,
+        0x7676_6331
+    );
+}
+
+/// The VVC factory rejects calls without explicit width / height in
+/// `CodecParameters` — same behavioural guarantee as the other blob
+/// decoders. Hosts that supply the parameters via the format description
+/// extensions still need width/height for the `CMVideoFormatDescription`
+/// the blob decoder builds.
+#[test]
+fn vvc_make_decoder_requires_width_height() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping vvc make-decoder check");
+        return;
+    }
+    let p = CodecParameters::video(CodecId::new("h266"));
+    let r = vt_blob::make_vvc_decoder(&p);
+    assert!(
+        r.is_err(),
+        "make_vvc_decoder should reject missing dimensions"
+    );
+}
+
 // ─────────────────────────── MPEG-2 decode test ───────────────────────────────
 
 /// Run `ffmpeg` as an opaque black-box validator to produce an MPEG-2

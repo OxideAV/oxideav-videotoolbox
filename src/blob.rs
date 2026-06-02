@@ -567,6 +567,15 @@ pub enum FrameSplit {
     /// those hosts open the session even when the bitstream alone wouldn't
     /// have been sufficient (analogous to the MPEG-4 Part 2 ESDS path).
     Av1Whole,
+    /// VVC (H.266) Annex-B elementary stream: split on AUD/PH/VCL boundaries
+    /// (see [`split_vvc_access_units`]) into per-access-unit payloads, with
+    /// leading non-VCL NAL units (DCI / OPI / VPS / SPS / PPS / PREFIX_APS)
+    /// attached to the first access unit so the configuration travels with
+    /// it. The first packet's configuration prefix is additionally wrapped
+    /// in a `VvcDecoderConfigurationRecord` (per ISO/IEC 14496-15 §11.2.4.2)
+    /// and supplied to VT via `SampleDescriptionExtensionAtoms = { "vvcC":
+    /// CFData }`, analogous to the MPEG-4 Part 2 ESDS and AV1 av1C paths.
+    VvcEs,
 }
 
 /// Split an MPEG-2 elementary-stream buffer into per-picture access units.
@@ -1283,6 +1292,394 @@ fn sequence_header_payload(obu: &[u8]) -> Option<&[u8]> {
     Some(&obu[cursor..end])
 }
 
+// ─────────────────────────── VVC (H.266) helpers ─────────────────────────────
+//
+// All VVC byte-stream / NAL-unit-type / configuration-record layout below is
+// derived from:
+//
+// * Rec. ITU-T H.266 (V4) (01/2026) — `docs/video/h266/T-REC-H.266-202601-I.pdf`.
+//   - §7.3.1.2 NAL unit header (2 bytes: `forbidden_zero_bit(1)` +
+//     `nuh_reserved_zero_bit(1)` + `nuh_layer_id(6)` + `nal_unit_type(5)` +
+//     `nuh_temporal_id_plus1(3)`).
+//   - Table 5 — NAL unit type codes (TRAIL_NUT = 0, IDR_W_RADL = 7,
+//     IDR_N_LP = 8, CRA_NUT = 9, GDR_NUT = 10, OPI_NUT = 12, DCI_NUT = 13,
+//     VPS_NUT = 14, SPS_NUT = 15, PPS_NUT = 16, PREFIX_APS_NUT = 17,
+//     SUFFIX_APS_NUT = 18, PH_NUT = 19, AUD_NUT = 20, …).
+//   - Annex B — byte stream format: each NAL unit is preceded by a 3-byte
+//     start code prefix `0x00 0x00 0x01`, optionally preceded by one or
+//     more leading/trailing/zero-bytes (so 4-byte `0x00 0x00 0x00 0x01`
+//     also marks a NAL boundary).
+//
+// * ISO/IEC 14496-15:2024 §11.2.4.2 — `VvcDecoderConfigurationRecord`:
+//   `docs/container/isobmff/ISO_IEC_14496-15-2024.pdf`. The minimal record
+//   we build sets `ptl_present_flag = 0` (PTL re-extracted by the decoder
+//   from the SPS) and arrays it in the recommended order DCI, OPI, VPS,
+//   SPS, PPS, PREFIX_APS, with `LengthSizeMinusOne = 3` (4-byte length
+//   prefix) so VT picks up the NAL units via length-prefix framing inside
+//   the format-description extension atom.
+
+/// Selected `nal_unit_type` codes from H.266 Table 5 used by the
+/// access-unit splitter and the vvcC configuration-record builder. Each
+/// constant matches the 5-bit value found in bits 7..3 of the second NAL
+/// header byte (i.e. `(byte1 >> 3) & 0x1F`).
+pub const VVC_NUT_TRAIL: u8 = 0;
+pub const VVC_NUT_STSA: u8 = 1;
+pub const VVC_NUT_RADL: u8 = 2;
+pub const VVC_NUT_RASL: u8 = 3;
+pub const VVC_NUT_IDR_W_RADL: u8 = 7;
+pub const VVC_NUT_IDR_N_LP: u8 = 8;
+pub const VVC_NUT_CRA: u8 = 9;
+pub const VVC_NUT_GDR: u8 = 10;
+pub const VVC_NUT_OPI: u8 = 12;
+pub const VVC_NUT_DCI: u8 = 13;
+pub const VVC_NUT_VPS: u8 = 14;
+pub const VVC_NUT_SPS: u8 = 15;
+pub const VVC_NUT_PPS: u8 = 16;
+pub const VVC_NUT_PREFIX_APS: u8 = 17;
+pub const VVC_NUT_SUFFIX_APS: u8 = 18;
+pub const VVC_NUT_PH: u8 = 19;
+pub const VVC_NUT_AUD: u8 = 20;
+pub const VVC_NUT_EOS: u8 = 21;
+pub const VVC_NUT_EOB: u8 = 22;
+pub const VVC_NUT_PREFIX_SEI: u8 = 23;
+pub const VVC_NUT_SUFFIX_SEI: u8 = 24;
+pub const VVC_NUT_FD: u8 = 25;
+
+/// Return `true` for a VCL NAL unit type (0..11, the slice-carrying types
+/// per H.266 Table 5). Used to distinguish VCL boundaries from parameter
+/// set boundaries when carving access units.
+pub fn vvc_is_vcl_nut(nut: u8) -> bool {
+    nut <= 11
+}
+
+/// Decode the 5-bit `nal_unit_type` from a 2-byte VVC NAL unit header.
+/// Returns `None` if `header` is shorter than 2 bytes or if the byte 0
+/// `forbidden_zero_bit` / `nuh_reserved_zero_bit` are set (both must be 0
+/// per H.266 §7.4.2.2 — non-zero indicates non-VVC data or a corrupted
+/// stream).
+pub fn vvc_nal_unit_type(header: &[u8]) -> Option<u8> {
+    if header.len() < 2 {
+        return None;
+    }
+    // Byte 0 layout: forbidden_zero_bit(1) | nuh_reserved_zero_bit(1) |
+    // nuh_layer_id(6). The two top bits must both be 0.
+    if (header[0] & 0xC0) != 0 {
+        return None;
+    }
+    // Byte 1 layout: nal_unit_type(5) | nuh_temporal_id_plus1(3).
+    Some((header[1] >> 3) & 0x1F)
+}
+
+/// Walk a VVC Annex-B byte stream and return a vector of `(offset, length)`
+/// pairs where each entry covers a single NAL unit's bytes — *not*
+/// including the preceding start code prefix.
+///
+/// Start codes per H.266 Annex B are `0x00 0x00 0x01` (3 bytes) optionally
+/// preceded by a `zero_byte = 0x00` (the 4-byte form `0x00 0x00 0x00 0x01`).
+/// The walker recognises both forms. Bytes between NAL units that aren't
+/// part of a start code (rare leading/trailing zero bytes) are dropped.
+///
+/// Returns an empty vector for an empty input or for input that contains no
+/// start codes at all.
+pub fn split_vvc_nal_units(buf: &[u8]) -> Vec<(usize, usize)> {
+    let mut nal_starts: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+            nal_starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(nal_starts.len());
+    for (idx, &start) in nal_starts.iter().enumerate() {
+        let mut end = nal_starts.get(idx + 1).copied().unwrap_or(buf.len());
+        // The next NAL's start-code prefix can be either 3 or 4 bytes; back
+        // up `end` past any preceding `zero_byte` (and past the start code
+        // prefix itself, which is `start - 3` for the next NAL).
+        if let Some(&next_start) = nal_starts.get(idx + 1) {
+            // next_start points to the byte AFTER the start code prefix, so
+            // the prefix occupies bytes `next_start - 3 .. next_start`. The
+            // optional preceding zero_byte sits at `next_start - 4` if the
+            // 4-byte form is in use.
+            end = next_start.saturating_sub(3);
+            if end > start && buf[end - 1] == 0 {
+                end -= 1;
+            }
+        }
+        if end > start {
+            out.push((start, end - start));
+        }
+    }
+    out
+}
+
+/// Extract every NAL unit of a given `nal_unit_type` from a VVC Annex-B
+/// byte stream. Each returned slice covers the NAL unit's bytes (header +
+/// RBSP) with no start code prefix. Useful for harvesting VPS / SPS / PPS
+/// to populate a `VvcDecoderConfigurationRecord` array.
+pub fn extract_vvc_nals_of_type(buf: &[u8], nut: u8) -> Vec<&[u8]> {
+    let mut out: Vec<&[u8]> = Vec::new();
+    for (off, len) in split_vvc_nal_units(buf) {
+        let nal = &buf[off..off + len];
+        if let Some(t) = vvc_nal_unit_type(nal) {
+            if t == nut {
+                out.push(nal);
+            }
+        }
+    }
+    out
+}
+
+/// Extract the VVC configuration prefix — the leading non-VCL NAL units
+/// (DCI, OPI, VPS, SPS, PPS, prefix APS) — from a VVC Annex-B byte stream,
+/// stopping at the first VCL NAL unit boundary.
+///
+/// Returns the slice of `buf` from offset 0 up to (but not including) the
+/// start code prefix of the first VCL NAL unit. Returns `None` if `buf`
+/// starts with a VCL NAL unit (no configuration to extract) or contains
+/// no NAL units at all.
+///
+/// The slice is suitable as the bitstream prefix that would be supplied to
+/// `build_vvc_decoder_config_record` after this function pulls the parameter
+/// sets via `extract_vvc_nals_of_type`.
+pub fn extract_vvc_config_prefix(buf: &[u8]) -> Option<&[u8]> {
+    // Walk the start codes; for each one inspect the NAL unit type and stop
+    // when we see a VCL boundary. Return `Some` of the slice from offset 0
+    // up to the start of the start code prefix of the first VCL NAL.
+    let mut i = 0usize;
+    while i + 3 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+            // Start code at [i..i+3]; NAL starts at i+3. Check VCL.
+            let nal_off = i + 3;
+            if nal_off + 2 <= buf.len() {
+                if let Some(nut) = vvc_nal_unit_type(&buf[nal_off..nal_off + 2]) {
+                    if vvc_is_vcl_nut(nut) {
+                        // Back up past an optional preceding zero_byte (the
+                        // 4-byte start code form `00 00 00 01`).
+                        let mut prefix_end = i;
+                        if prefix_end > 0 && buf[prefix_end - 1] == 0 {
+                            prefix_end -= 1;
+                        }
+                        return if prefix_end == 0 {
+                            None
+                        } else {
+                            Some(&buf[..prefix_end])
+                        };
+                    }
+                }
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Build an array entry for a `VvcDecoderConfigurationRecord`:
+/// `array_completeness(1) | reserved(2)=0 | NAL_unit_type(5)` byte,
+/// followed by (when `nut` is neither DCI_NUT nor OPI_NUT) a `u16` count of
+/// NAL units, then for each NAL unit a `u16 nal_unit_length` and the NAL
+/// unit bytes themselves.
+///
+/// `array_completeness` is set to `0` (NAL units of the indicated type
+/// could also appear in samples) since we don't enforce in-band/out-of-band
+/// exclusivity in this round.
+fn build_vvc_array(nut: u8, nals: &[&[u8]]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    // First byte: array_completeness(1) | reserved(2)=0 | NAL_unit_type(5).
+    out.push(nut & 0x1F);
+    if nut != VVC_NUT_DCI && nut != VVC_NUT_OPI {
+        let count = nals.len().min(u16::MAX as usize) as u16;
+        out.extend_from_slice(&count.to_be_bytes());
+    }
+    for nal in nals {
+        let len = nal.len().min(u16::MAX as usize) as u16;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&nal[..len as usize]);
+    }
+    out
+}
+
+/// Build a minimal `VvcDecoderConfigurationRecord` (vvcC payload, per
+/// ISO/IEC 14496-15 §11.2.4.2.2) from the parameter-set NAL units found in
+/// `prefix` (a VVC Annex-B byte stream).
+///
+/// Layout (`ptl_present_flag = 0` form, which lets VT re-extract PTL from
+/// the SPS):
+///
+/// * Byte 0: `reserved(5) = 0b11111` | `LengthSizeMinusOne(2) = 3` |
+///   `ptl_present_flag(1) = 0` → `0b11111110` = `0xFE`. The
+///   `LengthSizeMinusOne = 3` selects the standard 4-byte length prefix for
+///   the NAL units VT will see in the bitstream payload going through
+///   `submit_frame`.
+/// * Byte 1: `num_of_arrays`.
+/// * Bytes 2..: array entries in the order recommended by the spec —
+///   DCI, OPI, VPS, SPS, PPS, prefix APS.
+///
+/// Arrays that have no NAL units in `prefix` are omitted (so a stream with
+/// only VPS+SPS+PPS produces a 3-array record).
+///
+/// VideoToolbox picks this record up via
+/// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms` keyed by
+/// the four-character atom name `"vvcC"`.
+pub fn build_vvc_decoder_config_record(prefix: &[u8]) -> Vec<u8> {
+    // Harvest each parameter-set NAL unit type the spec's array order
+    // recommends. Each list's elements are slices into `prefix` (no start
+    // codes, just the NAL bytes themselves).
+    let dci = extract_vvc_nals_of_type(prefix, VVC_NUT_DCI);
+    let opi = extract_vvc_nals_of_type(prefix, VVC_NUT_OPI);
+    let vps = extract_vvc_nals_of_type(prefix, VVC_NUT_VPS);
+    let sps = extract_vvc_nals_of_type(prefix, VVC_NUT_SPS);
+    let pps = extract_vvc_nals_of_type(prefix, VVC_NUT_PPS);
+    let prefix_aps = extract_vvc_nals_of_type(prefix, VVC_NUT_PREFIX_APS);
+
+    // Build each array body (skipping empty arrays).
+    let arrays: Vec<(u8, &[&[u8]])> = [
+        (VVC_NUT_DCI, dci.as_slice()),
+        (VVC_NUT_OPI, opi.as_slice()),
+        (VVC_NUT_VPS, vps.as_slice()),
+        (VVC_NUT_SPS, sps.as_slice()),
+        (VVC_NUT_PPS, pps.as_slice()),
+        (VVC_NUT_PREFIX_APS, prefix_aps.as_slice()),
+    ]
+    .into_iter()
+    .filter(|(_, n)| !n.is_empty())
+    .collect();
+
+    let num_of_arrays = arrays.len().min(u8::MAX as usize) as u8;
+
+    let mut out: Vec<u8> = Vec::new();
+    // Byte 0: reserved(5)=0b11111 | LengthSizeMinusOne(2)=3 | ptl_present(1)=0.
+    out.push(0b1111_1110);
+    // Byte 1: num_of_arrays.
+    out.push(num_of_arrays);
+    for (nut, nals) in arrays {
+        out.extend_from_slice(&build_vvc_array(nut, nals));
+    }
+    out
+}
+
+/// Split a VVC Annex-B elementary-stream buffer into per-access-unit
+/// payloads.
+///
+/// H.266 §7.4.2.4 specifies that an access unit (AU) begins at an AUD NAL
+/// unit when one is present, or otherwise at the first VCL NAL unit of a
+/// new picture (signalled by the picture header `PH_NUT` immediately
+/// preceding the first VCL slice, or by a slice-header context change for
+/// streams that omit PH_NUT). For VT submission, splitting on either of:
+///
+///   * an `AUD_NUT` (= 20), or
+///   * a `PH_NUT` (= 19), or
+///   * a transition from non-VCL to VCL when no PH_NUT has been seen in the
+///     current pending unit
+///
+/// yields per-picture access units valid as VT `CMSampleBuffer` payloads.
+/// All leading parameter-set NAL units (DCI / OPI / VPS / SPS / PPS /
+/// PREFIX_APS) preceding the first VCL boundary are attached to the first
+/// access unit so the VOL / sequence configuration travels with it.
+///
+/// If no start codes are present in `buf`, the buffer is returned as a
+/// single access unit (defensive: shouldn't happen for a valid VVC
+/// elementary stream).
+pub fn split_vvc_access_units(buf: &[u8]) -> Vec<&[u8]> {
+    // Collect (start_code_prefix_start, nal_unit_type) for every NAL.
+    // start_code_prefix_start is the byte index of the first `0x00` of the
+    // start code prefix (3- or 4-byte form), so slicing
+    // `buf[prefix_start..next_prefix_start]` produces a slice whose first
+    // bytes are the start code prefix itself — exactly what VT wants.
+    let mut nal_info: Vec<(usize, u8)> = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+            let nal_off = i + 3;
+            // Determine the prefix start (back up one if preceded by 0x00).
+            let prefix_start = if i > 0 && buf[i - 1] == 0 { i - 1 } else { i };
+            // Decode nal_unit_type from the 2-byte header that follows the
+            // start code prefix.
+            let nut = if nal_off + 2 <= buf.len() {
+                vvc_nal_unit_type(&buf[nal_off..nal_off + 2]).unwrap_or(0xFF)
+            } else {
+                0xFF
+            };
+            nal_info.push((prefix_start, nut));
+            i = nal_off; // continue scanning from the byte after start code
+        } else {
+            i += 1;
+        }
+    }
+
+    if nal_info.is_empty() {
+        return if buf.is_empty() {
+            Vec::new()
+        } else {
+            vec![buf]
+        };
+    }
+
+    // Determine the offset at which each access unit begins. AU 0 starts
+    // at offset 0 and absorbs every leading non-VCL NAL plus the first
+    // picture header (PH_NUT) / AUD and the first VCL. Subsequent AU
+    // boundaries fire at the next *occurrence* of:
+    //   - an AUD_NUT,
+    //   - a PH_NUT, or
+    //   - a VCL NAL when no PH_NUT was seen since the last boundary.
+    //
+    // The "saw_*" flags track state since the most recent boundary; the
+    // first PH/AUD does not re-open AU 0, it merely arms the state so that
+    // the *next* PH/AUD/VCL-after-VCL fires.
+    let mut au_starts: Vec<usize> = vec![0];
+    let mut saw_vcl_in_current = false;
+    let mut saw_ph_in_current = false;
+    let mut saw_aud_in_current = false;
+    for (idx, &(prefix_start, nut)) in nal_info.iter().enumerate() {
+        if idx == 0 {
+            // AU 0 always starts at NAL 0 — record the boundary's flags
+            // based on its type so a same-type NAL later opens AU 1.
+            match nut {
+                VVC_NUT_PH => saw_ph_in_current = true,
+                VVC_NUT_AUD => saw_aud_in_current = true,
+                t if vvc_is_vcl_nut(t) => saw_vcl_in_current = true,
+                _ => {}
+            }
+            continue;
+        }
+        let start_new = match nut {
+            VVC_NUT_AUD if saw_aud_in_current || saw_vcl_in_current || saw_ph_in_current => true,
+            VVC_NUT_PH if saw_ph_in_current || saw_vcl_in_current => true,
+            t if vvc_is_vcl_nut(t) && !saw_ph_in_current && saw_vcl_in_current => true,
+            _ => false,
+        };
+        if start_new {
+            au_starts.push(prefix_start);
+            saw_vcl_in_current = false;
+            saw_ph_in_current = false;
+            saw_aud_in_current = false;
+        }
+        match nut {
+            VVC_NUT_PH => saw_ph_in_current = true,
+            VVC_NUT_AUD => saw_aud_in_current = true,
+            t if vvc_is_vcl_nut(t) => saw_vcl_in_current = true,
+            _ => {}
+        }
+    }
+
+    // AU 0's prefix_start is always 0 (so the leading parameter sets ride
+    // with the first picture). For each AU, the next AU's prefix_start
+    // bounds the slice end; for the final AU, the end is buf.len().
+    let mut out: Vec<&[u8]> = Vec::with_capacity(au_starts.len());
+    for (idx, &start) in au_starts.iter().enumerate() {
+        let begin = if idx == 0 { 0 } else { start };
+        let end = au_starts.get(idx + 1).copied().unwrap_or(buf.len());
+        if end > begin {
+            out.push(&buf[begin..end]);
+        }
+    }
+    out
+}
+
 // ─────────────────────────── Decoder ─────────────────────────────────────────
 
 /// Blob-style VTDecompressionSession decoder.
@@ -1655,6 +2052,14 @@ impl Decoder for BlobDecoder {
                         }
                     }
                 }
+                FrameSplit::VvcEs => {
+                    if let Some(prefix) = extract_vvc_config_prefix(&packet.data) {
+                        if !prefix.is_empty() {
+                            self.extradata =
+                                Some(("vvcC", build_vvc_decoder_config_record(prefix)));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1683,6 +2088,16 @@ impl Decoder for BlobDecoder {
                 // `split_mpeg4_part_two_access_units`). PTS handling matches
                 // the MPEG-2 path.
                 let units = split_mpeg4_part_two_access_units(&packet.data);
+                for (idx, unit) in units.iter().enumerate() {
+                    let pts = if idx == 0 { packet.pts } else { None };
+                    self.submit_frame(unit, pts)?;
+                }
+            }
+            FrameSplit::VvcEs => {
+                // Carve the VVC Annex-B elementary stream into per-access-
+                // unit payloads (see `split_vvc_access_units`). PTS handling
+                // matches the MPEG-2 / MPEG-4 Part 2 paths.
+                let units = split_vvc_access_units(&packet.data);
                 for (idx, unit) in units.iter().enumerate() {
                     let pts = if idx == 0 { packet.pts } else { None };
                     self.submit_frame(unit, pts)?;
@@ -2177,6 +2592,17 @@ pub const K_CM_VIDEO_CODEC_TYPE_MPEG4_VIDEO: u32 = 0x6D703476;
 /// session on macOS 14+ for hosts with the M3+ hardware encoder, but
 /// the encode path needs its own callback/pixel-buffer wiring).
 pub const K_CM_VIDEO_CODEC_TYPE_AV1: u32 = 0x61763031;
+/// kCMVideoCodecType_VVC = 'vvc1' (0x76_76_63_31). Per Apple's
+/// CoreMedia headers and ISO/IEC 14496-15 §11.x (the VVC sample-entry
+/// fourcc for in-band parameter sets). VideoToolbox first exposes a VVC
+/// *decoder* on macOS 26+ (Apple Silicon M3+ for hardware decode);
+/// older OS versions either fall back to a VT-internal software path
+/// where available or return a non-zero `OSStatus` at session creation
+/// (the registry's SW fallback to the pure-Rust `oxideav-h266` decoder
+/// covers that case). VVC compression sessions are not yet exposed by
+/// VideoToolbox at the time of this round, so the crate registers
+/// decode-only.
+pub const K_CM_VIDEO_CODEC_TYPE_VVC: u32 = 0x7676_6331;
 
 // ─────────────────────────── Public factories ────────────────────────────────
 
@@ -2379,12 +2805,60 @@ pub fn make_av1_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     )
 }
 
+/// VVC (H.266) video decoder via VideoToolbox.
+///
+/// Decode-only: VideoToolbox first exposes a VVC *decoder*
+/// (`kCMVideoCodecType_VVC` = `'vvc1'`) on macOS 26+ for Apple Silicon
+/// M3+ hardware, with VT-internal software fallback on older OS versions
+/// where it exists; no VVC compression session is exposed at the time of
+/// this round, so there is no matching `make_vvc_encoder`.
+///
+/// ## Framing
+///
+/// VVC input is an Annex-B elementary stream (per H.266 Annex B). The
+/// `FrameSplit::VvcEs` framer splits the buffer on AUD / PH / VCL
+/// boundaries (see [`split_vvc_access_units`]) into per-access-unit
+/// payloads, attaching any leading DCI / OPI / VPS / SPS / PPS / PREFIX_APS
+/// NAL units to the first access unit so the configuration travels with it.
+///
+/// ## Configuration record (vvcC) — extension-atom path
+///
+/// On hosts where VT requires the parameter sets out-of-band rather than
+/// extracted from the bitstream prefix, `BlobDecoder` calls
+/// [`extract_vvc_config_prefix`] on the first packet to harvest the
+/// leading non-VCL NAL units, wraps them in a `VvcDecoderConfigurationRecord`
+/// via [`build_vvc_decoder_config_record`] (per ISO/IEC 14496-15
+/// §11.2.4.2.2 — `ptl_present_flag = 0` form, `LengthSizeMinusOne = 3`),
+/// and supplies the blob to `CMVideoFormatDescriptionCreate` via
+/// `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms = {
+/// "vvcC": CFData }`. This is the same pattern wired in round 7 for
+/// MPEG-4 Part 2's ESDS and round 10 for AV1's av1C.
+///
+/// If the first packet contains no leading non-VCL NAL units (e.g. a
+/// mid-stream random-access entry where the decoder context already
+/// exists), [`extract_vvc_config_prefix`] returns `None` and the decoder
+/// reverts to the bare `(codec_type, width, height)` path. The pure-Rust
+/// `oxideav-h266` decoder remains in the registry as a lower-priority
+/// fallback for any host where session creation still fails.
+///
+/// ## Codec id
+///
+/// `CodecId::new("h266")`, matching the workspace's pure-Rust
+/// `oxideav-h266` codec id.
+pub fn make_vvc_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    BlobDecoder::make_with_framer("h266", K_CM_VIDEO_CODEC_TYPE_VVC, FrameSplit::VvcEs, params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_av1c_config_record, build_mpeg4_part_two_esds, extract_av1_sequence_header_obu,
-        extract_mpeg4_part_two_vol, parse_av1_seq_header_fields, split_mpeg2_access_units,
-        split_mpeg4_part_two_access_units, Av1SeqHeaderFields,
+        build_av1c_config_record, build_mpeg4_part_two_esds, build_vvc_decoder_config_record,
+        extract_av1_sequence_header_obu, extract_mpeg4_part_two_vol, extract_vvc_config_prefix,
+        extract_vvc_nals_of_type, parse_av1_seq_header_fields, split_mpeg2_access_units,
+        split_mpeg4_part_two_access_units, split_vvc_access_units, split_vvc_nal_units,
+        vvc_is_vcl_nut, vvc_nal_unit_type, Av1SeqHeaderFields, VVC_NUT_AUD, VVC_NUT_DCI,
+        VVC_NUT_IDR_W_RADL, VVC_NUT_OPI, VVC_NUT_PH, VVC_NUT_PPS, VVC_NUT_PREFIX_APS, VVC_NUT_SPS,
+        VVC_NUT_TRAIL, VVC_NUT_VPS,
     };
 
     // Start codes: B3 = sequence header, B8 = GOP, 00 = picture, B5 = ext.
@@ -2895,5 +3369,305 @@ mod tests {
         assert_eq!(d.high_bitdepth, 0);
         assert_eq!(d.chroma_subsampling_x, 1);
         assert_eq!(d.chroma_subsampling_y, 1);
+    }
+
+    // ── VVC (H.266) helpers ──────────────────────────────────────────────────
+    //
+    // Build a 2-byte VVC NAL unit header with the given nal_unit_type. The
+    // top two bits (forbidden_zero_bit + nuh_reserved_zero_bit) are 0;
+    // nuh_layer_id is 0; nuh_temporal_id_plus1 is 1. This is the minimum
+    // valid header shape per H.266 §7.3.1.2 / §7.4.2.2.
+    fn vvc_hdr(nut: u8) -> [u8; 2] {
+        [0x00, ((nut & 0x1F) << 3) | 0x01]
+    }
+
+    // Build a single Annex-B byte-stream NAL unit: 3-byte start code prefix
+    // + 2-byte header + an opaque RBSP byte. The 4-byte form is exercised
+    // in a dedicated test.
+    fn vvc_annex_b_nal(nut: u8, rbsp_byte: u8) -> Vec<u8> {
+        let hdr = vvc_hdr(nut);
+        vec![0x00, 0x00, 0x01, hdr[0], hdr[1], rbsp_byte]
+    }
+
+    #[test]
+    fn vvc_nal_unit_type_extracts_5_bit_field() {
+        for &nut in &[
+            VVC_NUT_TRAIL,
+            VVC_NUT_IDR_W_RADL,
+            VVC_NUT_VPS,
+            VVC_NUT_SPS,
+            VVC_NUT_PPS,
+            VVC_NUT_PH,
+            VVC_NUT_AUD,
+        ] {
+            let h = vvc_hdr(nut);
+            assert_eq!(vvc_nal_unit_type(&h), Some(nut), "round-trip nut {nut}");
+        }
+    }
+
+    #[test]
+    fn vvc_nal_unit_type_rejects_nonzero_top_bits() {
+        // forbidden_zero_bit set.
+        assert_eq!(vvc_nal_unit_type(&[0x80, 0x08]), None);
+        // nuh_reserved_zero_bit set.
+        assert_eq!(vvc_nal_unit_type(&[0x40, 0x08]), None);
+    }
+
+    #[test]
+    fn vvc_nal_unit_type_short_input_is_none() {
+        assert_eq!(vvc_nal_unit_type(&[]), None);
+        assert_eq!(vvc_nal_unit_type(&[0x00]), None);
+    }
+
+    #[test]
+    fn vvc_vcl_classification_matches_table_5() {
+        // VCL types: 0..=11 per H.266 Table 5.
+        for nut in 0..=11u8 {
+            assert!(vvc_is_vcl_nut(nut), "{nut} should be VCL");
+        }
+        // Non-VCL: parameter sets, PH, AUD, SEI, etc.
+        for &nut in &[
+            VVC_NUT_OPI,
+            VVC_NUT_DCI,
+            VVC_NUT_VPS,
+            VVC_NUT_SPS,
+            VVC_NUT_PPS,
+            VVC_NUT_PREFIX_APS,
+            VVC_NUT_PH,
+            VVC_NUT_AUD,
+        ] {
+            assert!(!vvc_is_vcl_nut(nut), "{nut} should not be VCL");
+        }
+    }
+
+    #[test]
+    fn vvc_split_nal_units_three_byte_start_codes() {
+        // SPS + PPS + IDR — three NALs with 3-byte start codes back-to-back.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0xAA));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_PPS, 0xBB));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_IDR_W_RADL, 0xCC));
+
+        let nals = split_vvc_nal_units(&buf);
+        assert_eq!(nals.len(), 3);
+        // Each NAL is exactly the 2-byte header + 1 RBSP byte = 3 bytes.
+        for (_, len) in &nals {
+            assert_eq!(*len, 3);
+        }
+        // First NAL is SPS.
+        let (off0, len0) = nals[0];
+        assert_eq!(
+            vvc_nal_unit_type(&buf[off0..off0 + len0]),
+            Some(VVC_NUT_SPS)
+        );
+    }
+
+    #[test]
+    fn vvc_split_nal_units_four_byte_start_codes() {
+        // VPS + SPS with 4-byte start codes (00 00 00 01 … 00 00 00 01 …).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        buf.extend_from_slice(&vvc_hdr(VVC_NUT_VPS));
+        buf.push(0x11);
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        buf.extend_from_slice(&vvc_hdr(VVC_NUT_SPS));
+        buf.push(0x22);
+        let nals = split_vvc_nal_units(&buf);
+        assert_eq!(nals.len(), 2, "two NALs expected: {nals:?}");
+        let (off0, len0) = nals[0];
+        let (off1, len1) = nals[1];
+        assert_eq!(
+            vvc_nal_unit_type(&buf[off0..off0 + len0]),
+            Some(VVC_NUT_VPS)
+        );
+        assert_eq!(
+            vvc_nal_unit_type(&buf[off1..off1 + len1]),
+            Some(VVC_NUT_SPS)
+        );
+    }
+
+    #[test]
+    fn vvc_extract_nals_of_type_returns_only_matching() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_VPS, 0xA0));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0xA1));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0xA2));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_PPS, 0xA3));
+        let sps = extract_vvc_nals_of_type(&buf, VVC_NUT_SPS);
+        assert_eq!(sps.len(), 2);
+        assert_eq!(sps[0][2], 0xA1);
+        assert_eq!(sps[1][2], 0xA2);
+        let pps = extract_vvc_nals_of_type(&buf, VVC_NUT_PPS);
+        assert_eq!(pps.len(), 1);
+        let none = extract_vvc_nals_of_type(&buf, VVC_NUT_AUD);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn vvc_extract_config_prefix_stops_at_first_vcl() {
+        // VPS + SPS + PPS + IDR → prefix is VPS+SPS+PPS bytes.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_VPS, 0x11));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0x22));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_PPS, 0x33));
+        let vcl_off = buf.len();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_IDR_W_RADL, 0x44));
+        let prefix = extract_vvc_config_prefix(&buf).expect("prefix present");
+        assert_eq!(prefix.len(), vcl_off);
+        // Sanity: it round-trips through the NAL walker as 3 NALs.
+        assert_eq!(split_vvc_nal_units(prefix).len(), 3);
+    }
+
+    #[test]
+    fn vvc_extract_config_prefix_none_when_starts_with_vcl() {
+        let buf = vvc_annex_b_nal(VVC_NUT_IDR_W_RADL, 0x77);
+        assert!(extract_vvc_config_prefix(&buf).is_none());
+    }
+
+    #[test]
+    fn vvc_extract_config_prefix_none_on_empty_or_no_start_codes() {
+        assert!(extract_vvc_config_prefix(&[]).is_none());
+        assert!(extract_vvc_config_prefix(&[1, 2, 3, 4]).is_none());
+    }
+
+    #[test]
+    fn vvc_decoder_config_record_byte_0_is_0xfe() {
+        // Reserved(5)=0b11111 | LengthSizeMinusOne(2)=3 | ptl_present(1)=0
+        // → 0b11111110 = 0xFE.
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0xAA));
+        let r = build_vvc_decoder_config_record(&prefix);
+        assert_eq!(r[0], 0xFE);
+    }
+
+    #[test]
+    fn vvc_decoder_config_record_lists_only_present_arrays() {
+        // VPS + SPS + PPS prefix → num_of_arrays = 3.
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_VPS, 0x10));
+        prefix.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0x20));
+        prefix.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_PPS, 0x30));
+        let r = build_vvc_decoder_config_record(&prefix);
+        assert_eq!(r[0], 0xFE);
+        assert_eq!(r[1], 3, "expected num_of_arrays=3 for VPS+SPS+PPS");
+    }
+
+    #[test]
+    fn vvc_decoder_config_record_array_layout() {
+        // VPS prefix only — verify the first array header byte equals
+        // NAL_unit_type (array_completeness=0, reserved=0).
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_VPS, 0xCC));
+        let r = build_vvc_decoder_config_record(&prefix);
+        // Header byte 0 = 0xFE, byte 1 = num_of_arrays = 1.
+        assert_eq!(r[0], 0xFE);
+        assert_eq!(r[1], 1);
+        // Array entry: byte 2 = NAL_unit_type (with top 3 bits zero).
+        assert_eq!(r[2] & 0x1F, VVC_NUT_VPS);
+        // Bytes 3..5 = num_nalus = 1 (BE u16).
+        assert_eq!(&r[3..5], &[0x00, 0x01]);
+        // Bytes 5..7 = nal_unit_length = 3 (header + 1 RBSP byte).
+        assert_eq!(&r[5..7], &[0x00, 0x03]);
+        // Bytes 7..10 = NAL bytes (header + 0xCC).
+        let hdr = vvc_hdr(VVC_NUT_VPS);
+        assert_eq!(r[7], hdr[0]);
+        assert_eq!(r[8], hdr[1]);
+        assert_eq!(r[9], 0xCC);
+    }
+
+    #[test]
+    fn vvc_decoder_config_record_dci_array_omits_num_nalus() {
+        // Per §11.2.4.2.2: DCI_NUT and OPI_NUT arrays omit the `num_nalus`
+        // u16 field. Verify the DCI array body is shorter than a VPS one.
+        let mut prefix_dci = Vec::new();
+        prefix_dci.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_DCI, 0xDD));
+        let r_dci = build_vvc_decoder_config_record(&prefix_dci);
+
+        let mut prefix_vps = Vec::new();
+        prefix_vps.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_VPS, 0xEE));
+        let r_vps = build_vvc_decoder_config_record(&prefix_vps);
+
+        // VPS adds 2 bytes (num_nalus u16) over DCI.
+        assert_eq!(r_vps.len(), r_dci.len() + 2);
+    }
+
+    #[test]
+    fn vvc_split_access_units_single_picture_with_param_sets() {
+        // Single AU: VPS + SPS + PPS + IDR slice. The parameter sets ride
+        // along with the first (and only) access unit.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_VPS, 0x01));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0x02));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_PPS, 0x03));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_IDR_W_RADL, 0x04));
+        let units = split_vvc_access_units(&buf);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0], &buf[..]);
+    }
+
+    #[test]
+    fn vvc_split_access_units_two_pictures_first_keeps_param_sets() {
+        // AU 0: VPS + SPS + PPS + IDR. AU 1: TRAIL slice (next picture).
+        // Without AUD/PH the splitter must open AU 1 at the next VCL when
+        // a VCL has already been emitted in the current pending unit.
+        let mut au0 = Vec::new();
+        au0.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_VPS, 0x01));
+        au0.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0x02));
+        au0.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_PPS, 0x03));
+        au0.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_IDR_W_RADL, 0x04));
+        let mut au1 = Vec::new();
+        au1.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_TRAIL, 0x05));
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&au0);
+        buf.extend_from_slice(&au1);
+        let units = split_vvc_access_units(&buf);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0], &au0[..]);
+        assert_eq!(units[1], &au1[..]);
+    }
+
+    #[test]
+    fn vvc_split_access_units_aud_starts_new_unit() {
+        // AU 0: SPS + IDR. AU 1: AUD + TRAIL — the AUD opens AU 1 even
+        // though the existing splitter logic would also fire on the VCL
+        // transition. Either rule fires at the AUD boundary.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0x01));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_IDR_W_RADL, 0x02));
+        let au1_start = buf.len();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_AUD, 0x03));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_TRAIL, 0x04));
+        let units = split_vvc_access_units(&buf);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[1].as_ptr(), buf[au1_start..].as_ptr());
+    }
+
+    #[test]
+    fn vvc_split_access_units_ph_starts_new_unit() {
+        // Per H.266 §7.4.2.4, the picture header (PH_NUT) begins a new
+        // picture; the splitter opens AU 1 at PH even without an AUD.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_SPS, 0x01));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_PH, 0x02));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_IDR_W_RADL, 0x03));
+        let au1_start = buf.len();
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_PH, 0x04));
+        buf.extend_from_slice(&vvc_annex_b_nal(VVC_NUT_TRAIL, 0x05));
+        let units = split_vvc_access_units(&buf);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[1].as_ptr(), buf[au1_start..].as_ptr());
+    }
+
+    #[test]
+    fn vvc_split_access_units_empty_buffer_yields_nothing() {
+        assert!(split_vvc_access_units(&[]).is_empty());
+    }
+
+    #[test]
+    fn vvc_codec_type_is_vvc1_fourcc() {
+        let expected = u32::from_be_bytes(*b"vvc1");
+        assert_eq!(super::K_CM_VIDEO_CODEC_TYPE_VVC, expected);
+        assert_eq!(super::K_CM_VIDEO_CODEC_TYPE_VVC, 0x7676_6331);
     }
 }
