@@ -43,28 +43,225 @@ const K_VT_HEVC_MAIN: &str = "HEVC_Main_AutoLevel";
 
 /// Translate a free-form `options["profile"]` string to the canonical
 /// `kVTProfileLevel_*` string Apple's VideoToolbox understands. The mapping
-/// covers the public set documented in `VTProfessionalVideoWorkflow.h` /
-/// `VTVideoEncoderList`. Returns `None` for empty / unrecognised input so
-/// the caller falls back to its built-in default.
+/// covers the public set declared in the macOS SDK header
+/// `VideoToolbox/VTCompressionProperties.h` (the very same header the rest of
+/// this crate already pins for `kVTCompressionPropertyKey_*` / property-key
+/// strings).
+///
+/// Returns `None` for empty / unrecognised input so the caller falls back to
+/// its built-in default. Inputs that already match the canonical
+/// `H264_*` form (`"H264_High_AutoLevel"`, `"H264_Baseline_3_1"`, etc.) are
+/// preserved via a pass-through — the prior round-9 implementation
+/// deliberately accepted literal Apple strings but its `_ => None` fall-back
+/// silently swallowed them, so the documented behaviour didn't actually
+/// happen. Round 12 closes that gap.
+///
+/// Round 12 also expands the alias table from the four `_AutoLevel` short
+/// names to the full set Apple declares:
+///
+/// * `baseline` / `baseline_1_3` / `baseline_3_0` … `baseline_5_2` —
+///   `kVTProfileLevel_H264_Baseline_*` (macOS 10.8 / 10.9+, per SDK header).
+/// * `main` / `main_3_0` … `main_5_2` — `kVTProfileLevel_H264_Main_*`.
+/// * `high` / `high_3_0` … `high_5_2` — `kVTProfileLevel_H264_High_*`.
+/// * `extended` / `extended_5_0` — `kVTProfileLevel_H264_Extended_*`.
+/// * `constrained_baseline` / `constrained_high` —
+///   `kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel` /
+///   `kVTProfileLevel_H264_ConstrainedHigh_AutoLevel` (macOS 12.0+).
 fn h264_profile_string(opt: &str) -> Option<&'static str> {
-    match opt.to_ascii_lowercase().as_str() {
+    let lower = opt.to_ascii_lowercase();
+    if let Some(s) = h264_profile_named_level(&lower) {
+        return Some(s);
+    }
+    // Pass-through for the canonical Apple form (`"H264_High_AutoLevel"`,
+    // `"H264_Baseline_3_1"`, …). Only accept strings that exactly match a
+    // value the SDK header documents, so an attacker can't drive arbitrary
+    // junk through into a CFString property.
+    if h264_canonical_value(opt) {
+        return h264_static_canonical(opt);
+    }
+    None
+}
+
+/// Subset that accepts the short aliases (no level digits) and the level-suffix
+/// aliases (`baseline_3_1`, `main_4_2`, `high_5_2`, etc.). Always lower-case
+/// input.
+fn h264_profile_named_level(lower: &str) -> Option<&'static str> {
+    match lower {
+        // Auto-level short names + tolerant variants.
         "baseline" | "baseline_auto" | "baseline_autolevel" => Some("H264_Baseline_AutoLevel"),
         "main" | "main_auto" | "main_autolevel" => Some("H264_Main_AutoLevel"),
         "high" | "high_auto" | "high_autolevel" => Some("H264_High_AutoLevel"),
         "extended" | "extended_auto" | "extended_autolevel" => Some("H264_Extended_AutoLevel"),
-        "" => None,
-        // Unknown alias: pass through verbatim — Apple accepts the literal
-        // `H264_<Profile>_<Level>` form too (e.g. `"H264_High_5_1"`).
+        "constrained_baseline"
+        | "constrainedbaseline"
+        | "constrained_baseline_auto"
+        | "constrained_baseline_autolevel" => Some("H264_ConstrainedBaseline_AutoLevel"),
+        "constrained_high"
+        | "constrainedhigh"
+        | "constrained_high_auto"
+        | "constrained_high_autolevel" => Some("H264_ConstrainedHigh_AutoLevel"),
+        // Baseline named-level variants (per SDK header).
+        "baseline_1_3" => Some("H264_Baseline_1_3"),
+        "baseline_3_0" => Some("H264_Baseline_3_0"),
+        "baseline_3_1" => Some("H264_Baseline_3_1"),
+        "baseline_3_2" => Some("H264_Baseline_3_2"),
+        "baseline_4_0" => Some("H264_Baseline_4_0"),
+        "baseline_4_1" => Some("H264_Baseline_4_1"),
+        "baseline_4_2" => Some("H264_Baseline_4_2"),
+        "baseline_5_0" => Some("H264_Baseline_5_0"),
+        "baseline_5_1" => Some("H264_Baseline_5_1"),
+        "baseline_5_2" => Some("H264_Baseline_5_2"),
+        // Main named-level variants.
+        "main_3_0" => Some("H264_Main_3_0"),
+        "main_3_1" => Some("H264_Main_3_1"),
+        "main_3_2" => Some("H264_Main_3_2"),
+        "main_4_0" => Some("H264_Main_4_0"),
+        "main_4_1" => Some("H264_Main_4_1"),
+        "main_4_2" => Some("H264_Main_4_2"),
+        "main_5_0" => Some("H264_Main_5_0"),
+        "main_5_1" => Some("H264_Main_5_1"),
+        "main_5_2" => Some("H264_Main_5_2"),
+        // High named-level variants.
+        "high_3_0" => Some("H264_High_3_0"),
+        "high_3_1" => Some("H264_High_3_1"),
+        "high_3_2" => Some("H264_High_3_2"),
+        "high_4_0" => Some("H264_High_4_0"),
+        "high_4_1" => Some("H264_High_4_1"),
+        "high_4_2" => Some("H264_High_4_2"),
+        "high_5_0" => Some("H264_High_5_0"),
+        "high_5_1" => Some("H264_High_5_1"),
+        "high_5_2" => Some("H264_High_5_2"),
+        // Extended named-level variant.
+        "extended_5_0" => Some("H264_Extended_5_0"),
         _ => None,
     }
 }
 
+/// Case-sensitive set of canonical `H264_*` strings that VT documents in
+/// `VTCompressionProperties.h`. Used by the pass-through arm so the caller
+/// can supply the literal SDK string instead of one of our short aliases.
+fn h264_canonical_value(s: &str) -> bool {
+    matches!(
+        s,
+        "H264_Baseline_AutoLevel"
+            | "H264_Main_AutoLevel"
+            | "H264_High_AutoLevel"
+            | "H264_Extended_AutoLevel"
+            | "H264_ConstrainedBaseline_AutoLevel"
+            | "H264_ConstrainedHigh_AutoLevel"
+            | "H264_Baseline_1_3"
+            | "H264_Baseline_3_0"
+            | "H264_Baseline_3_1"
+            | "H264_Baseline_3_2"
+            | "H264_Baseline_4_0"
+            | "H264_Baseline_4_1"
+            | "H264_Baseline_4_2"
+            | "H264_Baseline_5_0"
+            | "H264_Baseline_5_1"
+            | "H264_Baseline_5_2"
+            | "H264_Main_3_0"
+            | "H264_Main_3_1"
+            | "H264_Main_3_2"
+            | "H264_Main_4_0"
+            | "H264_Main_4_1"
+            | "H264_Main_4_2"
+            | "H264_Main_5_0"
+            | "H264_Main_5_1"
+            | "H264_Main_5_2"
+            | "H264_High_3_0"
+            | "H264_High_3_1"
+            | "H264_High_3_2"
+            | "H264_High_4_0"
+            | "H264_High_4_1"
+            | "H264_High_4_2"
+            | "H264_High_5_0"
+            | "H264_High_5_1"
+            | "H264_High_5_2"
+            | "H264_Extended_5_0"
+    )
+}
+
+/// Return the `'static` form of a validated canonical H.264 string. The Apple
+/// values are themselves `'static`; we just need to translate the runtime
+/// `&str` parameter into a known compile-time literal so the rest of the API
+/// can keep its `Option<&'static str>` shape.
+fn h264_static_canonical(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "H264_Baseline_AutoLevel" => "H264_Baseline_AutoLevel",
+        "H264_Main_AutoLevel" => "H264_Main_AutoLevel",
+        "H264_High_AutoLevel" => "H264_High_AutoLevel",
+        "H264_Extended_AutoLevel" => "H264_Extended_AutoLevel",
+        "H264_ConstrainedBaseline_AutoLevel" => "H264_ConstrainedBaseline_AutoLevel",
+        "H264_ConstrainedHigh_AutoLevel" => "H264_ConstrainedHigh_AutoLevel",
+        "H264_Baseline_1_3" => "H264_Baseline_1_3",
+        "H264_Baseline_3_0" => "H264_Baseline_3_0",
+        "H264_Baseline_3_1" => "H264_Baseline_3_1",
+        "H264_Baseline_3_2" => "H264_Baseline_3_2",
+        "H264_Baseline_4_0" => "H264_Baseline_4_0",
+        "H264_Baseline_4_1" => "H264_Baseline_4_1",
+        "H264_Baseline_4_2" => "H264_Baseline_4_2",
+        "H264_Baseline_5_0" => "H264_Baseline_5_0",
+        "H264_Baseline_5_1" => "H264_Baseline_5_1",
+        "H264_Baseline_5_2" => "H264_Baseline_5_2",
+        "H264_Main_3_0" => "H264_Main_3_0",
+        "H264_Main_3_1" => "H264_Main_3_1",
+        "H264_Main_3_2" => "H264_Main_3_2",
+        "H264_Main_4_0" => "H264_Main_4_0",
+        "H264_Main_4_1" => "H264_Main_4_1",
+        "H264_Main_4_2" => "H264_Main_4_2",
+        "H264_Main_5_0" => "H264_Main_5_0",
+        "H264_Main_5_1" => "H264_Main_5_1",
+        "H264_Main_5_2" => "H264_Main_5_2",
+        "H264_High_3_0" => "H264_High_3_0",
+        "H264_High_3_1" => "H264_High_3_1",
+        "H264_High_3_2" => "H264_High_3_2",
+        "H264_High_4_0" => "H264_High_4_0",
+        "H264_High_4_1" => "H264_High_4_1",
+        "H264_High_4_2" => "H264_High_4_2",
+        "H264_High_5_0" => "H264_High_5_0",
+        "H264_High_5_1" => "H264_High_5_1",
+        "H264_High_5_2" => "H264_High_5_2",
+        "H264_Extended_5_0" => "H264_Extended_5_0",
+        _ => return None,
+    })
+}
+
+/// Same shape as `h264_profile_string` for the HEVC encoder. Apple's SDK
+/// header `VideoToolbox/VTCompressionProperties.h` declares (as of macOS
+/// 14.2 SDK):
+///
+/// * `kVTProfileLevel_HEVC_Main_AutoLevel` (macOS 10.13+).
+/// * `kVTProfileLevel_HEVC_Main10_AutoLevel` (macOS 10.13+).
+/// * `kVTProfileLevel_HEVC_Main42210_AutoLevel` (macOS 12.3+).
+///
+/// Note: the **runtime CFString value** of the third one is
+/// `"HEVC_Main42210_AutoLevel"` — i.e. five contiguous digits, *not*
+/// `"HEVC_Main4_2_2_10_AutoLevel"` (which the round-9 alias map emitted; VT
+/// would have refused to recognise that string and silently kept the default
+/// Main profile). Round 12 fixes the alias's output to the actual SDK value
+/// while keeping the documented input alias `main4_2_2_10` working.
 fn hevc_profile_string(opt: &str) -> Option<&'static str> {
-    match opt.to_ascii_lowercase().as_str() {
-        "main" | "main_auto" | "main_autolevel" => Some("HEVC_Main_AutoLevel"),
-        "main10" | "main_10" | "main10_auto" | "main10_autolevel" => Some("HEVC_Main10_AutoLevel"),
-        "main4_2_2_10" | "main422_10" => Some("HEVC_Main4_2_2_10_AutoLevel"),
-        "" => None,
+    let lower = opt.to_ascii_lowercase();
+    match lower.as_str() {
+        "main" | "main_auto" | "main_autolevel" => return Some("HEVC_Main_AutoLevel"),
+        "main10" | "main_10" | "main10_auto" | "main10_autolevel" => {
+            return Some("HEVC_Main10_AutoLevel")
+        }
+        // Round 9 input aliases — kept verbatim.
+        "main4_2_2_10" | "main422_10" => return Some("HEVC_Main42210_AutoLevel"),
+        // New input aliases — the canonical SDK-symbol form and the
+        // value-form (no underscores).
+        "main42210" | "main_42210" | "main_4_2_2_10_autolevel" => {
+            return Some("HEVC_Main42210_AutoLevel")
+        }
+        "" => return None,
+        _ => {}
+    }
+    // Canonical-pass-through: accept the literal Apple CFString value.
+    match opt {
+        "HEVC_Main_AutoLevel" => Some("HEVC_Main_AutoLevel"),
+        "HEVC_Main10_AutoLevel" => Some("HEVC_Main10_AutoLevel"),
+        "HEVC_Main42210_AutoLevel" => Some("HEVC_Main42210_AutoLevel"),
         _ => None,
     }
 }
@@ -754,6 +951,131 @@ mod tests {
         assert_eq!(h264_profile_string("not-a-profile"), None);
     }
 
+    /// Constrained Baseline / Constrained High aliases land on the
+    /// `kVTProfileLevel_H264_Constrained{Baseline,High}_AutoLevel` symbols
+    /// declared in `VTCompressionProperties.h` (macOS 12.0+).
+    #[test]
+    fn h264_constrained_aliases() {
+        assert_eq!(
+            h264_profile_string("constrained_baseline"),
+            Some("H264_ConstrainedBaseline_AutoLevel")
+        );
+        assert_eq!(
+            h264_profile_string("ConstrainedBaseline"),
+            Some("H264_ConstrainedBaseline_AutoLevel")
+        );
+        assert_eq!(
+            h264_profile_string("CONSTRAINED_HIGH"),
+            Some("H264_ConstrainedHigh_AutoLevel")
+        );
+        assert_eq!(
+            h264_profile_string("constrainedhigh"),
+            Some("H264_ConstrainedHigh_AutoLevel")
+        );
+    }
+
+    /// Named-level H.264 aliases land on the explicit `H264_<Profile>_<L>_<l>`
+    /// SDK symbols. Coverage: every Baseline / Main / High level the SDK
+    /// header declares, plus `Extended_5_0` (the only Extended-with-level
+    /// constant Apple exports).
+    #[test]
+    fn h264_named_level_aliases() {
+        // Baseline.
+        assert_eq!(
+            h264_profile_string("baseline_1_3"),
+            Some("H264_Baseline_1_3")
+        );
+        assert_eq!(
+            h264_profile_string("baseline_3_0"),
+            Some("H264_Baseline_3_0")
+        );
+        assert_eq!(
+            h264_profile_string("Baseline_3_1"),
+            Some("H264_Baseline_3_1")
+        );
+        assert_eq!(
+            h264_profile_string("baseline_3_2"),
+            Some("H264_Baseline_3_2")
+        );
+        assert_eq!(
+            h264_profile_string("BASELINE_4_0"),
+            Some("H264_Baseline_4_0")
+        );
+        assert_eq!(
+            h264_profile_string("baseline_4_1"),
+            Some("H264_Baseline_4_1")
+        );
+        assert_eq!(
+            h264_profile_string("baseline_4_2"),
+            Some("H264_Baseline_4_2")
+        );
+        assert_eq!(
+            h264_profile_string("baseline_5_0"),
+            Some("H264_Baseline_5_0")
+        );
+        assert_eq!(
+            h264_profile_string("baseline_5_1"),
+            Some("H264_Baseline_5_1")
+        );
+        assert_eq!(
+            h264_profile_string("baseline_5_2"),
+            Some("H264_Baseline_5_2")
+        );
+        // Main.
+        assert_eq!(h264_profile_string("main_3_0"), Some("H264_Main_3_0"));
+        assert_eq!(h264_profile_string("main_3_1"), Some("H264_Main_3_1"));
+        assert_eq!(h264_profile_string("main_3_2"), Some("H264_Main_3_2"));
+        assert_eq!(h264_profile_string("main_4_0"), Some("H264_Main_4_0"));
+        assert_eq!(h264_profile_string("main_4_1"), Some("H264_Main_4_1"));
+        assert_eq!(h264_profile_string("Main_4_2"), Some("H264_Main_4_2"));
+        assert_eq!(h264_profile_string("main_5_0"), Some("H264_Main_5_0"));
+        assert_eq!(h264_profile_string("main_5_1"), Some("H264_Main_5_1"));
+        assert_eq!(h264_profile_string("main_5_2"), Some("H264_Main_5_2"));
+        // High.
+        assert_eq!(h264_profile_string("high_3_0"), Some("H264_High_3_0"));
+        assert_eq!(h264_profile_string("high_3_1"), Some("H264_High_3_1"));
+        assert_eq!(h264_profile_string("high_3_2"), Some("H264_High_3_2"));
+        assert_eq!(h264_profile_string("high_4_0"), Some("H264_High_4_0"));
+        assert_eq!(h264_profile_string("HIGH_4_1"), Some("H264_High_4_1"));
+        assert_eq!(h264_profile_string("high_4_2"), Some("H264_High_4_2"));
+        assert_eq!(h264_profile_string("high_5_0"), Some("H264_High_5_0"));
+        assert_eq!(h264_profile_string("high_5_1"), Some("H264_High_5_1"));
+        assert_eq!(h264_profile_string("high_5_2"), Some("H264_High_5_2"));
+        // Extended (only one Apple-declared level).
+        assert_eq!(
+            h264_profile_string("extended_5_0"),
+            Some("H264_Extended_5_0")
+        );
+    }
+
+    /// The canonical `H264_*` strings from the SDK header pass straight
+    /// through. The round-9 implementation documented this behaviour but the
+    /// `_ => None` arm silently swallowed it; round 12 fixes that.
+    #[test]
+    fn h264_canonical_passthrough() {
+        // Each canonical value is preserved verbatim (case-sensitive — they
+        // are SDK-declared symbol strings).
+        for s in [
+            "H264_Baseline_AutoLevel",
+            "H264_Main_AutoLevel",
+            "H264_High_AutoLevel",
+            "H264_Extended_AutoLevel",
+            "H264_ConstrainedBaseline_AutoLevel",
+            "H264_ConstrainedHigh_AutoLevel",
+            "H264_Baseline_1_3",
+            "H264_Baseline_5_2",
+            "H264_Main_5_2",
+            "H264_High_5_2",
+            "H264_Extended_5_0",
+        ] {
+            assert_eq!(h264_profile_string(s), Some(s));
+        }
+        // Junk SDK-style strings are NOT passed through — only the
+        // documented set is accepted.
+        assert_eq!(h264_profile_string("H264_DoesNotExist"), None);
+        assert_eq!(h264_profile_string("H264_High_99_9"), None);
+    }
+
     /// `hevc_profile_string` accepts the documented short aliases
     /// case-insensitively and maps each to the canonical
     /// `kVTProfileLevel_HEVC_*_AutoLevel` string.
@@ -765,11 +1087,56 @@ mod tests {
             hevc_profile_string("main_10"),
             Some("HEVC_Main10_AutoLevel")
         );
-        assert_eq!(
-            hevc_profile_string("main4_2_2_10"),
-            Some("HEVC_Main4_2_2_10_AutoLevel")
-        );
         assert_eq!(hevc_profile_string(""), None);
         assert_eq!(hevc_profile_string("bogus"), None);
+    }
+
+    /// HEVC 4:2:2 10-bit alias lands on the **actual** Apple CFString value
+    /// `"HEVC_Main42210_AutoLevel"` (five contiguous digits) — not the
+    /// `"HEVC_Main4_2_2_10_AutoLevel"` form the round-9 implementation
+    /// emitted (which VT would have rejected, silently falling back to
+    /// Main). The round-9 input alias `main4_2_2_10` keeps working; round 12
+    /// just corrects the output value and adds the canonical-form aliases.
+    #[test]
+    fn hevc_main42210_emits_actual_sdk_value() {
+        // Round-9 input aliases — preserved.
+        assert_eq!(
+            hevc_profile_string("main4_2_2_10"),
+            Some("HEVC_Main42210_AutoLevel")
+        );
+        assert_eq!(
+            hevc_profile_string("main422_10"),
+            Some("HEVC_Main42210_AutoLevel")
+        );
+        // Round-12 new input aliases.
+        assert_eq!(
+            hevc_profile_string("main42210"),
+            Some("HEVC_Main42210_AutoLevel")
+        );
+        assert_eq!(
+            hevc_profile_string("main_42210"),
+            Some("HEVC_Main42210_AutoLevel")
+        );
+        // Canonical pass-through.
+        assert_eq!(
+            hevc_profile_string("HEVC_Main42210_AutoLevel"),
+            Some("HEVC_Main42210_AutoLevel")
+        );
+    }
+
+    /// HEVC canonical-pass-through accepts each documented value verbatim
+    /// and refuses everything else (no `HEVC_DoesNotExist`).
+    #[test]
+    fn hevc_canonical_passthrough() {
+        for s in [
+            "HEVC_Main_AutoLevel",
+            "HEVC_Main10_AutoLevel",
+            "HEVC_Main42210_AutoLevel",
+        ] {
+            assert_eq!(hevc_profile_string(s), Some(s));
+        }
+        assert_eq!(hevc_profile_string("HEVC_DoesNotExist"), None);
+        // The bug-form string is not accepted.
+        assert_eq!(hevc_profile_string("HEVC_Main4_2_2_10_AutoLevel"), None);
     }
 }

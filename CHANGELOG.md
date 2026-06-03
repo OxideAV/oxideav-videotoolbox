@@ -9,6 +9,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 12: H.264 + HEVC profile-alias map expanded; canonical
+  `H264_*` / `HEVC_*` pass-through.** Round 9 wired the short `_AutoLevel`
+  aliases (H.264: `baseline` / `main` / `high` / `extended`; HEVC: `main` /
+  `main10` / `main4_2_2_10`) onto `kVTCompressionPropertyKey_ProfileLevel`,
+  and *documented* a literal-Apple-string pass-through ("callers can write
+  the literal Apple string into `options["profile"]` if needed without
+  breaking"). The underlying `match` arm fell through to `_ => None`,
+  silently dropping every literal Apple string. Round 12 closes that gap
+  and expands the alias table to every value the macOS SDK header
+  `VideoToolbox/VTCompressionProperties.h` declares:
+  - H.264 named-level aliases (per `VTCompressionProperties.h`):
+    `baseline_{1_3, 3_0, 3_1, 3_2, 4_0, 4_1, 4_2, 5_0, 5_1, 5_2}` →
+    `H264_Baseline_{1_3, 3_0, ..., 5_2}`; `main_{3_0..5_2}` →
+    `H264_Main_{3_0..5_2}`; `high_{3_0..5_2}` →
+    `H264_High_{3_0..5_2}`; `extended_5_0` → `H264_Extended_5_0`
+    (the only Extended-with-level constant Apple declares). 30 new
+    aliases. Inputs are case-insensitive; outputs match the SDK symbol
+    string verbatim.
+  - H.264 Constrained Baseline / Constrained High (macOS 12.0+ per
+    SDK header): new aliases `constrained_baseline` / `constrainedbaseline`
+    / `constrained_baseline_auto` / `constrained_baseline_autolevel` →
+    `H264_ConstrainedBaseline_AutoLevel`; same shape for `constrained_high`
+    → `H264_ConstrainedHigh_AutoLevel`.
+  - H.264 canonical-form pass-through: input strings that exactly match
+    the documented set of `H264_*` SDK-symbol values (`H264_Baseline_AutoLevel`,
+    `H264_High_5_1`, …) pass through verbatim. The pass-through is
+    deliberately a closed set — junk strings like `"H264_DoesNotExist"`
+    or `"H264_High_99_9"` are rejected so a caller can't drive arbitrary
+    CFString junk into the VT property.
+  - HEVC bug fix: round 9's `main4_2_2_10` / `main422_10` aliases emitted
+    `"HEVC_Main4_2_2_10_AutoLevel"`, but the **actual** CFString value
+    Apple declares (per `VTCompressionProperties.h`'s
+    `kVTProfileLevel_HEVC_Main42210_AutoLevel`, macOS 12.3+) is
+    `"HEVC_Main42210_AutoLevel"` — five contiguous digits, no interior
+    underscores. VT would have rejected the malformed string and silently
+    kept the default Main profile, so the alias didn't actually do
+    anything before. Round 12 emits the correct `"HEVC_Main42210_AutoLevel"`
+    string, preserves the round-9 input aliases, and adds the
+    SDK-symbol-form aliases `main42210` / `main_42210` /
+    `main_4_2_2_10_autolevel`.
+  - HEVC canonical-form pass-through: the three documented values
+    (`HEVC_Main_AutoLevel`, `HEVC_Main10_AutoLevel`,
+    `HEVC_Main42210_AutoLevel`) pass through verbatim. The pre-round-12
+    buggy form `"HEVC_Main4_2_2_10_AutoLevel"` is **rejected** (it was
+    never a valid VT property value anyway).
+  - No new sys.rs / blob.rs / decoder.rs FFI surface. Round 12 is a
+    pure alias-table / output-value change in `encoder.rs`; the
+    `kVTCompressionPropertyKey_ProfileLevel` write path itself is
+    unchanged.
+- Seven new unit tests on top of the existing two:
+  - `h264_constrained_aliases` — every input form × the two constrained
+    profiles maps to the canonical AutoLevel string.
+  - `h264_named_level_aliases` — every Baseline / Main / High named-level
+    alias from the SDK header (mixed case) maps to the corresponding
+    `H264_*` SDK value plus `Extended_5_0`.
+  - `h264_canonical_passthrough` — every documented Apple value passes
+    through verbatim; junk strings like `"H264_DoesNotExist"` /
+    `"H264_High_99_9"` are rejected.
+  - `hevc_main42210_emits_actual_sdk_value` — every input alias and the
+    canonical pass-through emit `HEVC_Main42210_AutoLevel`.
+  - `hevc_canonical_passthrough` — the three documented Apple values
+    pass; the pre-round-12 buggy `HEVC_Main4_2_2_10_AutoLevel` form is
+    rejected.
+  - `h264_profile_aliases` / `hevc_profile_aliases` — unchanged except
+    the `hevc_profile_aliases` test drops the now-incorrect
+    `Main4_2_2_10_AutoLevel` assertion (covered by the dedicated
+    `hevc_main42210_emits_actual_sdk_value` test above).
+
 - **Round 11: VVC (H.266) video decode** via `VTDecompressionSession`
   (`kCMVideoCodecType_VVC` = `'vvc1'` = `0x7676_6331`). Decode-only —
   VideoToolbox does not yet expose a VVC compression session at the time

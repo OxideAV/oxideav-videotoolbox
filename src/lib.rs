@@ -60,21 +60,31 @@
 //! `kVTCompressionPropertyKey_ProfileLevel`; and the ProRes encoder's
 //! `params.tag` selects one of the six `kCMVideoCodecType_AppleProRes*`
 //! flavours (`apco` / `apcs` / `apcn` [default] / `apch` / `ap4h` /
-//! `ap4x`). Round 10 closed the AV1 av1C extension-atom path. **Round 11
-//! (this commit) adds VVC (H.266) video decode** via
-//! `kCMVideoCodecType_VVC = 'vvc1'` — decode-only (no VVC compression
-//! session yet exposed by VideoToolbox). A new `FrameSplit::VvcEs` framer
-//! splits a VVC Annex-B elementary stream into per-access-unit payloads on
-//! AUD / PH / VCL boundaries per H.266 Annex B, and on the first packet
-//! the leading non-VCL NAL units (DCI / OPI / VPS / SPS / PPS /
-//! PREFIX_APS) are wrapped in a `VvcDecoderConfigurationRecord` (per
-//! ISO/IEC 14496-15 §11.2.4.2.2, `ptl_present_flag = 0` /
-//! `LengthSizeMinusOne = 3` form) and supplied to
-//! `CMVideoFormatDescriptionCreate` via
+//! `ap4x`). Round 10 closed the AV1 av1C extension-atom path. Round 11
+//! added VVC (H.266) video decode via `kCMVideoCodecType_VVC = 'vvc1'` —
+//! decode-only (no VVC compression session yet exposed by VideoToolbox).
+//! A `FrameSplit::VvcEs` framer splits a VVC Annex-B elementary stream
+//! into per-access-unit payloads on AUD / PH / VCL boundaries per H.266
+//! Annex B, and on the first packet the leading non-VCL NAL units
+//! (DCI / OPI / VPS / SPS / PPS / PREFIX_APS) are wrapped in a
+//! `VvcDecoderConfigurationRecord` (per ISO/IEC 14496-15 §11.2.4.2.2,
+//! `ptl_present_flag = 0` / `LengthSizeMinusOne = 3` form) and supplied
+//! to `CMVideoFormatDescriptionCreate` via
 //! `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms = {
 //! "vvcC": CFData }`. Hardware decode is gated to Apple Silicon M3+ on
 //! macOS 26+; older hosts fall back through the registry to the pure-Rust
-//! `oxideav-h266` decoder.
+//! `oxideav-h266` decoder. **Round 12 (this commit) expands the H.264 +
+//! HEVC profile-alias map** to every value the macOS SDK header
+//! `VideoToolbox/VTCompressionProperties.h` declares: 30 H.264
+//! named-level aliases (`baseline_3_1` → `H264_Baseline_3_1` etc.); two
+//! H.264 constrained-profile aliases (`constrained_baseline` /
+//! `constrained_high`); a canonical `H264_*` pass-through for callers
+//! supplying the literal Apple string; an HEVC `Main42210` bug fix
+//! (round 9 emitted `HEVC_Main4_2_2_10_AutoLevel`, which VT rejects; the
+//! actual SDK value is `HEVC_Main42210_AutoLevel`); and an HEVC
+//! canonical-form pass-through. No new FFI surface — the
+//! `kVTCompressionPropertyKey_ProfileLevel` write path itself is
+//! unchanged.
 //!
 //! # Workspace policy
 //!
