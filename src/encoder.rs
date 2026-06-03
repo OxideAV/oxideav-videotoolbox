@@ -42,6 +42,10 @@ const K_VT_MAX_KEY_FRAME_INTERVAL: &str = "MaxKeyFrameInterval";
 const K_VT_MAX_KEY_FRAME_INTERVAL_DURATION: &str = "MaxKeyFrameIntervalDuration";
 // kVTCompressionPropertyKey_ExpectedFrameRate (CFNumber, fps)
 const K_VT_EXPECTED_FRAME_RATE: &str = "ExpectedFrameRate";
+// kVTCompressionPropertyKey_DataRateLimits (CFArray<CFNumber>, [bytes, seconds, ...])
+const K_VT_DATA_RATE_LIMITS: &str = "DataRateLimits";
+// kVTCompressionPropertyKey_ConstantBitRate (CFNumber bits per second, macOS 13.0+)
+const K_VT_CONSTANT_BIT_RATE: &str = "ConstantBitRate";
 // kVTProfileLevel_H264_Baseline_AutoLevel
 const K_VT_H264_BASELINE: &str = "H264_Baseline_AutoLevel";
 // kVTProfileLevel_HEVC_Main_AutoLevel
@@ -109,6 +113,101 @@ pub(crate) fn resolve_expected_frame_rate(params: &CodecParameters) -> Option<f6
         }
     }
     None
+}
+
+/// One hard-cap segment of `kVTCompressionPropertyKey_DataRateLimits`.
+/// Per `VideoToolbox/VTCompressionProperties.h`, "each hard limit is
+/// described by a data size in bytes and a duration in seconds, and
+/// requires that the total size of compressed data for any contiguous
+/// segment of that duration (in decode time) must not exceed the data
+/// size". The CFArray Apple expects is a flat alternating
+/// `[bytes, seconds, bytes, seconds, ...]` of "an even number of
+/// CFNumbers" — Apple documents up to two segments ("zero, one or two
+/// hard limits").
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct DataRateLimit {
+    pub bytes: i32,
+    pub seconds: f64,
+}
+
+/// Parse `options["data_rate_limits"]` as a comma-separated list of
+/// `bytes:seconds` pairs (one or two segments). Whitespace surrounding
+/// each token is tolerated.
+///
+/// Examples (per the SDK header's hard-cap shape):
+///   * `"100000:1"` — at most 100 000 bytes in any one-second window.
+///   * `"100000:1, 500000:5"` — composable caps over a 1 s and 5 s window.
+///
+/// Rejects:
+///   * Anything outside the 1–2-segment range Apple documents.
+///   * Negative bytes / negative or non-positive seconds (the SDK rejects
+///     these at `VTSessionSetProperty` time).
+///   * Non-integer or `> i32::MAX` byte counts (the property uses
+///     `CFNumber<SInt32>` per Apple's array-element typing convention;
+///     callers that need a larger window per segment should split into
+///     two segments).
+///   * NaN / infinite seconds.
+///   * Empty / unparseable strings (the encoder keeps VT's default of
+///     "no data rate limits").
+pub(crate) fn parse_data_rate_limits(opt: &str) -> Option<Vec<DataRateLimit>> {
+    let trimmed = opt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2);
+    for seg in trimmed.split(',') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            return None;
+        }
+        let (bytes_str, seconds_str) = seg.split_once(':')?;
+        let bytes: i64 = bytes_str.trim().parse().ok()?;
+        if !(0..=i32::MAX as i64).contains(&bytes) {
+            return None;
+        }
+        let seconds: f64 = seconds_str.trim().parse().ok()?;
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return None;
+        }
+        out.push(DataRateLimit {
+            bytes: bytes as i32,
+            seconds,
+        });
+    }
+    if out.is_empty() || out.len() > 2 {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parse `options["constant_bit_rate"]` as a non-negative integer
+/// bits-per-second value for `kVTCompressionPropertyKey_ConstantBitRate`
+/// (macOS 13.0+, per `VideoToolbox/VTCompressionProperties.h`).
+///
+/// The SDK header documents the property as `CFNumber bits per second`
+/// and notes:
+///   * CBR is intended for legacy CDN interop, not general streaming.
+///   * Not compatible with `kVTCompressionPropertyKey_DataRateLimits` or
+///     `kVTCompressionPropertyKey_AverageBitRate`.
+///   * `kVTCompressionPropertyKey_ExpectedFrameRate` should be set
+///     alongside CBR for effective rate control.
+///   * Not all encoders or modes support CBR; setting the property on an
+///     unsupported encoder returns `kVTPropertyNotSupportedErr`. The
+///     bridge treats that as non-fatal (the prior behaviour stays in
+///     effect), matching the round 9 / 13 pattern.
+///
+/// Returns `None` for negative / unparseable / non-numeric input so the
+/// caller falls back to VT's default rate-control mode.
+pub(crate) fn parse_constant_bit_rate(opt: &str) -> Option<i32> {
+    let trimmed = opt.trim();
+    let parsed: i64 = trimmed.parse().ok()?;
+    if parsed < 0 {
+        return None;
+    }
+    if parsed > i32::MAX as i64 {
+        return Some(i32::MAX);
+    }
+    Some(parsed as i32)
 }
 
 /// Translate a free-form `options["profile"]` string to the canonical
@@ -779,6 +878,59 @@ impl VtEncoder {
             }
         }
 
+        // DataRateLimits — `options["data_rate_limits"]` parsed as a
+        // comma-separated list of `bytes:seconds` pairs. Per the SDK
+        // header the property is `CFArray[CFNumber]` of alternating
+        // bytes-and-seconds entries, with "zero, one or two hard
+        // limits". The bridge clamps unsupported input to the parser's
+        // documented rejection set so VT receives a well-formed array
+        // or no array at all (the encoder keeps its default rate
+        // control).
+        if let Some(drl_raw) = params.options.get("data_rate_limits") {
+            if let Some(segments) = parse_data_rate_limits(drl_raw) {
+                // Build a CFArray of CFNumbers alternating bytes-i32,
+                // seconds-Float64. CoreFoundation copies each value at
+                // CFNumberCreate time; we release every element after the
+                // array retains it via `kCFTypeArrayCallBacks`.
+                let mut elements: Vec<sys::CFTypeRef> = Vec::with_capacity(segments.len() * 2);
+                for seg in &segments {
+                    elements.push(unsafe { sys::cf_number_i32(vt, seg.bytes) });
+                    elements.push(unsafe { sys::cf_number_f64(vt, seg.seconds) });
+                }
+                let arr = unsafe { sys::cf_array(vt, &elements) };
+                let drl_key = unsafe { sys::cf_string(vt, K_VT_DATA_RATE_LIMITS) };
+                unsafe {
+                    (vt.vt_session_set_property)(session, drl_key, arr);
+                    (vt.cf_release)(drl_key);
+                    (vt.cf_release)(arr);
+                    for e in elements {
+                        (vt.cf_release)(e);
+                    }
+                }
+            }
+        }
+
+        // ConstantBitRate — `options["constant_bit_rate"]` parsed as a
+        // non-negative i32 bits-per-second value (CFNumber, macOS
+        // 13.0+). The SDK header notes CBR is for legacy-CDN interop
+        // and is mutually exclusive with `AverageBitRate` and
+        // `DataRateLimits`. Older macOS (pre-13) or encoders that lack
+        // CBR support return `kVTPropertyNotSupportedErr` at
+        // `VTSessionSetProperty`; we treat that as non-fatal so the
+        // encoder keeps its default mode, matching every prior
+        // round-9 / round-13 knob's failure semantics.
+        if let Some(cbr_raw) = params.options.get("constant_bit_rate") {
+            if let Some(cbr) = parse_constant_bit_rate(cbr_raw) {
+                let cbr_val = unsafe { sys::cf_number_i32(vt, cbr) };
+                let cbr_key = unsafe { sys::cf_string(vt, K_VT_CONSTANT_BIT_RATE) };
+                unsafe {
+                    (vt.vt_session_set_property)(session, cbr_key, cbr_val);
+                    (vt.cf_release)(cbr_key);
+                    (vt.cf_release)(cbr_val);
+                }
+            }
+        }
+
         // Prepare.
         let prep_status = unsafe { (vt.vt_comp_prepare)(session) };
         if prep_status != K_OS_STATUS_NO_ERROR {
@@ -1054,8 +1206,9 @@ pub fn make_hevc_encoder(params: &CodecParameters) -> Result<Box<dyn oxideav_cor
 #[cfg(test)]
 mod tests {
     use super::{
-        h264_profile_string, hevc_profile_string, parse_keyframe_interval,
-        parse_keyframe_interval_duration, resolve_expected_frame_rate,
+        h264_profile_string, hevc_profile_string, parse_constant_bit_rate, parse_data_rate_limits,
+        parse_keyframe_interval, parse_keyframe_interval_duration, resolve_expected_frame_rate,
+        DataRateLimit,
     };
     use oxideav_core::{CodecId, CodecParameters, Rational};
 
@@ -1354,5 +1507,109 @@ mod tests {
             .insert("expected_frame_rate".to_string(), "0".to_string());
         let v = resolve_expected_frame_rate(&p).expect("fallback");
         assert!((v - 30.0).abs() < 1e-9, "got {v}");
+    }
+
+    /// `parse_data_rate_limits` accepts 1–2 `bytes:seconds` segments
+    /// (whitespace-tolerated; comma-separated). Bytes is an i32 (clamped
+    /// to the SDK's CFNumber<SInt32> array element); seconds is a
+    /// strictly-positive finite Float64 per the header's "duration in
+    /// seconds" wording.
+    #[test]
+    fn data_rate_limits_parser_single_segment() {
+        let segs = parse_data_rate_limits("100000:1").expect("single segment");
+        assert_eq!(
+            segs,
+            vec![DataRateLimit {
+                bytes: 100_000,
+                seconds: 1.0
+            }]
+        );
+    }
+
+    #[test]
+    fn data_rate_limits_parser_two_segments() {
+        let segs = parse_data_rate_limits("100000:1, 500000:5").expect("two segments");
+        assert_eq!(
+            segs,
+            vec![
+                DataRateLimit {
+                    bytes: 100_000,
+                    seconds: 1.0,
+                },
+                DataRateLimit {
+                    bytes: 500_000,
+                    seconds: 5.0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn data_rate_limits_parser_whitespace_tolerated() {
+        let segs = parse_data_rate_limits("  200000 : 2.5  ").expect("whitespace");
+        assert_eq!(
+            segs,
+            vec![DataRateLimit {
+                bytes: 200_000,
+                seconds: 2.5,
+            }]
+        );
+    }
+
+    #[test]
+    fn data_rate_limits_parser_rejects_more_than_two_segments() {
+        // Apple's header documents "zero, one or two hard limits"; we
+        // reject 3+ segments since VT would refuse a `CFArray` with more
+        // than 4 elements anyway.
+        assert_eq!(parse_data_rate_limits("1:1, 2:2, 3:3"), None);
+    }
+
+    #[test]
+    fn data_rate_limits_parser_rejects_zero_or_negative_seconds() {
+        assert_eq!(parse_data_rate_limits("100000:0"), None);
+        assert_eq!(parse_data_rate_limits("100000:-1"), None);
+        assert_eq!(parse_data_rate_limits("100000:nan"), None);
+        assert_eq!(parse_data_rate_limits("100000:inf"), None);
+    }
+
+    #[test]
+    fn data_rate_limits_parser_rejects_negative_or_oversize_bytes() {
+        assert_eq!(parse_data_rate_limits("-1:1"), None);
+        // i32::MAX + 1 — out of CFNumber<SInt32> range.
+        assert_eq!(parse_data_rate_limits("2147483648:1"), None);
+        // i32::MAX exactly is accepted (boundary).
+        let segs = parse_data_rate_limits("2147483647:1").expect("i32::MAX boundary");
+        assert_eq!(segs[0].bytes, i32::MAX);
+    }
+
+    #[test]
+    fn data_rate_limits_parser_rejects_malformed_input() {
+        // Missing colon.
+        assert_eq!(parse_data_rate_limits("100000"), None);
+        // Empty / whitespace-only.
+        assert_eq!(parse_data_rate_limits(""), None);
+        assert_eq!(parse_data_rate_limits("   "), None);
+        // Empty segment after comma.
+        assert_eq!(parse_data_rate_limits("100000:1,"), None);
+        // Non-numeric.
+        assert_eq!(parse_data_rate_limits("abc:1"), None);
+        assert_eq!(parse_data_rate_limits("100000:abc"), None);
+    }
+
+    /// `parse_constant_bit_rate` accepts non-negative integers
+    /// (CFNumber bits-per-second); clamps overflow at `i32::MAX`; rejects
+    /// negatives / floats / empty / non-numeric.
+    #[test]
+    fn constant_bit_rate_parser() {
+        assert_eq!(parse_constant_bit_rate("0"), Some(0));
+        assert_eq!(parse_constant_bit_rate("2000000"), Some(2_000_000));
+        assert_eq!(parse_constant_bit_rate(" 5000000 "), Some(5_000_000));
+        // Clamp at i32::MAX.
+        assert_eq!(parse_constant_bit_rate("99999999999"), Some(i32::MAX));
+        // Reject.
+        assert_eq!(parse_constant_bit_rate("-1"), None);
+        assert_eq!(parse_constant_bit_rate(""), None);
+        assert_eq!(parse_constant_bit_rate("2.5"), None);
+        assert_eq!(parse_constant_bit_rate("not-a-number"), None);
     }
 }

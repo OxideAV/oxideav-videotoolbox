@@ -29,7 +29,8 @@ use oxideav_core::{
 };
 
 use crate::encoder::{
-    parse_keyframe_interval, parse_keyframe_interval_duration, resolve_expected_frame_rate,
+    parse_constant_bit_rate, parse_data_rate_limits, parse_keyframe_interval,
+    parse_keyframe_interval_duration, resolve_expected_frame_rate,
 };
 use crate::sys::{
     self, cf_number_i32, cf_string, CMSampleTimingInfo, CMTime,
@@ -2350,6 +2351,53 @@ impl BlobEncoder {
                 (vt.vt_session_set_property)(session, efr_key, efr_val);
                 (vt.cf_release)(efr_key);
                 (vt.cf_release)(efr_val);
+            }
+        }
+
+        // DataRateLimits — `options["data_rate_limits"]` parsed as a
+        // comma-separated list of `bytes:seconds` pairs (1–2 segments).
+        // Same SDK property as the H.264 / HEVC paths in `encoder.rs`;
+        // MJPEG honours the hard cap on its rate-controlled output and
+        // ProRes ignores it (ProRes is fixed-CBR per profile). The
+        // plumbing is uniform across all encoder paths to keep the
+        // bridge surface minimal.
+        if let Some(drl_raw) = params.options.get("data_rate_limits") {
+            if let Some(segments) = parse_data_rate_limits(drl_raw) {
+                let mut elements: Vec<sys::CFTypeRef> = Vec::with_capacity(segments.len() * 2);
+                for seg in &segments {
+                    elements.push(unsafe { cf_number_i32(vt, seg.bytes) });
+                    elements.push(unsafe { sys::cf_number_f64(vt, seg.seconds) });
+                }
+                let arr = unsafe { sys::cf_array(vt, &elements) };
+                let drl_key = unsafe { cf_string(vt, "DataRateLimits") };
+                unsafe {
+                    (vt.vt_session_set_property)(session, drl_key, arr);
+                    (vt.cf_release)(drl_key);
+                    (vt.cf_release)(arr);
+                    for e in elements {
+                        (vt.cf_release)(e);
+                    }
+                }
+            }
+        }
+
+        // ConstantBitRate — `options["constant_bit_rate"]` (CFNumber
+        // bits-per-second, macOS 13.0+). Same SDK property as the
+        // H.264 / HEVC paths; MJPEG accepts CBR on macOS 13+ where the
+        // encoder supports it (and falls back to its default rate
+        // controller otherwise via the non-fatal failure path); ProRes
+        // returns `kVTPropertyNotSupportedErr` since the profile dictates
+        // its CBR target. Failure is non-fatal, matching every other
+        // knob in this list.
+        if let Some(cbr_raw) = params.options.get("constant_bit_rate") {
+            if let Some(cbr) = parse_constant_bit_rate(cbr_raw) {
+                let cbr_val = unsafe { cf_number_i32(vt, cbr) };
+                let cbr_key = unsafe { cf_string(vt, "ConstantBitRate") };
+                unsafe {
+                    (vt.vt_session_set_property)(session, cbr_key, cbr_val);
+                    (vt.cf_release)(cbr_key);
+                    (vt.cf_release)(cbr_val);
+                }
             }
         }
 

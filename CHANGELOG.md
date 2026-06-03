@@ -9,6 +9,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 14: hard-cap + CBR rate-control writes
+  (`DataRateLimits` / `ConstantBitRate`) across every VT encoder.**
+  Round 13 closed the cadence-knob trio (`MaxKeyFrameInterval` /
+  `MaxKeyFrameIntervalDuration` / `ExpectedFrameRate`); round 14 wires
+  the two remaining rate-control knobs Apple documents alongside
+  `AverageBitRate` in `VideoToolbox/VTCompressionProperties.h`:
+  - `kVTCompressionPropertyKey_DataRateLimits` (CFArray\<CFNumber\>,
+    alternating `[bytes, seconds, ...]` pairs). Per the SDK doc, "each
+    hard limit is described by a data size in bytes and a duration in
+    seconds, and requires that the total size of compressed data for any
+    contiguous segment of that duration (in decode time) must not exceed
+    the data size"; Apple documents "zero, one or two hard limits".
+    Source: `params.options["data_rate_limits"]` parsed as a
+    comma-separated list of `bytes:seconds` pairs (1–2 segments;
+    whitespace tolerated). Examples: `"100000:1"` (single 100 KB / 1 s
+    cap) or `"100000:1, 500000:5"` (composable 1 s + 5 s caps). Bytes
+    is parsed as a non-negative integer clamped to `i32::MAX` (the
+    SDK's `CFNumber<SInt32>` array-element type); seconds is parsed as
+    a finite strictly-positive Float64. Negative bytes / non-positive
+    or non-finite seconds / malformed input / 3+ segments are silently
+    rejected and the encoder keeps VT's default of "no data rate
+    limits".
+  - `kVTCompressionPropertyKey_ConstantBitRate` (CFNumber bits/second,
+    macOS 13.0+). Source: `params.options["constant_bit_rate"]` parsed
+    as a non-negative integer clamped to `i32::MAX`. Per the SDK
+    header, CBR "is intended for legacy CDN interop, not general
+    streaming scenarios" and is mutually exclusive with
+    `AverageBitRate` + `DataRateLimits`; on encoders / OS versions
+    that don't support CBR, `VTSessionSetProperty` returns
+    `kVTPropertyNotSupportedErr` and the bridge keeps the prior
+    rate-control mode (non-fatal, matching every other round-9 /
+    round-13 knob's failure semantics).
+- New `sys::cf_array` helper backed by `CFArrayCreate` +
+  `kCFTypeArrayCallBacks` (the exported `CFArrayCallBacks` singleton for
+  `CFType` element arrays). The helper produces a `CFArray` whose
+  retain/release pairs with each element's own ref-count, so the
+  `DataRateLimits` write path can build a flat
+  `[CFNumber<i32>, CFNumber<f64>, ...]` array, hand it to
+  `VTSessionSetProperty`, and release every element + the array
+  afterwards. New `FnCFArrayCreate` function-pointer type + raw
+  `*const c_void` field on `Vtable` for the `kCFTypeArrayCallBacks` data
+  symbol; new `unsafe impl Send + Sync for Vtable` (the callbacks symbol
+  is a process-lifetime read-only data export — no thread affinity).
+  Every prior CF helper (`cf_string`, `cf_number_i32`, `cf_number_f32`,
+  `cf_number_f64`, `cf_data`, `cf_empty_dict`) is unchanged.
+- The new property writes land in both encoder paths: `encoder.rs`
+  (H.264 / HEVC `VtEncoder::create`) and `blob.rs` (MJPEG / ProRes
+  `BlobEncoder::new`). The plumbing is identical so the bridge surface
+  stays uniform; ProRes (fixed-CBR per profile) silently ignores both
+  properties, matching the existing `AverageBitRate`-is-a-no-op-on-ProRes
+  pattern. The recommended composition `AverageBitRate +
+  DataRateLimits` (soft target + hard cap) works on H.264 / HEVC / MJPEG
+  by setting `params.bit_rate` and `options["data_rate_limits"]`
+  together.
+- New `DataRateLimit` `pub(crate)` struct (`{ bytes: i32, seconds: f64 }`)
+  in `encoder.rs` to model one CFArray segment. New parsers
+  (`parse_data_rate_limits`, `parse_constant_bit_rate`) live alongside
+  the round-13 cadence parsers, also `pub(crate)`, imported by `blob.rs`
+  so the H.264/HEVC and MJPEG/ProRes paths share identical input
+  semantics.
+- Nine new unit tests covering the new parsers and their input ranges:
+  `data_rate_limits_parser_single_segment` /
+  `data_rate_limits_parser_two_segments` /
+  `data_rate_limits_parser_whitespace_tolerated` (accepts the documented
+  shapes — 1 segment, 2 segments, whitespace tolerated);
+  `data_rate_limits_parser_rejects_more_than_two_segments` /
+  `data_rate_limits_parser_rejects_zero_or_negative_seconds` /
+  `data_rate_limits_parser_rejects_negative_or_oversize_bytes` /
+  `data_rate_limits_parser_rejects_malformed_input` (rejects every
+  SDK-documented out-of-range / malformed input class);
+  `constant_bit_rate_parser` (accepts 0 / positive / whitespace, clamps
+  overflow at `i32::MAX`, rejects negatives / floats / empty / non-
+  numeric). One new integration test
+  (`data_rate_and_cbr_knobs_round_trip_without_regression`) drives the
+  live VT session for H.264 with `AverageBitRate + DataRateLimits` set
+  (`make_h264_encoder`) and MJPEG with `ConstantBitRate` set
+  (`make_jpeg_encoder`), and asserts both encoders still produce ≥ 1
+  packet after 5 input frames + flush — the visible signal that VT
+  accepted (or non-fatally ignored) the property writes.
 - **Round 13: cadence-knob property writes
   (`MaxKeyFrameInterval` / `MaxKeyFrameIntervalDuration` /
   `ExpectedFrameRate`) across every VT encoder.** Until round 12 the

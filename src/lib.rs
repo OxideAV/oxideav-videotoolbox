@@ -73,18 +73,28 @@
 //! `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms = {
 //! "vvcC": CFData }`. Hardware decode is gated to Apple Silicon M3+ on
 //! macOS 26+; older hosts fall back through the registry to the pure-Rust
-//! `oxideav-h266` decoder. **Round 12 (this commit) expands the H.264 +
-//! HEVC profile-alias map** to every value the macOS SDK header
-//! `VideoToolbox/VTCompressionProperties.h` declares: 30 H.264
-//! named-level aliases (`baseline_3_1` → `H264_Baseline_3_1` etc.); two
-//! H.264 constrained-profile aliases (`constrained_baseline` /
-//! `constrained_high`); a canonical `H264_*` pass-through for callers
-//! supplying the literal Apple string; an HEVC `Main42210` bug fix
-//! (round 9 emitted `HEVC_Main4_2_2_10_AutoLevel`, which VT rejects; the
-//! actual SDK value is `HEVC_Main42210_AutoLevel`); and an HEVC
-//! canonical-form pass-through. No new FFI surface — the
-//! `kVTCompressionPropertyKey_ProfileLevel` write path itself is
-//! unchanged.
+//! `oxideav-h266` decoder. Round 12 expanded the H.264 + HEVC
+//! profile-alias map to every value the macOS SDK header
+//! `VideoToolbox/VTCompressionProperties.h` declares (30 H.264
+//! named-level aliases, two H.264 constrained-profile aliases, an
+//! HEVC `Main42210` bug fix, and canonical `H264_*` / `HEVC_*`
+//! pass-throughs). Round 13 wired the three cadence knobs
+//! (`MaxKeyFrameInterval` / `MaxKeyFrameIntervalDuration` /
+//! `ExpectedFrameRate`) across every VT encoder. **Round 14 (this
+//! commit) wires the remaining two rate-control knobs Apple documents
+//! alongside `AverageBitRate` in `VTCompressionProperties.h`:**
+//! `kVTCompressionPropertyKey_DataRateLimits` (CFArray\<CFNumber\>,
+//! alternating `[bytes, seconds, ...]` per the SDK header, 1–2
+//! segments) and `kVTCompressionPropertyKey_ConstantBitRate`
+//! (CFNumber bits/second, macOS 13.0+). The two new knobs complete
+//! the soft-target / hard-cap / fixed-CBR rate-control trio across
+//! both encoder paths (`encoder.rs` H.264 / HEVC and `blob.rs`
+//! MJPEG / ProRes). A new `sys::cf_array` helper backed by
+//! `CFArrayCreate` + the `kCFTypeArrayCallBacks` data symbol supports
+//! the `DataRateLimits` CFArray write path; new option parsers
+//! (`parse_data_rate_limits`, `parse_constant_bit_rate`) live alongside
+//! the round-13 cadence parsers and are shared between the two
+//! encoder backends.
 //!
 //! # Workspace policy
 //!

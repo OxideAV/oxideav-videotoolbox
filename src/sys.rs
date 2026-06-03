@@ -397,6 +397,21 @@ pub type FnCFStringCreateWithCString =
 pub type FnCFDataCreate =
     unsafe extern "C" fn(alloc: CFAllocatorRef, bytes: *const u8, length: i64) -> CFDataRef;
 
+/// `CFArrayCreate(allocator, values, numValues, callBacks)` — copies the
+/// `values` array of `numValues` `CFTypeRef` pointers into a fresh
+/// `CFArray`. Used by the `kVTCompressionPropertyKey_DataRateLimits`
+/// path, which takes `CFArray[CFNumber]` of alternating bytes-and-seconds
+/// per Apple's `VTCompressionProperties.h`. The `callBacks` argument
+/// must be `kCFTypeArrayCallBacks` (the exported `CFArrayCallBacks`
+/// singleton for `CFType` elements); we resolve that as a data symbol
+/// at vtable-load time.
+pub type FnCFArrayCreate = unsafe extern "C" fn(
+    alloc: CFAllocatorRef,
+    values: *const *const c_void,
+    num_values: i64,
+    callbacks: *const c_void,
+) -> CFArrayRef;
+
 pub type FnCFRelease = unsafe extern "C" fn(cf: CFTypeRef);
 pub type FnCFRetain = unsafe extern "C" fn(cf: CFTypeRef) -> CFTypeRef;
 
@@ -464,6 +479,13 @@ pub struct Vtable {
     pub cf_number_create: FnCFNumberCreate,
     pub cf_string_create: FnCFStringCreateWithCString,
     pub cf_data_create: FnCFDataCreate,
+    pub cf_array_create: FnCFArrayCreate,
+    /// `kCFTypeArrayCallBacks` — Apple's exported `CFArrayCallBacks`
+    /// singleton for `CFType`-pointer element arrays. Resolved as a data
+    /// symbol from `CoreFoundation` and passed to `CFArrayCreate` so the
+    /// freshly-created array retains and releases its `CFNumberRef`
+    /// elements correctly. Used by the `DataRateLimits` write path.
+    pub cf_type_array_callbacks: *const c_void,
     pub cf_release: FnCFRelease,
     pub cf_retain: FnCFRetain,
     // Keep libraries alive
@@ -472,6 +494,13 @@ pub struct Vtable {
     _cm: Library,
     _cf: Library,
 }
+
+// SAFETY: `cf_type_array_callbacks` is a stable read-only data symbol
+// exported by CoreFoundation (`kCFTypeArrayCallBacks`), valid for the
+// process lifetime; no thread-affinity. The function pointers in the
+// vtable are already `extern "C" fn` and therefore Send + Sync.
+unsafe impl Send for Vtable {}
+unsafe impl Sync for Vtable {}
 
 /// Process-wide cache. `OnceLock` so concurrent first calls collapse
 /// to a single load. Stored as `Result` so the dlopen failure surface
@@ -692,6 +721,21 @@ fn load_vtable() -> Result<Vtable, String> {
         cf_number_create: sym!(cf, "CFNumberCreate", FnCFNumberCreate),
         cf_string_create: sym!(cf, "CFStringCreateWithCString", FnCFStringCreateWithCString),
         cf_data_create: sym!(cf, "CFDataCreate", FnCFDataCreate),
+        cf_array_create: sym!(cf, "CFArrayCreate", FnCFArrayCreate),
+        // `kCFTypeArrayCallBacks` is a *data* symbol (a static
+        // `CFArrayCallBacks` struct), not a function. We resolve it as a
+        // raw pointer and pass the *pointer* (not the value) to
+        // `CFArrayCreate` so the freshly-created array retains/releases
+        // its `CFType` elements correctly.
+        cf_type_array_callbacks: {
+            let s: libloading::Symbol<*const c_void> = unsafe {
+                cf.get(b"kCFTypeArrayCallBacks\0")
+                    .map_err(|e| format!("dlsym kCFTypeArrayCallBacks: {e}"))?
+            };
+            // `Symbol<*const c_void>` derefs to the address the linker
+            // stored — i.e. the address of the `CFArrayCallBacks` struct.
+            *s
+        },
         cf_release: sym!(cf, "CFRelease", FnCFRelease),
         cf_retain: sym!(cf, "CFRetain", FnCFRetain),
         _vt: vt,
@@ -788,6 +832,34 @@ pub unsafe fn cf_number_f64(vt: &Vtable, v: f64) -> CFNumberRef {
 /// slice need not outlive the returned `CFData`.
 pub unsafe fn cf_data(vt: &Vtable, bytes: &[u8]) -> CFDataRef {
     unsafe { (vt.cf_data_create)(std::ptr::null_mut(), bytes.as_ptr(), bytes.len() as i64) }
+}
+
+/// Create a `CFArray` of `CFType` elements (typically `CFNumber`).
+///
+/// Used by the `kVTCompressionPropertyKey_DataRateLimits` write path,
+/// which per Apple's `VTCompressionProperties.h` takes a
+/// `CFArray[CFNumber]` of alternating bytes-and-seconds entries
+/// (`[bytes, seconds, bytes, seconds, ...]`).
+///
+/// The new array retains each element via `kCFTypeArrayCallBacks`, so
+/// the caller must `cf_release` every element pointer it created
+/// independently of the array itself (the array's retain pairs with the
+/// release the array performs on its own destruction).
+///
+/// # Safety
+/// `elements` must be a valid slice of `CFTypeRef`-compatible pointers
+/// (each non-NULL and owned by the caller). Caller must call
+/// `cf_release` on the returned array when done.
+pub unsafe fn cf_array(vt: &Vtable, elements: &[CFTypeRef]) -> CFArrayRef {
+    let values: Vec<*const c_void> = elements.iter().map(|&p| p as *const c_void).collect();
+    unsafe {
+        (vt.cf_array_create)(
+            std::ptr::null_mut(),
+            values.as_ptr(),
+            elements.len() as i64,
+            vt.cf_type_array_callbacks,
+        )
+    }
 }
 
 /// Create an empty CFDictionary (no entries) via the vtable.

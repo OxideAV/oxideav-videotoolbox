@@ -467,6 +467,116 @@ fn cadence_knobs_round_trip_without_regression() {
     );
 }
 
+/// Round 14: the `kVTCompressionPropertyKey_DataRateLimits` and
+/// `kVTCompressionPropertyKey_ConstantBitRate` writes don't regress the
+/// encode path on either encoder backend.
+///
+/// `DataRateLimits` (the hard cap that pairs with `AverageBitRate`'s soft
+/// target) is set on H.264 with a single 100 000 byte / 1 s segment;
+/// `ConstantBitRate` is *not* set alongside it (the SDK header documents
+/// CBR as mutually exclusive with `DataRateLimits` / `AverageBitRate`).
+/// The MJPEG path exercises CBR alone on a 2 Mbps target — MJPEG accepts
+/// the property on macOS 13+ where supported, and on older OS / encoder
+/// the property write silently fails (the bridge stays on its prior
+/// rate-control mode and still produces packets).
+///
+/// Both encoders must produce at least one packet after a 5-frame
+/// encode + flush, matching the round-9 / round-13 regression-signal
+/// shape.
+#[test]
+fn data_rate_and_cbr_knobs_round_trip_without_regression() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!(
+            "oxideav-videotoolbox: framework unavailable, skipping data-rate / CBR round trip"
+        );
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let n_frames = 5usize;
+
+    // ── H.264 (encoder.rs path) — DataRateLimits + AverageBitRate. ───────
+    let mut h264_params = CodecParameters::video(CodecId::new("h264"));
+    h264_params.width = Some(width as u32);
+    h264_params.height = Some(height as u32);
+    h264_params.pixel_format = Some(PixelFormat::Yuv420P);
+    h264_params.frame_rate = Some(oxideav_core::Rational::new(30, 1));
+    // The SDK header recommends setting `AverageBitRate` alongside
+    // `DataRateLimits` so the encoder has a soft long-term target.
+    h264_params.bit_rate = Some(800_000);
+    h264_params.options = oxideav_core::CodecOptions::new()
+        // Single segment: at most 100_000 bytes in any 1-second window.
+        .set("data_rate_limits", "100000:1");
+
+    let mut enc = vt_encoder::make_h264_encoder(&h264_params)
+        .expect("h264 encoder with data-rate limits construction");
+    let mut h264_packets = Vec::new();
+    for i in 0..n_frames {
+        let frame = synthetic_frame(width, height, i as u8, (i as i64) * 33_333);
+        enc.send_frame(&Frame::Video(frame)).expect("send_frame");
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => h264_packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e}"),
+            }
+        }
+    }
+    enc.flush().expect("flush");
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => h264_packets.push(p),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_packet flush: {e}"),
+        }
+    }
+    assert!(
+        !h264_packets.is_empty(),
+        "H.264 encoder with data-rate-limits produced no packets"
+    );
+
+    // ── MJPEG (blob.rs path) — ConstantBitRate only. ─────────────────────
+    let mut mjpeg_params = CodecParameters::video(CodecId::new("mjpeg"));
+    mjpeg_params.width = Some(width as u32);
+    mjpeg_params.height = Some(height as u32);
+    mjpeg_params.pixel_format = Some(PixelFormat::Yuv420P);
+    mjpeg_params.frame_rate = Some(oxideav_core::Rational::new(30, 1));
+    mjpeg_params.options = oxideav_core::CodecOptions::new()
+        // CBR target; SDK header recommends ExpectedFrameRate alongside
+        // (covered by `params.frame_rate` via the resolver).
+        .set("constant_bit_rate", "2000000");
+
+    let mut mjpeg_enc =
+        vt_blob::make_jpeg_encoder(&mjpeg_params).expect("mjpeg encoder with CBR construction");
+    let mut mjpeg_packets = Vec::new();
+    for i in 0..n_frames {
+        let frame = synthetic_frame(width, height, i as u8, (i as i64) * 33_333);
+        mjpeg_enc
+            .send_frame(&Frame::Video(frame))
+            .expect("mjpeg send_frame");
+        loop {
+            match mjpeg_enc.receive_packet() {
+                Ok(p) => mjpeg_packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("mjpeg receive_packet: {e}"),
+            }
+        }
+    }
+    mjpeg_enc.flush().expect("mjpeg flush");
+    loop {
+        match mjpeg_enc.receive_packet() {
+            Ok(p) => mjpeg_packets.push(p),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("mjpeg receive_packet flush: {e}"),
+        }
+    }
+    assert!(
+        !mjpeg_packets.is_empty(),
+        "MJPEG encoder with CBR knob produced no packets"
+    );
+}
+
 /// Confirms `register()` installs decode + encode factories for every
 /// codec the crate claims in its README (h264 / hevc / mjpeg / prores).
 #[test]
