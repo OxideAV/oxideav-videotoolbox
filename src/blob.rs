@@ -28,6 +28,9 @@ use oxideav_core::{
     TimeBase, VideoFrame, VideoPlane,
 };
 
+use crate::encoder::{
+    parse_keyframe_interval, parse_keyframe_interval_duration, resolve_expected_frame_rate,
+};
 use crate::sys::{
     self, cf_number_i32, cf_string, CMSampleTimingInfo, CMTime,
     K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY,
@@ -2297,6 +2300,56 @@ impl BlobEncoder {
                         (vt.cf_release)(q_val);
                     }
                 }
+            }
+        }
+
+        // MaxKeyFrameInterval — `options["keyframe_interval"]` (frames).
+        // Per `VTCompressionProperties.h` the property is CFNumber<int>
+        // and accepts 0 as "no forced cadence". MJPEG (intra-only) sees
+        // every frame as a keyframe regardless of the property; ProRes
+        // is also intra-only, so VT silently ignores the property here.
+        // The plumbing is identical to the H.264 / HEVC paths in
+        // `encoder.rs` to keep the bridge surface uniform.
+        if let Some(kfi_raw) = params.options.get("keyframe_interval") {
+            if let Some(kfi) = parse_keyframe_interval(kfi_raw) {
+                let kfi_val = unsafe { cf_number_i32(vt, kfi) };
+                let kfi_key = unsafe { cf_string(vt, "MaxKeyFrameInterval") };
+                unsafe {
+                    (vt.vt_session_set_property)(session, kfi_key, kfi_val);
+                    (vt.cf_release)(kfi_key);
+                    (vt.cf_release)(kfi_val);
+                }
+            }
+        }
+
+        // MaxKeyFrameIntervalDuration — `options["keyframe_interval_duration"]`
+        // (seconds, CFNumber<Float64>). Same SDK property as the H.264 /
+        // HEVC paths; MJPEG / ProRes are intra-only and ignore it but VT
+        // accepts the property unconditionally.
+        if let Some(kfd_raw) = params.options.get("keyframe_interval_duration") {
+            if let Some(kfd) = parse_keyframe_interval_duration(kfd_raw) {
+                let kfd_val = unsafe { sys::cf_number_f64(vt, kfd) };
+                let kfd_key = unsafe { cf_string(vt, "MaxKeyFrameIntervalDuration") };
+                unsafe {
+                    (vt.vt_session_set_property)(session, kfd_key, kfd_val);
+                    (vt.cf_release)(kfd_key);
+                    (vt.cf_release)(kfd_val);
+                }
+            }
+        }
+
+        // ExpectedFrameRate — `options["expected_frame_rate"]` (Float64
+        // fps) or, when absent, derived from `params.frame_rate`. Same
+        // SDK property as the H.264 / HEVC paths; the MJPEG encoder uses
+        // it to budget the rate-controller and the ProRes encoder treats
+        // it as a no-op (ProRes is CBR per profile).
+        if let Some(efr) = resolve_expected_frame_rate(params) {
+            let efr_val = unsafe { sys::cf_number_f64(vt, efr) };
+            let efr_key = unsafe { cf_string(vt, "ExpectedFrameRate") };
+            unsafe {
+                (vt.vt_session_set_property)(session, efr_key, efr_val);
+                (vt.cf_release)(efr_key);
+                (vt.cf_release)(efr_val);
             }
         }
 

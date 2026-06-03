@@ -36,10 +36,80 @@ const K_VT_ALLOW_FRAME_REORDER: &str = "AllowFrameReordering";
 const K_VT_PROFILE_LEVEL: &str = "ProfileLevel";
 // kVTCompressionPropertyKey_Quality (CFNumber Float, 0.0..1.0)
 const K_VT_QUALITY: &str = "Quality";
+// kVTCompressionPropertyKey_MaxKeyFrameInterval (CFNumber<int>, frames)
+const K_VT_MAX_KEY_FRAME_INTERVAL: &str = "MaxKeyFrameInterval";
+// kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration (CFNumber<seconds>)
+const K_VT_MAX_KEY_FRAME_INTERVAL_DURATION: &str = "MaxKeyFrameIntervalDuration";
+// kVTCompressionPropertyKey_ExpectedFrameRate (CFNumber, fps)
+const K_VT_EXPECTED_FRAME_RATE: &str = "ExpectedFrameRate";
 // kVTProfileLevel_H264_Baseline_AutoLevel
 const K_VT_H264_BASELINE: &str = "H264_Baseline_AutoLevel";
 // kVTProfileLevel_HEVC_Main_AutoLevel
 const K_VT_HEVC_MAIN: &str = "HEVC_Main_AutoLevel";
+
+/// Parse `options["keyframe_interval"]` as a non-negative integer frame
+/// count for `kVTCompressionPropertyKey_MaxKeyFrameInterval`. Per
+/// `VTCompressionProperties.h`, the property is CFNumber<int> and
+/// "0 means keyframes can be inserted on demand"; we accept 0 (caller
+/// explicitly opts out of a forced cadence) up to `i32::MAX` and clamp
+/// anything beyond. Returns `None` for unparseable / negative input so
+/// the caller falls back to VT's built-in default (no upper bound).
+pub(crate) fn parse_keyframe_interval(opt: &str) -> Option<i32> {
+    let trimmed = opt.trim();
+    let parsed: i64 = trimmed.parse().ok()?;
+    if parsed < 0 {
+        return None;
+    }
+    if parsed > i32::MAX as i64 {
+        return Some(i32::MAX);
+    }
+    Some(parsed as i32)
+}
+
+/// Parse `options["keyframe_interval_duration"]` as a non-negative
+/// Float64 seconds value for
+/// `kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration`. Per the SDK
+/// header the property is `CFNumber<seconds>` and a value of 0 disables
+/// the duration-based cadence cap. Rejects NaN / negative / non-finite
+/// input so the caller falls back to VT's default.
+pub(crate) fn parse_keyframe_interval_duration(opt: &str) -> Option<f64> {
+    let v: f64 = opt.trim().parse().ok()?;
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    Some(v)
+}
+
+/// Resolve `kVTCompressionPropertyKey_ExpectedFrameRate` (CFNumber, fps).
+///
+/// Precedence:
+///   1. `params.options["expected_frame_rate"]` if it parses as a finite
+///      strictly-positive Float64.
+///   2. `params.frame_rate` (`Rational`) if non-zero and the resulting
+///      `as_f64()` is finite and strictly positive.
+///
+/// The SDK header documents the property as a hint the encoder uses to
+/// optimise rate-control and energy budgeting; the value need not match
+/// the actual presentation rate, but Apple recommends setting it to the
+/// real-time frame rate when the stream targets a known cadence.
+pub(crate) fn resolve_expected_frame_rate(params: &CodecParameters) -> Option<f64> {
+    if let Some(raw) = params.options.get("expected_frame_rate") {
+        if let Ok(v) = raw.trim().parse::<f64>() {
+            if v.is_finite() && v > 0.0 {
+                return Some(v);
+            }
+        }
+    }
+    if let Some(r) = params.frame_rate {
+        if r.den != 0 {
+            let v = r.as_f64();
+            if v.is_finite() && v > 0.0 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
 
 /// Translate a free-form `options["profile"]` string to the canonical
 /// `kVTProfileLevel_*` string Apple's VideoToolbox understands. The mapping
@@ -656,6 +726,59 @@ impl VtEncoder {
             }
         }
 
+        // MaxKeyFrameInterval — `options["keyframe_interval"]` is the
+        // maximum frame count between keyframes (CFNumber<int> per
+        // `VTCompressionProperties.h`). Per the SDK doc, 0 means "no
+        // forced cadence cap; keyframes are inserted on demand". The
+        // parser clamps anything beyond `i32::MAX` to the SDK's natural
+        // upper bound; unparseable / negative input is ignored so the
+        // encoder keeps VT's built-in default (also "no cap" on Apple
+        // hardware encoders unless the caller asks for one).
+        if let Some(kfi_raw) = params.options.get("keyframe_interval") {
+            if let Some(kfi) = parse_keyframe_interval(kfi_raw) {
+                let kfi_val = unsafe { sys::cf_number_i32(vt, kfi) };
+                let kfi_key = unsafe { sys::cf_string(vt, K_VT_MAX_KEY_FRAME_INTERVAL) };
+                unsafe {
+                    (vt.vt_session_set_property)(session, kfi_key, kfi_val);
+                    (vt.cf_release)(kfi_key);
+                    (vt.cf_release)(kfi_val);
+                }
+            }
+        }
+
+        // MaxKeyFrameIntervalDuration — `options["keyframe_interval_duration"]`
+        // is the maximum wall-clock seconds between keyframes
+        // (CFNumber<seconds> per the SDK header). Apple documents both
+        // duration- and frame-count-based caps as composable: VT picks
+        // whichever forces a keyframe first. 0 disables the duration cap.
+        if let Some(kfd_raw) = params.options.get("keyframe_interval_duration") {
+            if let Some(kfd) = parse_keyframe_interval_duration(kfd_raw) {
+                let kfd_val = unsafe { sys::cf_number_f64(vt, kfd) };
+                let kfd_key = unsafe { sys::cf_string(vt, K_VT_MAX_KEY_FRAME_INTERVAL_DURATION) };
+                unsafe {
+                    (vt.vt_session_set_property)(session, kfd_key, kfd_val);
+                    (vt.cf_release)(kfd_key);
+                    (vt.cf_release)(kfd_val);
+                }
+            }
+        }
+
+        // ExpectedFrameRate — caller-supplied via `options["expected_frame_rate"]`
+        // (Float64 fps) or, when absent, derived from `params.frame_rate`
+        // (the stream's container-level cadence). Per the SDK header this
+        // is a hint the encoder uses for rate-control and energy
+        // optimisation; setting it incorrectly does not break output but
+        // mis-tunes the bit-rate envelope on streams with a stable cadence.
+        if let Some(efr) = resolve_expected_frame_rate(params) {
+            let efr_val = unsafe { sys::cf_number_f64(vt, efr) };
+            let efr_key = unsafe { sys::cf_string(vt, K_VT_EXPECTED_FRAME_RATE) };
+            unsafe {
+                (vt.vt_session_set_property)(session, efr_key, efr_val);
+                (vt.cf_release)(efr_key);
+                (vt.cf_release)(efr_val);
+            }
+        }
+
         // Prepare.
         let prep_status = unsafe { (vt.vt_comp_prepare)(session) };
         if prep_status != K_OS_STATUS_NO_ERROR {
@@ -930,7 +1053,11 @@ pub fn make_hevc_encoder(params: &CodecParameters) -> Result<Box<dyn oxideav_cor
 
 #[cfg(test)]
 mod tests {
-    use super::{h264_profile_string, hevc_profile_string};
+    use super::{
+        h264_profile_string, hevc_profile_string, parse_keyframe_interval,
+        parse_keyframe_interval_duration, resolve_expected_frame_rate,
+    };
+    use oxideav_core::{CodecId, CodecParameters, Rational};
 
     /// `h264_profile_string` accepts the documented short aliases
     /// case-insensitively and maps each to the canonical
@@ -1138,5 +1265,94 @@ mod tests {
         assert_eq!(hevc_profile_string("HEVC_DoesNotExist"), None);
         // The bug-form string is not accepted.
         assert_eq!(hevc_profile_string("HEVC_Main4_2_2_10_AutoLevel"), None);
+    }
+
+    /// `parse_keyframe_interval` accepts non-negative integers (including 0,
+    /// the SDK's "no forced cadence" sentinel) and clamps anything above
+    /// `i32::MAX` to that ceiling. Whitespace surrounding the value is
+    /// tolerated; negative, empty, and non-numeric input all return `None`.
+    #[test]
+    fn keyframe_interval_parser() {
+        assert_eq!(parse_keyframe_interval("0"), Some(0));
+        assert_eq!(parse_keyframe_interval("1"), Some(1));
+        assert_eq!(parse_keyframe_interval("60"), Some(60));
+        assert_eq!(parse_keyframe_interval(" 250 "), Some(250));
+        // Clamp at i32::MAX rather than overflow.
+        assert_eq!(parse_keyframe_interval("99999999999"), Some(i32::MAX));
+        // Reject negatives, empty, and non-numeric strings.
+        assert_eq!(parse_keyframe_interval("-1"), None);
+        assert_eq!(parse_keyframe_interval(""), None);
+        assert_eq!(parse_keyframe_interval("not-a-number"), None);
+        assert_eq!(parse_keyframe_interval("3.14"), None);
+    }
+
+    /// `parse_keyframe_interval_duration` accepts non-negative finite
+    /// Float64 values (including 0, the SDK's "no forced cadence" sentinel).
+    /// Negatives, NaN, ±infinity, and unparseable input return `None`.
+    #[test]
+    fn keyframe_interval_duration_parser() {
+        assert_eq!(parse_keyframe_interval_duration("0"), Some(0.0));
+        assert_eq!(parse_keyframe_interval_duration("0.5"), Some(0.5));
+        assert_eq!(parse_keyframe_interval_duration("2"), Some(2.0));
+        assert_eq!(parse_keyframe_interval_duration(" 1.25 "), Some(1.25));
+        // Reject negatives, NaN, infinity, empty.
+        assert_eq!(parse_keyframe_interval_duration("-0.1"), None);
+        assert_eq!(parse_keyframe_interval_duration("nan"), None);
+        assert_eq!(parse_keyframe_interval_duration("inf"), None);
+        assert_eq!(parse_keyframe_interval_duration("-inf"), None);
+        assert_eq!(parse_keyframe_interval_duration(""), None);
+        assert_eq!(parse_keyframe_interval_duration("not-a-number"), None);
+    }
+
+    /// `resolve_expected_frame_rate` reads `options["expected_frame_rate"]`
+    /// when present and finite-positive, falling back to `params.frame_rate`
+    /// (`Rational`) otherwise. Returns `None` when both sources are absent or
+    /// invalid so the encoder skips setting the property entirely.
+    #[test]
+    fn expected_frame_rate_resolver() {
+        // Neither source set → None (encoder keeps VT's default cadence hint).
+        let mut p = CodecParameters::video(CodecId::new("h264"));
+        assert_eq!(resolve_expected_frame_rate(&p), None);
+
+        // params.frame_rate alone — derived from the Rational's `as_f64`.
+        p.frame_rate = Some(Rational::new(30000, 1001));
+        let v = resolve_expected_frame_rate(&p).expect("derived from Rational");
+        assert!((v - (30000.0 / 1001.0)).abs() < 1e-9, "got {v}");
+
+        // Zero-denominator Rational is rejected (division-by-zero would
+        // produce a non-finite value).
+        p.frame_rate = Some(Rational::new(30, 0));
+        assert_eq!(resolve_expected_frame_rate(&p), None);
+
+        // Negative / zero rate rejected.
+        p.frame_rate = Some(Rational::new(-30, 1));
+        assert_eq!(resolve_expected_frame_rate(&p), None);
+        p.frame_rate = Some(Rational::new(0, 1));
+        assert_eq!(resolve_expected_frame_rate(&p), None);
+
+        // Explicit options value overrides params.frame_rate.
+        p.frame_rate = Some(Rational::new(30, 1));
+        p.options
+            .insert("expected_frame_rate".to_string(), "59.94".to_string());
+        let v = resolve_expected_frame_rate(&p).expect("override");
+        assert!((v - 59.94).abs() < 1e-9, "got {v}");
+
+        // Junk / non-finite override falls back to params.frame_rate.
+        p.options
+            .insert("expected_frame_rate".to_string(), "nan".to_string());
+        let v = resolve_expected_frame_rate(&p).expect("fallback");
+        assert!((v - 30.0).abs() < 1e-9, "got {v}");
+
+        // Negative override falls back to params.frame_rate.
+        p.options
+            .insert("expected_frame_rate".to_string(), "-10".to_string());
+        let v = resolve_expected_frame_rate(&p).expect("fallback");
+        assert!((v - 30.0).abs() < 1e-9, "got {v}");
+
+        // Zero override falls back to params.frame_rate.
+        p.options
+            .insert("expected_frame_rate".to_string(), "0".to_string());
+        let v = resolve_expected_frame_rate(&p).expect("fallback");
+        assert!((v - 30.0).abs() < 1e-9, "got {v}");
     }
 }

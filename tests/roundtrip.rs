@@ -360,6 +360,113 @@ fn encoder_knobs_round_trip_without_regression() {
     assert!(got_one, "ProRes LT encoder produced no packets");
 }
 
+/// Round-13 cadence knobs (`MaxKeyFrameInterval` /
+/// `MaxKeyFrameIntervalDuration` / `ExpectedFrameRate`) must reach the live
+/// VT compression session without breaking encode output.
+///
+/// VT (per `VTCompressionProperties.h`) accepts these as optional hints;
+/// if a property is rejected, `VTSessionSetProperty` returns a non-zero
+/// OSStatus but session creation still succeeds — so the visible
+/// regression signal is "session creates but encode produces zero
+/// packets". We exercise both encoder paths:
+///
+/// The H.264 (encoder.rs) path sets `options["keyframe_interval"] = 30`,
+/// `options["keyframe_interval_duration"] = 2.0`, and a 30/1
+/// `params.frame_rate` driving the `ExpectedFrameRate` fallback. The MJPEG
+/// (blob.rs) path exercises the same three knobs through the blob factory.
+///
+/// Both encoders must produce at least one packet after a 5-frame
+/// encode + flush, matching the round-9 `encoder_knobs_round_trip_without_regression`
+/// shape.
+#[test]
+fn cadence_knobs_round_trip_without_regression() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping cadence-knobs round trip");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let n_frames = 5usize;
+
+    // ── H.264 (encoder.rs path). ─────────────────────────────────────────
+    let mut h264_params = CodecParameters::video(CodecId::new("h264"));
+    h264_params.width = Some(width as u32);
+    h264_params.height = Some(height as u32);
+    h264_params.pixel_format = Some(PixelFormat::Yuv420P);
+    h264_params.frame_rate = Some(oxideav_core::Rational::new(30, 1));
+    h264_params.options = oxideav_core::CodecOptions::new()
+        .set("keyframe_interval", "30")
+        .set("keyframe_interval_duration", "2.0");
+
+    let mut enc = vt_encoder::make_h264_encoder(&h264_params)
+        .expect("h264 encoder with cadence knobs construction");
+    let mut h264_packets = Vec::new();
+    for i in 0..n_frames {
+        let frame = synthetic_frame(width, height, i as u8, (i as i64) * 33_333);
+        enc.send_frame(&Frame::Video(frame)).expect("send_frame");
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => h264_packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet: {e}"),
+            }
+        }
+    }
+    enc.flush().expect("flush");
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => h264_packets.push(p),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_packet flush: {e}"),
+        }
+    }
+    assert!(
+        !h264_packets.is_empty(),
+        "H.264 encoder with cadence knobs produced no packets"
+    );
+
+    // ── MJPEG (blob.rs path). ────────────────────────────────────────────
+    let mut mjpeg_params = CodecParameters::video(CodecId::new("mjpeg"));
+    mjpeg_params.width = Some(width as u32);
+    mjpeg_params.height = Some(height as u32);
+    mjpeg_params.pixel_format = Some(PixelFormat::Yuv420P);
+    mjpeg_params.frame_rate = Some(oxideav_core::Rational::new(60, 1));
+    mjpeg_params.options = oxideav_core::CodecOptions::new()
+        .set("keyframe_interval", "1")
+        .set("keyframe_interval_duration", "0.5")
+        .set("expected_frame_rate", "59.94");
+
+    let mut mjpeg_enc = vt_blob::make_jpeg_encoder(&mjpeg_params)
+        .expect("mjpeg encoder with cadence knobs construction");
+    let mut mjpeg_packets = Vec::new();
+    for i in 0..n_frames {
+        let frame = synthetic_frame(width, height, i as u8, (i as i64) * 16_667);
+        mjpeg_enc
+            .send_frame(&Frame::Video(frame))
+            .expect("mjpeg send_frame");
+        loop {
+            match mjpeg_enc.receive_packet() {
+                Ok(p) => mjpeg_packets.push(p),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("mjpeg receive_packet: {e}"),
+            }
+        }
+    }
+    mjpeg_enc.flush().expect("mjpeg flush");
+    loop {
+        match mjpeg_enc.receive_packet() {
+            Ok(p) => mjpeg_packets.push(p),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("mjpeg receive_packet flush: {e}"),
+        }
+    }
+    assert!(
+        !mjpeg_packets.is_empty(),
+        "MJPEG encoder with cadence knobs produced no packets"
+    );
+}
+
 /// Confirms `register()` installs decode + encode factories for every
 /// codec the crate claims in its README (h264 / hevc / mjpeg / prores).
 #[test]

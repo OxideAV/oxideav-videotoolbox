@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 13: cadence-knob property writes
+  (`MaxKeyFrameInterval` / `MaxKeyFrameIntervalDuration` /
+  `ExpectedFrameRate`) across every VT encoder.** Until round 12 the
+  bridge configured five compression properties (`RealTime`,
+  `AllowFrameReordering`, `ProfileLevel`, `AverageBitRate`, `Quality`).
+  Round 13 adds the three keyframe-cadence / frame-rate-hint properties
+  Apple documents in `VideoToolbox/VTCompressionProperties.h` as the
+  next-tier rate-control knobs alongside `AverageBitRate`:
+  - `kVTCompressionPropertyKey_MaxKeyFrameInterval` (CFNumber\<int\>,
+    "maximum interval between key frames in frames", 0 = no forced
+    cadence). Source: `params.options["keyframe_interval"]` parsed as a
+    non-negative integer; negatives / unparseable input are silently
+    dropped and the encoder keeps VT's built-in default. Values above
+    `i32::MAX` clamp to that ceiling rather than overflow.
+  - `kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration`
+    (CFNumber\<seconds\>, "maximum interval in seconds", 0 = no forced
+    cadence). Source: `params.options["keyframe_interval_duration"]`
+    parsed as a non-negative finite Float64; negatives / NaN /
+    infinities are rejected. Per Apple's SDK doc, the duration cap and
+    the frame-count cap are composable — VT picks whichever forces a
+    keyframe first.
+  - `kVTCompressionPropertyKey_ExpectedFrameRate` (CFNumber, fps). The
+    encoder uses this for rate-control and energy budgeting. Source
+    precedence: `params.options["expected_frame_rate"]` (Float64) if
+    finite-positive, otherwise the stream's `params.frame_rate`
+    (`Rational`) reduced via `as_f64()`. Zero / negative / non-finite
+    inputs from either source are skipped so the encoder keeps VT's
+    default cadence hint.
+- New `sys::cf_number_f64` helper backed by the existing
+  `CFNumberCreate` symbol and a new `K_CF_NUMBER_FLOAT_64_TYPE = 6`
+  constant (per `CFNumber.h` enum order:
+  `kCFNumberSInt8Type = 1 .. kCFNumberFloat32Type = 5,
+  kCFNumberFloat64Type = 6`). Used by the new `MaxKeyFrameIntervalDuration`
+  and `ExpectedFrameRate` writes. Every prior CFNumber call site
+  (`cf_number_i32`, `cf_number_f32`) is unchanged.
+- The new property writes land in both encoder paths: `encoder.rs`
+  (H.264 / HEVC `VtEncoder::create`) and `blob.rs` (MJPEG / ProRes
+  `BlobEncoder::new`). The plumbing is identical so the bridge surface
+  stays uniform; ProRes / MJPEG are intra-only so VT silently ignores
+  the keyframe-cadence properties on those codecs, matching the existing
+  `AverageBitRate`-is-a-no-op-on-ProRes pattern. The `ExpectedFrameRate`
+  hint reaches all four encoders.
+- Five new unit tests covering the new helpers and their input ranges:
+  `keyframe_interval_parser` (accepts 0 / positive / whitespace,
+  clamps overflow at `i32::MAX`, rejects negatives / floats / empty),
+  `keyframe_interval_duration_parser` (accepts 0 / finite-positive /
+  whitespace, rejects negatives / NaN / ±infinity / empty),
+  `expected_frame_rate_resolver` (4 sub-cases: derived from
+  `Rational`, zero-denominator rejection, options override taking
+  precedence, options fall-back when override is junk / non-finite /
+  zero / negative). One new integration test
+  `cadence_knobs_round_trip_without_regression` drives the live VT
+  session for H.264 (`make_h264_encoder`) and MJPEG
+  (`make_jpeg_encoder`) with all three knobs set and asserts both
+  encoders still produce ≥ 1 packet after 5 input frames + flush —
+  the visible signal that VT accepted the property writes.
 - **Round 12: H.264 + HEVC profile-alias map expanded; canonical
   `H264_*` / `HEVC_*` pass-through.** Round 9 wired the short `_AutoLevel`
   aliases (H.264: `baseline` / `main` / `high` / `extended`; HEVC: `main` /

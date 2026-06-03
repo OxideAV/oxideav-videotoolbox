@@ -133,6 +133,13 @@ pub const K_CF_NUMBER_SI_NT64_TYPE: i32 = 4;
 /// kCFNumberFloat64Type = 6). Used to wrap the
 /// `kVTCompressionPropertyKey_Quality` value (CFNumber 0.0..1.0).
 pub const K_CF_NUMBER_FLOAT_32_TYPE: i32 = 5;
+/// `kCFNumberFloat64Type` per Apple's `CFNumber.h` enum order
+/// (immediately follows `kCFNumberFloat32Type`). Used to wrap the
+/// `kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration` value
+/// (CFNumber\<seconds\>) and the `kVTCompressionPropertyKey_ExpectedFrameRate`
+/// value (CFNumber, fps), both documented in
+/// `VideoToolbox/VTCompressionProperties.h`.
+pub const K_CF_NUMBER_FLOAT_64_TYPE: i32 = 6;
 
 // ─────────────────────────── kCVPixelFormatType constants ─────────────────────
 
@@ -744,6 +751,26 @@ pub unsafe fn cf_number_f32(vt: &Vtable, v: f32) -> CFNumberRef {
             std::ptr::null_mut(),
             K_CF_NUMBER_FLOAT_32_TYPE,
             &v as *const f32 as *const _,
+        )
+    }
+}
+
+/// Create a CFNumber (Float64) via the vtable. Used to wrap the
+/// `kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration` value
+/// (CFNumber\<seconds\>) and the `kVTCompressionPropertyKey_ExpectedFrameRate`
+/// value (CFNumber, frames-per-second). Apple's `CFNumber.h` documents
+/// `kCFNumberFloat64Type = 6` as a 64-bit IEEE-754 double; CoreFoundation
+/// copies the value at the pointer at call time so the caller's `v` does
+/// not need to outlive the call.
+///
+/// # Safety
+/// Caller must call `cf_release` on the returned value when done.
+pub unsafe fn cf_number_f64(vt: &Vtable, v: f64) -> CFNumberRef {
+    unsafe {
+        (vt.cf_number_create)(
+            std::ptr::null_mut(),
+            K_CF_NUMBER_FLOAT_64_TYPE,
+            &v as *const f64 as *const _,
         )
     }
 }
