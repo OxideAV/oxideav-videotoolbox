@@ -1,6 +1,6 @@
 # oxideav-videotoolbox
 
-macOS VideoToolbox hardware decode/encode bridge for the [oxideav](https://github.com/OxideAV/oxideav) framework.
+Apple-platform (macOS + iOS) VideoToolbox hardware decode/encode bridge for the [oxideav](https://github.com/OxideAV/oxideav) framework.
 
 ## Why a bridge crate?
 
@@ -12,14 +12,29 @@ This crate is a **thin runtime-loaded bridge** — no compile-time link dependen
 
 Two distinct failure paths fall back automatically to the pure-Rust codec:
 
-1. **Load failure** — older macOS, missing framework, sandboxed environment without VT entitlements. `register()` logs and returns without registering, so the SW codec is the only candidate at dispatch.
-2. **Init failure** — `VTDecompressionSessionCreate` / `VTCompressionSessionCreate` returns a non-zero `OSStatus` for the requested parameters. Common triggers: stream above the device's max resolution, hardware encoder slot already busy (concurrent-session cap), unsupported pixel format, codec profile the device doesn't accelerate. The factory returns `Err`; the registry's `make_decoder_with` / `make_encoder_with` retries the next-priority impl (typically the SW one).
+1. **Load failure** — older OS, missing framework, sandboxed environment without VT entitlements. `register()` logs and returns without registering, so the SW codec is the only candidate at dispatch. On macOS this surfaces if `Library::new("/System/Library/Frameworks/...")` cannot map the framework; on iOS the system dyld has link-loaded the four frameworks at process start, so the only path that fires this branch is a `Library::this()` failure (effectively impossible for a running process — Apple's runtime always provides the frameworks on every supported iOS version).
+2. **Init failure** — `VTDecompressionSessionCreate` / `VTCompressionSessionCreate` returns a non-zero `OSStatus` for the requested parameters. Common triggers: stream above the device's max resolution, hardware encoder slot already busy (concurrent-session cap), unsupported pixel format, codec profile the device doesn't accelerate. The factory returns `Err`; the registry's `make_decoder_with` / `make_encoder_with` retries the next-priority impl (typically the SW one). On iOS this also catches the platform-specific gaps Apple documents — e.g. AV1 encode requires A17+, ProRes encode requires iPhone 13 Pro+, some `kVTCompressionPropertyKey_*` keys are macOS-only and return `kVTPropertyNotSupportedErr` (treated as non-fatal by the property-write helper).
 
 Pipelines that **require** hardware (e.g. real-time low-latency capture where the SW path can't keep up) can opt out of the SW fallback by setting `CodecPreferences { require_hardware: true, .. }` — the registry will then surface the `OSStatus` error instead of degrading silently.
 
 ## Platform gating
 
-The whole crate is `#![cfg(target_os = "macos")]`. On Linux / Windows it compiles to an empty rlib; the umbrella `oxideav` crate gates the `register` call behind the same cfg.
+The whole crate is `#![cfg(any(target_os = "macos", target_os = "ios"))]`. On Linux / Windows it compiles to an empty rlib; the umbrella `oxideav` crate gates the `register` call behind the same cfg.
+
+Symbol-loading shape differs by platform:
+
+* **macOS** — `libloading::Library::new("/System/Library/Frameworks/<Name>.framework/<Name>")` opens each of VideoToolbox / CoreVideo / CoreMedia / CoreFoundation via `dlopen` at first use. **No compile-time link dependency.**
+* **iOS** — the four Apple system frameworks are link-loaded at process start by the system dyld via `build.rs` (`cargo:rustc-link-lib=framework=VideoToolbox` etc.). At runtime `libloading::os::unix::Library::this()` returns the host process's `RTLD_DEFAULT` handle and every framework symbol resolves via `dlsym` against the dyld shared cache.
+
+The vtable assembly code and every call site are identical across the two branches — the only difference is the `sys::open()` helper.
+
+## iOS targets
+
+* `aarch64-apple-ios` — iOS device builds (iPhone, iPad)
+* `aarch64-apple-ios-sim` — Apple Silicon iOS simulator
+* `x86_64-apple-ios-sim` — Intel-Mac iOS simulator (legacy host)
+
+The crate's `cargo check` is exercised against all three in CI. Live `cargo test` on iOS would need an iOS simulator runner; the current integration suite drives ffmpeg as a black-box oracle, which isn't shipped in the iOS sim — live iOS testing is a follow-up. macOS tests cover the shared crate body, which is symmetric on the two platforms above the symbol-loading layer.
 
 ## Priority
 

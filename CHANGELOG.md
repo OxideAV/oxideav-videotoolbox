@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **iOS target support.** The crate `#![cfg(...)]` widens from
+  `target_os = "macos"` to `any(target_os = "macos", target_os = "ios")`
+  so the entire VT decode/encode surface — `VTDecompressionSession*` /
+  `VTCompressionSession*` / `CMVideoFormatDescription*` / `CVPixelBuffer*`
+  / `CF*` — is now exposed on iOS (`aarch64-apple-ios`,
+  `aarch64-apple-ios-sim`, `x86_64-apple-ios-sim`) as well as macOS.
+  - A new `build.rs` emits `cargo:rustc-link-lib=framework=VideoToolbox`
+    (plus `CoreVideo`, `CoreMedia`, `CoreFoundation`) on
+    `target_os = "ios"` only. macOS keeps zero compile-time link
+    dependency; the build script is a no-op on every other target.
+  - `sys::open()` gains a `#[cfg(target_os = "ios")]` branch that uses
+    `libloading::os::unix::Library::this()` (equivalent to
+    `dlopen(NULL, ...)`) instead of `Library::new(absolute_path)`. iOS
+    sandboxed apps cannot reliably `dlopen("/System/Library/Frameworks/...")`,
+    but the four frameworks have already been link-loaded by the system
+    dyld at process start, so symbol resolution via `RTLD_DEFAULT`
+    against the dyld shared cache works for every VT / CV / CM / CF
+    symbol the vtable needs.
+  - The four `open("/System/Library/Frameworks/<Name>.framework/<Name>")`
+    call sites at vtable-load time keep their string arguments
+    unchanged — on iOS the path argument is unused, on macOS it remains
+    the dlopen target. **The vtable assembly code and every symbol
+    `.get(b"VT...")` call are byte-identical across the two platforms.**
+  - `Cargo.toml` `[target.'cfg(target_os = "macos")'.dependencies]` widens
+    to `[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]`
+    so `libloading` is now pulled on both Apple platforms. Linux /
+    Windows still see an empty rlib with no extra deps.
+  - macOS behaviour is unchanged — the existing dlopen-at-first-use
+    code path is preserved exactly. No new failure modes on macOS, no
+    regression risk on the existing integration suite, no version-bump
+    breaking-change implication.
+
 - **Round 14: hard-cap + CBR rate-control writes
   (`DataRateLimits` / `ConstantBitRate`) across every VT encoder.**
   Round 13 closed the cadence-knob trio (`MaxKeyFrameInterval` /

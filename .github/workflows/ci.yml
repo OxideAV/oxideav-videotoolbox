@@ -1,14 +1,19 @@
 name: CI
 
-# Two CI paths:
+# Three CI paths:
 #
 # * `ci` (default-features) — uses the OxideAV org-level reusable workflow,
 #   which exercises the registry-integrated path (oxideav-core dep +
-#   Decoder/Encoder trait impls).
+#   Decoder/Encoder trait impls) on macOS + Linux + Windows.
 # * `ci-standalone` (no-default-features) — inline job that builds and
 #   tests the lib with `--no-default-features`, exercising the
 #   `oxideav-core`-free standalone path. Catches regressions where
 #   pipeline modules accidentally regrow an oxideav-core import.
+# * `ci-ios-check` — `cargo check` against `aarch64-apple-ios` and
+#   `aarch64-apple-ios-sim` on the macos-latest runner. Compile-only
+#   gate (no test runner — iOS simulator + ffmpeg-as-oracle not
+#   available in CI). Verifies the build.rs framework-link directives
+#   stay correct as the vtable + sys.rs evolve.
 
 on:
   push:
@@ -44,3 +49,31 @@ jobs:
 
       - name: Test (no-default-features)
         run: cargo test --no-default-features --lib --verbose
+
+  ci-ios-check:
+    name: Build (iOS targets)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (with iOS targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-check
+
+      - name: cargo check (aarch64-apple-ios — device)
+        run: cargo check --target aarch64-apple-ios --all-features --lib --verbose
+
+      - name: cargo check (aarch64-apple-ios-sim — arm64 simulator)
+        run: cargo check --target aarch64-apple-ios-sim --all-features --lib --verbose
+
+      - name: cargo check (x86_64-apple-ios — Intel-Mac simulator)
+        run: cargo check --target x86_64-apple-ios --all-features --lib --verbose
+
+      - name: cargo check (aarch64-apple-ios — no-default-features)
+        run: cargo check --target aarch64-apple-ios --no-default-features --lib --verbose

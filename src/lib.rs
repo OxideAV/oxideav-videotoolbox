@@ -1,22 +1,39 @@
-#![cfg(target_os = "macos")]
-//! macOS VideoToolbox hardware decode/encode bridge.
+#![cfg(any(target_os = "macos", target_os = "ios"))]
+//! Apple-platform VideoToolbox hardware decode/encode bridge (macOS + iOS).
 //!
-//! This crate is a **runtime-loaded** bridge to Apple's
+//! This crate is a bridge to Apple's
 //! [VideoToolbox](https://developer.apple.com/documentation/videotoolbox)
-//! framework. It uses [`libloading`] to `dlopen` the framework on
-//! first use, so:
+//! framework. The framework C ABI is identical on macOS and iOS — the
+//! same `VTDecompressionSession*` / `VTCompressionSession*` /
+//! `CMVideoFormatDescription*` / `CVPixelBuffer*` / `CF*` surface — so
+//! the entire crate body is platform-agnostic above the symbol-loading
+//! layer.
 //!
-//! * macOS builds have **no compile-time link dependency** on
-//!   VideoToolbox; if the framework can't be loaded, the registered
-//!   factories return `Error::Unsupported` and the framework registry
-//!   falls back to the pure-Rust codec implementation.
-//! * No Objective-C / Swift involved. VideoToolbox is a C API; symbol
-//!   resolution + Core Foundation refcounting is all FFI.
+//! Symbol-loading shape:
 //!
-//! The crate is gated to `cfg(target_os = "macos")` at the source
-//! level: on Linux / Windows the entire crate compiles to an empty
-//! rlib, and consumers (umbrella `oxideav`) gate the `register` call
-//! behind the same cfg.
+//! * **macOS:** `libloading::Library::new("/System/Library/Frameworks/<Name>.framework/<Name>")`
+//!   opens each of VideoToolbox / CoreVideo / CoreMedia / CoreFoundation
+//!   via `dlopen` at first use. **No compile-time link dependency** —
+//!   load failure (older OS, missing framework, sandboxed environment
+//!   without entitlements) flows through `register()` as a graceful
+//!   no-op, and the framework registry falls back to the pure-Rust
+//!   codec implementation.
+//! * **iOS:** the four frameworks are link-loaded at process start by
+//!   the system dyld (see `build.rs` which emits the conventional
+//!   `cargo:rustc-link-lib=framework=...` directives). At runtime
+//!   `libloading::Library::this()` returns the host process's
+//!   `RTLD_DEFAULT` handle and every framework symbol resolves via the
+//!   dyld shared cache. The `register()` graceful-failure path still
+//!   exists structurally but rarely fires on iOS — Apple's runtime
+//!   ensures the frameworks are present on every supported iOS version.
+//!
+//! No Objective-C / Swift on either platform. VideoToolbox is a C API;
+//! symbol resolution + Core Foundation refcounting is all FFI.
+//!
+//! The crate is gated to `cfg(any(target_os = "macos", target_os = "ios"))`
+//! at the source level: on Linux / Windows the entire crate compiles to
+//! an empty rlib, and consumers (umbrella `oxideav`) gate the `register`
+//! call behind the same cfg.
 //!
 //! # Status
 //!

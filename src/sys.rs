@@ -745,10 +745,33 @@ fn load_vtable() -> Result<Vtable, String> {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn open(path: &str) -> Result<Library, String> {
     // SAFETY: dlopen on a fixed system framework path with no init
     // callbacks; equivalent to a normal program startup load.
     unsafe { Library::new(path) }.map_err(|e| format!("dlopen {path}: {e}"))
+}
+
+#[cfg(target_os = "ios")]
+fn open(_path: &str) -> Result<Library, String> {
+    // On iOS the four system frameworks are link-loaded at process
+    // start via build.rs `cargo:rustc-link-lib=framework=...`
+    // directives. `os::unix::Library::this()` returns a handle equivalent
+    // to `dlopen(NULL, ...)` — the host process's `RTLD_DEFAULT` —
+    // and subsequent `Symbol::get(b"VT...")` calls resolve every
+    // VT / CV / CM / CF symbol the vtable needs from the dyld shared
+    // cache. The `_path` argument is unused on iOS (sandboxed apps
+    // cannot reliably `dlopen` `/System/...` paths), but the four call
+    // sites keep their string arguments for parity with the macOS branch.
+    //
+    // `os::unix::Library::this()` is safe to call — it maps the
+    // already-loaded process image and is documented as the
+    // `dlopen(NULL, ...)` equivalent. Resolving link-loaded framework
+    // symbols from that handle is the iOS-conventional pattern. The
+    // Library is materialised once on the first vtable load and
+    // cached for the lifetime of the process.
+    let lib_unix = libloading::os::unix::Library::this();
+    Ok(Library::from(lib_unix))
 }
 
 // ─────────────────────────── CF helpers ───────────────────────────────────────
