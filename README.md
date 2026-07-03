@@ -1,5 +1,7 @@
 # oxideav-videotoolbox
 
+[![CI](https://github.com/OxideAV/oxideav-videotoolbox/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-videotoolbox/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-videotoolbox.svg)](https://crates.io/crates/oxideav-videotoolbox) [![docs.rs](https://docs.rs/oxideav-videotoolbox/badge.svg)](https://docs.rs/oxideav-videotoolbox) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Apple-platform (macOS + iOS) VideoToolbox hardware decode/encode bridge for the [oxideav](https://github.com/OxideAV/oxideav) framework.
 
 ## Why a bridge crate?
