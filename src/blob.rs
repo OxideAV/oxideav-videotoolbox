@@ -72,6 +72,8 @@ unsafe extern "C" fn dec_callback(
     status: i32,
     _info_flags: u32,
     image_buffer: sys::CVImageBufferRef,
+    presentation_time_stamp: CMTime,
+    _presentation_duration: CMTime,
 ) {
     let state_ptr = output_callback_ref_con as *const Mutex<DecCallbackState>;
     let state = unsafe { &*state_ptr };
@@ -111,7 +113,18 @@ unsafe extern "C" fn dec_callback(
     unsafe { (vt.cv_pb_unlock)(image_buffer, 0) };
 
     match frame {
-        Ok(f) => guard.frames.push_back(f),
+        Ok(mut f) => {
+            // Recover the presentation timestamp VT hands back for this
+            // frame. `submit_frame` wraps `packet.pts` (or a sequential
+            // decode-order counter when the packet carried none) in a
+            // timescale-1 000 000 CMTime, and VT returns that same time
+            // here in presentation order, so `value` is the caller's own
+            // PTS number.
+            f.pts = presentation_time_stamp
+                .is_valid()
+                .then_some(presentation_time_stamp.value);
+            guard.frames.push_back(f);
+        }
         Err(e) => guard.error = Some(e),
     }
 }

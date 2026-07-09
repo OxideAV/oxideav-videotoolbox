@@ -124,12 +124,23 @@ impl CMSampleTimingInfo {
 /// Callback for VTDecompressionSession: called by VT with each decoded frame.
 /// `output_callback_ref_con` is our Box<dyn FnMut(...)> as *mut c_void.
 /// `source_frame_ref_con` is unused (we use `output_callback_ref_con`).
+///
+/// The signature mirrors `VTDecompressionOutputCallback` from
+/// `VideoToolbox/VTDecompressionSession.h` exactly — including the two
+/// trailing by-value `CMTime` parameters (`presentationTimeStamp`,
+/// `presentationDuration`). An earlier revision of this binding omitted
+/// them; that happened to work on the AArch64 / x86-64 C calling
+/// conventions (a callee may ignore trailing arguments), but it made the
+/// decoded frame's presentation timestamp unrecoverable, so every
+/// decoded `VideoFrame` came back with `pts: None`.
 pub type VTDecompressionOutputCallback = unsafe extern "C" fn(
     decomp_output_ref_con: *mut c_void,
     source_frame_ref_con: *mut c_void,
     status: OSStatus,
     info_flags: u32,
     image_buffer: CVImageBufferRef,
+    presentation_time_stamp: CMTime,
+    presentation_duration: CMTime,
 );
 
 /// Wrapper passed to VT as the record.

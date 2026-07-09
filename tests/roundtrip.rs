@@ -268,6 +268,136 @@ fn prores_roundtrip() {
     run_roundtrip("prores");
 }
 
+/// Presentation timestamps survive the full hardware encode → decode
+/// round trip.
+///
+/// The decompression-output callback receives the frame's presentation
+/// time as a by-value `CMTime` (per the callback prototype in
+/// `VideoToolbox/VTDecompressionSession.h`); an earlier binding omitted
+/// the two trailing `CMTime` parameters, so decoded frames always came
+/// back with `pts: None`. This test drives real distinct PTS values
+/// through the encoder-packet → decoder-frame pipeline and asserts each
+/// decoded frame carries one of the submitted timestamps, in ascending
+/// presentation order.
+///
+/// Two codecs cover both decode paths: `h264` (parameter-set path,
+/// `decoder.rs`) and `mjpeg` (blob path, `blob.rs`).
+fn run_pts_survival(codec: &str) {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping {codec} pts survival");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let n_frames = 8usize;
+    // Distinct, non-contiguous PTS values so a synthetic counter (0, 1,
+    // 2, …) can never masquerade as the real timeline.
+    let submitted_pts: Vec<i64> = (0..n_frames).map(|i| 40_000 + (i as i64) * 3_003).collect();
+
+    let mut p = CodecParameters::video(CodecId::new(codec));
+    p.width = Some(width as u32);
+    p.height = Some(height as u32);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+
+    let mut encoder: Box<dyn Encoder> = match codec {
+        "h264" => vt_encoder::make_h264_encoder(&p).expect("encoder construction"),
+        "mjpeg" => vt_blob::make_jpeg_encoder(&p).expect("encoder construction"),
+        _ => panic!("unknown codec {codec}"),
+    };
+
+    let mut packets = Vec::new();
+    for (i, &pts) in submitted_pts.iter().enumerate() {
+        let frame = synthetic_frame(width, height, i as u8, pts);
+        encoder
+            .send_frame(&Frame::Video(frame))
+            .expect("send_frame");
+        loop {
+            match encoder.receive_packet() {
+                Ok(pkt) => packets.push(pkt),
+                Err(Error::NeedMore) => break,
+                Err(e) => panic!("receive_packet error: {e}"),
+            }
+        }
+    }
+    encoder.flush().expect("encoder flush");
+    loop {
+        match encoder.receive_packet() {
+            Ok(pkt) => packets.push(pkt),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_packet (flush) error: {e}"),
+        }
+    }
+    assert!(!packets.is_empty(), "{codec} encoder produced no packets");
+
+    let mut decoder: Box<dyn Decoder> = match codec {
+        "h264" => vt_decoder::H264VtDecoder::make(&p).expect("decoder construction"),
+        "mjpeg" => vt_blob::make_jpeg_decoder(&p).expect("decoder construction"),
+        _ => panic!("unknown codec {codec}"),
+    };
+
+    let mut decoded_pts: Vec<i64> = Vec::new();
+    let mut drain = |decoder: &mut Box<dyn Decoder>, decoded_pts: &mut Vec<i64>| loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Video(vf)) => {
+                decoded_pts.push(vf.pts.expect("decoded frame must carry a PTS"))
+            }
+            Ok(_) => {}
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame error: {e}"),
+        }
+    };
+    for pkt in &packets {
+        decoder.send_packet(pkt).expect("send_packet");
+        drain(&mut decoder, &mut decoded_pts);
+    }
+    decoder.flush().expect("decoder flush");
+    drain(&mut decoder, &mut decoded_pts);
+
+    assert!(
+        !decoded_pts.is_empty(),
+        "{codec} decoder produced no frames"
+    );
+    // Every decoded PTS is one of the submitted values (no synthetic
+    // counters, no invalid-time placeholders).
+    for pts in &decoded_pts {
+        assert!(
+            submitted_pts.contains(pts),
+            "{codec}: decoded pts {pts} was never submitted (submitted {submitted_pts:?})"
+        );
+    }
+    // Presentation order is ascending (frame reordering is disabled at
+    // the encoder, so decode order == presentation order).
+    for pair in decoded_pts.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "{codec}: decoded pts not ascending: {decoded_pts:?}"
+        );
+    }
+    // No wholesale loss: at least half the submitted frames must come
+    // back out (VT may hold trailing frames on some encoders, but losing
+    // most of them means the plumbing broke).
+    assert!(
+        decoded_pts.len() >= n_frames / 2,
+        "{codec}: only {} of {n_frames} frames decoded",
+        decoded_pts.len()
+    );
+    println!(
+        "{codec} pts survival: {} frames decoded, pts = {decoded_pts:?}",
+        decoded_pts.len()
+    );
+}
+
+#[test]
+fn h264_pts_survival() {
+    run_pts_survival("h264");
+}
+
+#[test]
+fn mjpeg_pts_survival() {
+    run_pts_survival("mjpeg");
+}
+
 /// Round 9 — verifies that the new encoder knobs land without
 /// disrupting decode quality:
 ///

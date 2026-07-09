@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Decompression-output callback ABI + decoded-frame PTS recovery.**
+  The `VTDecompressionOutputCallback` prototype in
+  `VideoToolbox/VTDecompressionSession.h` takes **seven** parameters —
+  the binding omitted the two trailing by-value `CMTime`s
+  (`presentationTimeStamp`, `presentationDuration`). That happened to
+  work on the AArch64 / x86-64 C calling conventions (a callee may
+  ignore trailing arguments), but the decoded frame's presentation time
+  was unrecoverable, so **every** decoded `VideoFrame` came back with
+  `pts: None` across all nine codecs. The callback type and both
+  callback implementations (`decoder.rs` H.264/HEVC and `blob.rs`
+  MJPEG / ProRes / MPEG-2 / VP9 / MPEG-4 Pt 2 / AV1 / VVC) now match the
+  header exactly and propagate the returned time into `VideoFrame::pts`
+  (when the CMTime is valid; the value round-trips the caller's own
+  `packet.pts` number, or the sequential decode-order counter for
+  packets that carried none). New hardware integration tests
+  `h264_pts_survival` / `mjpeg_pts_survival` drive distinct
+  non-contiguous PTS values through the encode → decode pipeline and
+  assert each decoded frame carries one of the submitted timestamps in
+  ascending presentation order.
+
 - **`CMTime` validity semantics.** Per CoreMedia's `CMTime.h`,
   `kCMTimeFlags_Valid` (bit 0) "must be set, or the CMTime is considered
   invalid" — the exported `kCMTimeInvalid` constant is the all-zero

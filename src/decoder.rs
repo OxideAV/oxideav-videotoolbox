@@ -123,6 +123,8 @@ unsafe extern "C" fn decomp_callback(
     status: i32,
     _info_flags: u32,
     image_buffer: sys::CVImageBufferRef,
+    presentation_time_stamp: CMTime,
+    _presentation_duration: CMTime,
 ) {
     let state_ptr = output_callback_ref_con as *const Mutex<CallbackState>;
     let state = unsafe { &*state_ptr };
@@ -196,8 +198,17 @@ unsafe extern "C" fn decomp_callback(
 
     unsafe { (vt.cv_pb_unlock)(image_buffer, 0) };
 
+    // Recover the presentation timestamp VT hands back for this frame.
+    // Submission wraps `packet.pts` (or a sequential decode-order counter
+    // when the packet carried none) in a timescale-1 000 000 CMTime, and
+    // VT returns that same time here in presentation order, so `value` is
+    // the caller's own PTS number.
+    let pts = presentation_time_stamp
+        .is_valid()
+        .then_some(presentation_time_stamp.value);
+
     guard.frames.push_back(VideoFrame {
-        pts: None,
+        pts,
         planes: vec![
             VideoPlane {
                 stride: width,
