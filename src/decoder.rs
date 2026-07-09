@@ -525,7 +525,14 @@ impl Drop for H264VtDecoder {
     fn drop(&mut self) {
         if let Ok(vt) = sys::vtable() {
             if !self.session.is_null() {
-                unsafe { (vt.vt_decomp_invalidate)(self.session) };
+                // Per VTDecompressionSession.h: "call
+                // VTDecompressionSessionInvalidate to tear it down and
+                // then CFRelease to release your object reference". The
+                // session is a CF object; invalidating alone leaks it.
+                unsafe {
+                    (vt.vt_decomp_invalidate)(self.session);
+                    (vt.cf_release)(self.session);
+                }
             }
             if !self.fmt_desc.is_null() {
                 unsafe { (vt.cf_release)(self.fmt_desc) };
@@ -715,7 +722,12 @@ impl Drop for HevcVtDecoder {
     fn drop(&mut self) {
         if let Ok(vt) = sys::vtable() {
             if !self.session.is_null() {
-                unsafe { (vt.vt_decomp_invalidate)(self.session) };
+                // Invalidate, then release the CF object reference (see
+                // the H264VtDecoder Drop for the header contract).
+                unsafe {
+                    (vt.vt_decomp_invalidate)(self.session);
+                    (vt.cf_release)(self.session);
+                }
             }
             if !self.fmt_desc.is_null() {
                 unsafe { (vt.cf_release)(self.fmt_desc) };

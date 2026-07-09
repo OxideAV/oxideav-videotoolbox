@@ -1087,7 +1087,21 @@ impl Drop for VtEncoder {
             return;
         }
         if let Ok(vt) = sys::vtable() {
-            unsafe { (vt.vt_comp_invalidate)(self.session) };
+            // Per VTCompressionSession.h: invalidate to tear the session
+            // down, then CFRelease the object reference — sessions are CF
+            // objects and invalidating alone leaks them.
+            unsafe {
+                (vt.vt_comp_invalidate)(self.session);
+                (vt.cf_release)(self.session);
+            }
+            // Balance the `Arc::into_raw(Arc::clone(&state))` handed to
+            // `VTCompressionSessionCreate` as the callback refcon.
+            // Invalidate guarantees no further callback invocations, so
+            // the raw pointer (== `Arc::as_ptr(&self.state)`) can be
+            // reclaimed; `self.state` still holds its own reference, so
+            // the allocation stays alive until the struct finishes
+            // dropping.
+            let _ = unsafe { Arc::from_raw(Arc::as_ptr(&self.state)) };
         }
     }
 }

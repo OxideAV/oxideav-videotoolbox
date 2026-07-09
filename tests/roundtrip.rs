@@ -388,6 +388,53 @@ fn run_pts_survival(codec: &str) {
     );
 }
 
+/// Session teardown is invalidate-then-CFRelease per the framework
+/// headers. This stress loop creates, uses, and drops many encoder +
+/// decoder sessions back to back; an over-release (double CFRelease) or
+/// a use-after-invalidate in the Drop path crashes the process here,
+/// and an under-release shows up as unbounded session leakage under
+/// instrumentation.
+#[test]
+fn session_teardown_stress() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping teardown stress");
+        return;
+    }
+
+    let width = 64usize;
+    let height = 64usize;
+    let mut p = CodecParameters::video(CodecId::new("h264"));
+    p.width = Some(width as u32);
+    p.height = Some(height as u32);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+
+    for i in 0..24usize {
+        let mut encoder = vt_encoder::make_h264_encoder(&p).expect("encoder construction");
+        let frame = synthetic_frame(width, height, (i % 8) as u8, i as i64);
+        encoder
+            .send_frame(&Frame::Video(frame))
+            .expect("send_frame");
+        let mut packets = Vec::new();
+        loop {
+            match encoder.receive_packet() {
+                Ok(pkt) => packets.push(pkt),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet error: {e}"),
+            }
+        }
+        drop(encoder); // invalidate + CFRelease + Arc reclaim
+
+        // Feed whatever came out into a fresh decoder, then drop it too
+        // (exercises the lazily-created decompression session teardown).
+        let mut decoder = vt_decoder::H264VtDecoder::make(&p).expect("decoder construction");
+        for pkt in &packets {
+            decoder.send_packet(pkt).expect("send_packet");
+        }
+        let _ = decoder.flush();
+        drop(decoder); // invalidate + CFRelease (session + fmt_desc)
+    }
+}
+
 #[test]
 fn h264_pts_survival() {
     run_pts_survival("h264");

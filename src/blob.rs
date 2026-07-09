@@ -2011,7 +2011,14 @@ impl Drop for BlobDecoder {
     fn drop(&mut self) {
         if let Ok(vt) = sys::vtable() {
             if !self.session.is_null() {
-                unsafe { (vt.vt_decomp_invalidate)(self.session) };
+                // Per VTDecompressionSession.h: invalidate to tear the
+                // session down, then CFRelease the object reference —
+                // sessions are CF objects and invalidating alone leaks
+                // them.
+                unsafe {
+                    (vt.vt_decomp_invalidate)(self.session);
+                    (vt.cf_release)(self.session);
+                }
             }
             if !self.fmt_desc.is_null() {
                 unsafe { (vt.cf_release)(self.fmt_desc) };
@@ -2564,7 +2571,17 @@ impl Drop for BlobEncoder {
             return;
         }
         if let Ok(vt) = sys::vtable() {
-            unsafe { (vt.vt_comp_invalidate)(self.session) };
+            // Per VTCompressionSession.h: invalidate to tear the session
+            // down, then CFRelease the object reference — sessions are CF
+            // objects and invalidating alone leaks them.
+            unsafe {
+                (vt.vt_comp_invalidate)(self.session);
+                (vt.cf_release)(self.session);
+            }
+            // Balance the `Arc::into_raw(Arc::clone(&state))` handed to
+            // `VTCompressionSessionCreate` as the callback refcon (see
+            // `VtEncoder::drop` for the reasoning).
+            let _ = unsafe { Arc::from_raw(Arc::as_ptr(&self.state)) };
         }
     }
 }

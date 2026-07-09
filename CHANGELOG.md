@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Session teardown leaked every session object (and both encoders
+  leaked their callback state).** The framework headers
+  (`VTDecompressionSession.h` / `VTCompressionSession.h`) require
+  "call `VT*SessionInvalidate` to tear it down **and then CFRelease**
+  to release your object reference" — all four `Drop` impls invalidated
+  but never released, so each decoder/encoder instance leaked one CF
+  session object per lifetime. Both encoder paths additionally leaked
+  the `Arc<Mutex<EncCallbackState>>` handed to
+  `VTCompressionSessionCreate` via `Arc::into_raw` (never reclaimed —
+  the packet queue and error string outlived every encoder). `Drop` now
+  invalidates, releases the session, and (encoders) rebalances the raw
+  `Arc` after invalidate guarantees no further callback invocations. A
+  new `session_teardown_stress` hardware test churns 24 encoder +
+  decoder session lifecycles back to back to pin the teardown ordering
+  (an over-release crashes it).
+
 - **Decompression-output callback ABI + decoded-frame PTS recovery.**
   The `VTDecompressionOutputCallback` prototype in
   `VideoToolbox/VTDecompressionSession.h` takes **seven** parameters —
