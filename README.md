@@ -17,6 +17,58 @@ Two distinct failure paths fall back automatically to the pure-Rust codec:
 1. **Load failure** — older OS, missing framework, sandboxed environment without VT entitlements. `register()` logs and returns without registering, so the SW codec is the only candidate at dispatch. On macOS this surfaces if `Library::new("/System/Library/Frameworks/...")` cannot map the framework; on iOS the system dyld has link-loaded the four frameworks at process start, so the only path that fires this branch is a `Library::this()` failure (effectively impossible for a running process — Apple's runtime always provides the frameworks on every supported iOS version).
 2. **Init failure** — `VTDecompressionSessionCreate` / `VTCompressionSessionCreate` returns a non-zero `OSStatus` for the requested parameters. Common triggers: stream above the device's max resolution, hardware encoder slot already busy (concurrent-session cap), unsupported pixel format, codec profile the device doesn't accelerate. The factory returns `Err`; the registry's `make_decoder_with` / `make_encoder_with` retries the next-priority impl (typically the SW one). On iOS this also catches the platform-specific gaps Apple documents — e.g. AV1 encode requires A17+, ProRes encode requires iPhone 13 Pro+, some `kVTCompressionPropertyKey_*` keys are macOS-only and return `kVTPropertyNotSupportedErr` (treated as non-fatal by the property-write helper).
 
+## Error taxonomy
+
+Every non-zero `OSStatus` is rendered with its symbolic header name —
+e.g. `VTDecompressionSessionCreate: OSStatus -12906
+(kVTCouldNotFindVideoDecoderErr)` — via `sys::describe_os_status`, which
+covers the error enums of `VideoToolbox/VTErrors.h`, CoreMedia's
+`CMBlockBuffer.h` / `CMFormatDescription.h` / `CMSampleBuffer.h`, and
+CoreVideo's `CVReturn.h`. Statuses are classified onto the typed core
+error surface:
+
+* `Error::Unsupported` — the "not available on this host" family
+  (`kVTCouldNotFindVideo{De,En}coderErr`,
+  `kVTVideo{De,En}coderNotAvailableNowErr`,
+  `kVTVideoDecoderUnsupportedDataFormatErr`,
+  `kVTPropertyNotSupportedErr`, `kVTPixelTransferNotSupportedErr`,
+  needs-Rosetta, …) — the registry retries the pure-Rust impl.
+* `Error::InvalidData` — `kVTParameterErr`, `kVTVideoDecoderBadDataErr`.
+* `Error::Other` — malfunctions, allocation failures, unknown codes.
+
+Errors reported by VT's async output callbacks surface once on the next
+`send_packet` / `send_frame` and are then cleared — one corrupt access
+unit does not latch the session into a permanent error state.
+
+## Timestamps & packet metadata
+
+* **Decoded frames carry their PTS.** The decompression-output callback
+  receives the presentation time as a by-value `CMTime` (per the
+  seven-parameter prototype in `VTDecompressionSession.h`); the bridge
+  round-trips `packet.pts` through it, so `VideoFrame::pts` is the
+  caller's own timestamp in presentation order (or a sequential
+  decode-order index for packets that carried none).
+* **Encoder packets carry stream metadata**: `flags.keyframe` (from the
+  access unit's VCL NAL types for H.264/HEVC — IDR / IDR_W_RADL /
+  IDR_N_LP / CRA — and unconditionally for the intra-only MJPEG /
+  ProRes), `dts` mirroring `pts` (frame reordering is disabled at
+  session-create time), and `duration` derived from
+  `options["expected_frame_rate"]` / `params.frame_rate`.
+
+## Hardware policy knob
+
+`options["hardware"]` builds the session-specification dictionary for
+**all four encoders and all nine decoders**:
+
+| Value | Specification | Behaviour |
+|-------|---------------|-----------|
+| `require` / `required` | `kVT*Specification_RequireHardwareAccelerated*` = true | Hardware only; session creation fails with typed `Error::Unsupported` when the media engine is absent / the format isn't hardware-supported / the hardware slot is busy. No silent software fallback. |
+| `enable` / `allow` | `kVT*Specification_EnableHardwareAccelerated*` = true | Prefer hardware, allow VT fallback (VT's documented default, stated explicitly). |
+| `disable` / `software` / `sw` | the Enable key = false | Force VT's internal software codec (distinct from the registry's pure-Rust fallback). |
+
+Absent / unrecognised values keep VT's default policy (no specification
+dictionary).
+
 Pipelines that **require** hardware (e.g. real-time low-latency capture where the SW path can't keep up) can opt out of the SW fallback by setting `CodecPreferences { require_hardware: true, .. }` — the registry will then surface the `OSStatus` error instead of degrading silently.
 
 ## Platform gating
@@ -75,6 +127,7 @@ Encoders accept four optional knobs threaded through `CodecParameters`:
 | Expected frame rate (fps) | `params.options["expected_frame_rate"]` (finite-positive Float64); fall-back: `params.frame_rate` reduced via `Rational::as_f64()` | H.264, HEVC, MJPEG (ProRes ignores; fixed-CBR) | `kVTCompressionPropertyKey_ExpectedFrameRate` (CFNumber-Float64) |
 | Data-rate hard cap | `params.options["data_rate_limits"]` (`bytes:seconds[,bytes:seconds]`, 1–2 segments) | H.264, HEVC, MJPEG (ProRes ignores; fixed-CBR) | `kVTCompressionPropertyKey_DataRateLimits` (CFArray\<CFNumber\>, alternating `[bytes, seconds, ...]`) |
 | Constant bit-rate (bps, macOS 13+) | `params.options["constant_bit_rate"]` (non-negative integer; clamped to `i32::MAX`) | H.264, HEVC, MJPEG (ProRes ignores; fixed-CBR). Mutually exclusive with `bit_rate` (`AverageBitRate`) + `data_rate_limits` per SDK header. | `kVTCompressionPropertyKey_ConstantBitRate` (CFNumber bits/second) |
+| Hardware policy | `params.options["hardware"]` (`require` / `enable` / `disable`) | every encoder **and** decoder (session-specification, not a property) | `kVT{VideoEncoder,VideoDecoder}Specification_{Require,Enable}HardwareAccelerated*` (CFBoolean) |
 
 All knobs are optional; absent / out-of-range values keep the previous defaults (H.264 Baseline_AutoLevel, HEVC Main_AutoLevel, ProRes 422, no explicit bit-rate or quality, VT-default keyframe cadence, no data rate limits, default rate-control mode). VT silently ignores properties it doesn't support for a given codec, so `bit_rate` on ProRes is a no-op (ProRes is fixed-CBR per profile), `MaxKeyFrameInterval*` on MJPEG / ProRes is a no-op (both are intra-only), and `constant_bit_rate` on pre-macOS-13 hosts or encoders without CBR support returns `kVTPropertyNotSupportedErr` (treated as non-fatal) — round-trip still succeeds in every case.
 
