@@ -57,18 +57,46 @@ pub struct CMTime {
     pub epoch: i64,
 }
 
+/// `kCMTimeFlags_Valid` (1 << 0) per CoreMedia's `CMTime.h`: "Must be
+/// set, or the CMTime is considered invalid." All other flag bits
+/// (rounded / ±infinity / indefinite) qualify a *valid* time; a CMTime
+/// whose flags word has bit 0 clear is invalid regardless of its
+/// value/timescale fields.
+pub const K_CM_TIME_FLAGS_VALID: u32 = 1 << 0;
+
 impl CMTime {
     pub fn make(value: i64, timescale: i32) -> Self {
         Self {
             value,
             timescale,
-            flags: 1, // kCMTimeFlags_Valid
+            flags: K_CM_TIME_FLAGS_VALID,
             epoch: 0,
         }
     }
 
     pub fn zero() -> Self {
         Self::make(0, 1)
+    }
+
+    /// `kCMTimeInvalid` — the all-zero struct. Per `CMTime.h` a CMTime
+    /// is invalid exactly when `kCMTimeFlags_Valid` is clear, and the
+    /// exported `kCMTimeInvalid` constant is the zero-initialised
+    /// struct. Use this (never a "valid" sentinel value such as
+    /// `i64::MIN`) wherever the framework accepts an optional time,
+    /// e.g. an unknown decode timestamp in `CMSampleTimingInfo`.
+    pub fn invalid() -> Self {
+        Self {
+            value: 0,
+            timescale: 0,
+            flags: 0,
+            epoch: 0,
+        }
+    }
+
+    /// Whether the framework will treat this time as valid
+    /// (`kCMTimeFlags_Valid` set).
+    pub fn is_valid(&self) -> bool {
+        self.flags & K_CM_TIME_FLAGS_VALID != 0
     }
 }
 
@@ -86,7 +114,7 @@ impl CMSampleTimingInfo {
         Self {
             duration: CMTime::make(0, 1),
             presentation_time_stamp: CMTime::make(0, 1),
-            decode_time_stamp: CMTime::make(i64::MIN, 1), // kCMTimeInvalid
+            decode_time_stamp: CMTime::invalid(),
         }
     }
 }
@@ -931,5 +959,39 @@ mod tests {
     #[test]
     fn vtable_resolves() {
         vtable().expect("vtable load");
+    }
+
+    /// `CMTime::make` produces a valid time; `CMTime::invalid()` is the
+    /// all-zero `kCMTimeInvalid` struct (flags bit 0 clear). Per
+    /// CoreMedia's `CMTime.h`, `kCMTimeFlags_Valid` "must be set, or the
+    /// CMTime is considered invalid" — a sentinel *value* (e.g.
+    /// `i64::MIN`) with the Valid flag set is NOT an invalid time.
+    #[test]
+    fn cmtime_validity_flags() {
+        let t = CMTime::make(42, 1_000_000);
+        assert!(t.is_valid());
+        assert_eq!(t.value, 42);
+        assert_eq!(t.timescale, 1_000_000);
+        assert_eq!(t.flags, K_CM_TIME_FLAGS_VALID);
+        assert_eq!(t.epoch, 0);
+
+        let inv = CMTime::invalid();
+        assert!(!inv.is_valid());
+        assert_eq!(inv.value, 0);
+        assert_eq!(inv.timescale, 0);
+        assert_eq!(inv.flags, 0);
+        assert_eq!(inv.epoch, 0);
+
+        assert!(CMTime::zero().is_valid());
+    }
+
+    /// The default sample-timing template carries an *invalid* decode
+    /// timestamp (unknown DTS), not a "valid" `i64::MIN` sentinel.
+    #[test]
+    fn sample_timing_dts_is_invalid_time() {
+        let timing = CMSampleTimingInfo::zero();
+        assert!(timing.duration.is_valid());
+        assert!(timing.presentation_time_stamp.is_valid());
+        assert!(!timing.decode_time_stamp.is_valid());
     }
 }

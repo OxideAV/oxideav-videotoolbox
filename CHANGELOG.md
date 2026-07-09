@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`CMTime` validity semantics.** Per CoreMedia's `CMTime.h`,
+  `kCMTimeFlags_Valid` (bit 0) "must be set, or the CMTime is considered
+  invalid" — the exported `kCMTimeInvalid` constant is the all-zero
+  struct. The bridge previously fabricated an "unknown DTS" as
+  `CMTime::make(i64::MIN, 1)`, which has the Valid flag **set** and is
+  therefore a *valid* decode timestamp of `i64::MIN` as far as the
+  framework is concerned. All three submission sites (`decoder.rs`
+  H.264/HEVC, `blob.rs` blob/framer path, and the
+  `CMSampleTimingInfo::zero()` template) now pass a true
+  `CMTime::invalid()` (all-zero) DTS. New `sys` API:
+  `CMTime::invalid()`, `CMTime::is_valid()`, and the
+  `K_CM_TIME_FLAGS_VALID` constant, with unit tests pinning the flag
+  semantics.
+
 ### Added
 
 - **iOS target support.** The crate `#![cfg(...)]` widens from

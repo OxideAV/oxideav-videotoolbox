@@ -1943,7 +1943,7 @@ impl BlobDecoder {
         let timing = CMSampleTimingInfo {
             duration: CMTime::make(1, 30),
             presentation_time_stamp: CMTime::make(pts_eff, 1_000_000),
-            decode_time_stamp: CMTime::make(i64::MIN, 1),
+            decode_time_stamp: CMTime::invalid(),
         };
         let sample_size = frame_bytes.len();
 

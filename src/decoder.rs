@@ -353,7 +353,7 @@ fn submit_nal_units(
     let timing = CMSampleTimingInfo {
         duration: CMTime::make(1, 30),
         presentation_time_stamp: CMTime::make(pts.unwrap_or(pts_counter), 1_000_000),
-        decode_time_stamp: CMTime::make(i64::MIN, 1),
+        decode_time_stamp: CMTime::invalid(),
     };
 
     let mut sample_buf: sys::CMSampleBufferRef = std::ptr::null_mut();
