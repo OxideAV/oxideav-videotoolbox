@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`OSStatus` error taxonomy.** New `sys::os_status_name` /
+  `sys::describe_os_status` translate every non-zero status the vtable's
+  API families can return into its symbolic header constant — the error
+  enums of `VideoToolbox/VTErrors.h` (48 codes), CoreMedia's
+  `CMBlockBuffer.h` / `CMFormatDescription.h` / `CMSampleBuffer.h`, and
+  CoreVideo's `CVReturn.h` — so a failure now reads
+  `VTDecompressionSessionCreate: OSStatus -12906
+  (kVTCouldNotFindVideoDecoderErr)` instead of a bare number. A shared
+  `vt_error(context, status)` classifier maps statuses onto the typed
+  core error surface: the "not available on this host" family
+  (could-not-find-codec / not-available-now / unsupported-data-format /
+  property-not-supported / needs-Rosetta / …) becomes
+  `Error::Unsupported` so the registry's software-fallback retry can
+  distinguish hardware "can't" from hardware "broke";
+  `kVTParameterErr` / `kVTVideoDecoderBadDataErr` become
+  `Error::InvalidData`; everything else stays `Error::Other`. All ~25
+  raw-status error sites across `decoder.rs` / `encoder.rs` / `blob.rs`
+  (session create, sample submission, encode/complete, pixel-buffer
+  create/lock, and the four async callbacks) now route through the
+  taxonomy. Unit tests pin the name table, the render format, and the
+  classification.
+
 - **Encoder output packets carry stream metadata.** All four VT
   encoders (H.264 / HEVC in `encoder.rs`, MJPEG / ProRes in `blob.rs`)
   now populate:

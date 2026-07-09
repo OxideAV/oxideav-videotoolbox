@@ -115,6 +115,41 @@ pub(crate) fn resolve_expected_frame_rate(params: &CodecParameters) -> Option<f6
     None
 }
 
+/// Map a non-zero `OSStatus` from a VideoToolbox / CoreMedia / CoreVideo
+/// call into a typed `oxideav_core::Error`, with the symbolic header
+/// name (per `sys::describe_os_status`) in the message.
+///
+/// Classification:
+///   * **Unsupported** — the "no such codec / not on this host / not
+///     right now" family (`kVTCouldNotFindVideo{De,En}coderErr`,
+///     `kVTVideo{De,En}coderNotAvailableNowErr`,
+///     `kVTVideoDecoderUnsupportedDataFormatErr`,
+///     `kVTPropertyNotSupportedErr`, `kVTPixelTransferNotSupportedErr`,
+///     `kVTFormatDescriptionChangeNotSupportedErr`, and the two
+///     needs-Rosetta statuses). The registry's software-fallback retry
+///     keys off this: hardware "can't" is not hardware "broke".
+///   * **Invalid** — caller/data-shaped failures (`kVTParameterErr`,
+///     `kVTVideoDecoderBadDataErr`).
+///   * **Other** — everything else (malfunctions, allocation failures,
+///     invalidated sessions, unknown codes).
+pub(crate) fn vt_error(context: &str, status: sys::OSStatus) -> Error {
+    let msg = format!("{context}: OSStatus {}", sys::describe_os_status(status));
+    match status {
+        sys::K_VT_PROPERTY_NOT_SUPPORTED_ERR
+        | sys::K_VT_PIXEL_TRANSFER_NOT_SUPPORTED_ERR
+        | sys::K_VT_COULD_NOT_FIND_VIDEO_DECODER_ERR
+        | sys::K_VT_COULD_NOT_FIND_VIDEO_ENCODER_ERR
+        | sys::K_VT_VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT_ERR
+        | sys::K_VT_VIDEO_DECODER_NOT_AVAILABLE_NOW_ERR
+        | sys::K_VT_VIDEO_ENCODER_NOT_AVAILABLE_NOW_ERR
+        | sys::K_VT_FORMAT_DESCRIPTION_CHANGE_NOT_SUPPORTED_ERR
+        | sys::K_VT_VIDEO_DECODER_NEEDS_ROSETTA_ERR
+        | sys::K_VT_VIDEO_ENCODER_NEEDS_ROSETTA_ERR => Error::unsupported(msg),
+        sys::K_VT_PARAMETER_ERR | sys::K_VT_VIDEO_DECODER_BAD_DATA_ERR => Error::invalid(msg),
+        _ => Error::other(msg),
+    }
+}
+
 /// Per-frame duration in microseconds (the encoder output packets'
 /// `TimeBase::new(1, 1_000_000)`), derived from the same frame-rate
 /// resolution as `resolve_expected_frame_rate`. `None` when the caller
@@ -590,9 +625,7 @@ unsafe fn extract_annex_b(
         )
     };
     if status != K_OS_STATUS_NO_ERROR {
-        return Err(Error::other(format!(
-            "CMBlockBufferCopyDataBytes: {status}"
-        )));
+        return Err(vt_error("CMBlockBufferCopyDataBytes", status));
     }
 
     // Convert AVCC → Annex-B: replace each 4-byte big-endian length
@@ -671,7 +704,10 @@ unsafe extern "C" fn comp_callback(
     };
 
     if status != K_OS_STATUS_NO_ERROR {
-        guard.error = Some(format!("VT encode callback error: OSStatus {status}"));
+        guard.error = Some(format!(
+            "VT encode callback: OSStatus {}",
+            sys::describe_os_status(status)
+        ));
         return;
     }
 
@@ -771,9 +807,10 @@ impl VtEncoder {
         if status != K_OS_STATUS_NO_ERROR {
             // Reclaim the leaked Arc.
             let _ = unsafe { Arc::from_raw(state_raw as *const Mutex<EncCallbackState>) };
-            return Err(Error::other(format!(
-                "VTCompressionSessionCreate: OSStatus {status} (codec_type 0x{codec_type:08x})"
-            )));
+            return Err(vt_error(
+                &format!("VTCompressionSessionCreate (codec_type 0x{codec_type:08x})"),
+                status,
+            ));
         }
 
         // Configure properties.
@@ -1101,9 +1138,7 @@ impl VtEncoder {
         if ret != 0 {
             // Free the boxes ourselves since the callback won't be called.
             let _ = unsafe { Box::from_raw(boxes_raw as *mut PlaneBoxes) };
-            return Err(Error::other(format!(
-                "CVPixelBufferCreateWithPlanarBytes: CVReturn {ret}"
-            )));
+            return Err(vt_error("CVPixelBufferCreateWithPlanarBytes", ret));
         }
 
         Ok(pixel_buf)
@@ -1182,18 +1217,17 @@ impl oxideav_core::Encoder for VtEncoder {
         unsafe { (vt.cf_release)(pixel_buf) };
 
         if status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "VTCompressionSessionEncodeFrame: {status}"
-            )));
+            return Err(vt_error("VTCompressionSessionEncodeFrame", status));
         }
 
         // Force synchronous completion.
         let complete_status =
             unsafe { (vt.vt_comp_complete)(self.session, CMTime::make(i64::MAX, 1)) };
         if complete_status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "VTCompressionSessionCompleteFrames: {complete_status}"
-            )));
+            return Err(vt_error(
+                "VTCompressionSessionCompleteFrames",
+                complete_status,
+            ));
         }
 
         // Drain newly produced packets. Frame reordering is disabled at
@@ -1234,9 +1268,10 @@ impl oxideav_core::Encoder for VtEncoder {
         let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
         let status = unsafe { (vt.vt_comp_complete)(self.session, CMTime::make(i64::MAX, 1)) };
         if status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "VTCompressionSessionCompleteFrames (flush): {status}"
-            )));
+            return Err(vt_error(
+                "VTCompressionSessionCompleteFrames (flush)",
+                status,
+            ));
         }
         let mut guard = self
             .state
@@ -1271,6 +1306,51 @@ mod tests {
         resolve_expected_frame_rate, DataRateLimit,
     };
     use oxideav_core::{CodecId, CodecParameters, Rational};
+
+    /// `vt_error` classifies the "not available on this host" family as
+    /// `Unsupported` (so the registry's software fallback retries), the
+    /// caller/data-shaped family as `InvalidData`, and everything else
+    /// as `Other` — always embedding the symbolic header name.
+    #[test]
+    fn vt_error_classification() {
+        use super::vt_error;
+        use oxideav_core::Error;
+
+        // Unsupported family.
+        for status in [
+            -12900, -12905, -12906, -12908, -12910, -12913, -12915, -12916, -17692, -17693,
+        ] {
+            match vt_error("ctx", status) {
+                Error::Unsupported(msg) => {
+                    assert!(msg.contains("ctx"), "missing context in {msg}");
+                    assert!(msg.contains("kVT"), "missing symbolic name in {msg}");
+                }
+                other => panic!("status {status}: expected Unsupported, got {other:?}"),
+            }
+        }
+        // Invalid-data family.
+        for status in [-12902, -12909] {
+            match vt_error("ctx", status) {
+                Error::InvalidData(msg) => {
+                    assert!(msg.contains("kVT"), "missing symbolic name in {msg}");
+                }
+                other => panic!("status {status}: expected InvalidData, got {other:?}"),
+            }
+        }
+        // Everything else — including unknown codes — is Other, and the
+        // message keeps the numeric status.
+        match vt_error("VTDecompressionSessionCreate", -12911) {
+            Error::Other(msg) => {
+                assert!(msg.contains("kVTVideoDecoderMalfunctionErr"), "{msg}");
+                assert!(msg.contains("-12911"), "{msg}");
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+        match vt_error("ctx", -424242) {
+            Error::Other(msg) => assert!(msg.contains("-424242"), "{msg}"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
 
     /// `frame_duration_us` derives the per-frame duration (µs) from the
     /// same cadence resolution as `resolve_expected_frame_rate` and

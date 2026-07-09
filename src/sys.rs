@@ -813,6 +813,139 @@ fn open(_path: &str) -> Result<Library, String> {
     Ok(Library::from(lib_unix))
 }
 
+// ─────────────────────────── OSStatus taxonomy ────────────────────────────────
+
+/// Statuses that mean "this codec / configuration is not available on
+/// this host" rather than "the bridge misused the API" — the registry's
+/// software-fallback path wants to treat these as `Unsupported`.
+pub const K_VT_PROPERTY_NOT_SUPPORTED_ERR: OSStatus = -12900;
+pub const K_VT_PARAMETER_ERR: OSStatus = -12902;
+pub const K_VT_PIXEL_TRANSFER_NOT_SUPPORTED_ERR: OSStatus = -12905;
+pub const K_VT_COULD_NOT_FIND_VIDEO_DECODER_ERR: OSStatus = -12906;
+pub const K_VT_COULD_NOT_FIND_VIDEO_ENCODER_ERR: OSStatus = -12908;
+pub const K_VT_VIDEO_DECODER_BAD_DATA_ERR: OSStatus = -12909;
+pub const K_VT_VIDEO_DECODER_UNSUPPORTED_DATA_FORMAT_ERR: OSStatus = -12910;
+pub const K_VT_VIDEO_DECODER_NOT_AVAILABLE_NOW_ERR: OSStatus = -12913;
+pub const K_VT_VIDEO_ENCODER_NOT_AVAILABLE_NOW_ERR: OSStatus = -12915;
+pub const K_VT_FORMAT_DESCRIPTION_CHANGE_NOT_SUPPORTED_ERR: OSStatus = -12916;
+pub const K_VT_VIDEO_DECODER_NEEDS_ROSETTA_ERR: OSStatus = -17692;
+pub const K_VT_VIDEO_ENCODER_NEEDS_ROSETTA_ERR: OSStatus = -17693;
+
+/// Translate a non-zero `OSStatus` / `CVReturn` from the frameworks this
+/// crate binds into the symbolic constant name its public header
+/// declares. Covers the error enums of `VideoToolbox/VTErrors.h`,
+/// CoreMedia's `CMBlockBuffer.h` / `CMFormatDescription.h` /
+/// `CMSampleBuffer.h`, and CoreVideo's `CVReturn.h` — i.e. every API
+/// family the vtable calls. Returns `None` for codes outside those
+/// enums (sub-codec-specific or private statuses).
+pub fn os_status_name(status: OSStatus) -> Option<&'static str> {
+    Some(match status {
+        // VideoToolbox/VTErrors.h
+        -12900 => "kVTPropertyNotSupportedErr",
+        -12901 => "kVTPropertyReadOnlyErr",
+        -12902 => "kVTParameterErr",
+        -12903 => "kVTInvalidSessionErr",
+        -12904 => "kVTAllocationFailedErr",
+        -12905 => "kVTPixelTransferNotSupportedErr",
+        -12906 => "kVTCouldNotFindVideoDecoderErr",
+        -12907 => "kVTCouldNotCreateInstanceErr",
+        -12908 => "kVTCouldNotFindVideoEncoderErr",
+        -12909 => "kVTVideoDecoderBadDataErr",
+        -12910 => "kVTVideoDecoderUnsupportedDataFormatErr",
+        -12911 => "kVTVideoDecoderMalfunctionErr",
+        -12912 => "kVTVideoEncoderMalfunctionErr",
+        -12913 => "kVTVideoDecoderNotAvailableNowErr",
+        -12914 => "kVTPixelRotationNotSupportedErr",
+        -12915 => "kVTVideoEncoderNotAvailableNowErr",
+        -12916 => "kVTFormatDescriptionChangeNotSupportedErr",
+        -12917 => "kVTInsufficientSourceColorDataErr",
+        -12918 => "kVTCouldNotCreateColorCorrectionDataErr",
+        -12919 => "kVTColorSyncTransformConvertFailedErr",
+        -12210 => "kVTVideoDecoderAuthorizationErr",
+        -12211 => "kVTVideoEncoderAuthorizationErr",
+        -12212 => "kVTColorCorrectionPixelTransferFailedErr",
+        -12213 => "kVTMultiPassStorageIdentifierMismatchErr",
+        -12214 => "kVTMultiPassStorageInvalidErr",
+        -12215 => "kVTFrameSiloInvalidTimeStampErr",
+        -12216 => "kVTFrameSiloInvalidTimeRangeErr",
+        -12217 => "kVTCouldNotFindTemporalFilterErr",
+        -12218 => "kVTPixelTransferNotPermittedErr",
+        -12219 => "kVTColorCorrectionImageRotationFailedErr",
+        -17690 => "kVTVideoDecoderRemovedErr",
+        -17691 => "kVTSessionMalfunctionErr",
+        -17692 => "kVTVideoDecoderNeedsRosettaErr",
+        -17693 => "kVTVideoEncoderNeedsRosettaErr",
+        -17694 => "kVTVideoDecoderReferenceMissingErr",
+        -17695 => "kVTVideoDecoderCallbackMessagingErr",
+        -17696 => "kVTVideoDecoderUnknownErr",
+        -17697 => "kVTExtensionDisabledErr",
+        -17698 => "kVTVideoEncoderMVHEVCVideoLayerIDsMismatchErr",
+        -17699 => "kVTCouldNotOutputTaggedBufferGroupErr",
+        -19510 => "kVTCouldNotFindExtensionErr",
+        -19511 => "kVTExtensionConflictErr",
+        -19512 => "kVTVideoEncoderAutoWhiteBalanceNotLockedErr",
+        // CoreMedia/CMBlockBuffer.h
+        -12700 => "kCMBlockBufferStructureAllocationFailedErr",
+        -12701 => "kCMBlockBufferBlockAllocationFailedErr",
+        -12702 => "kCMBlockBufferBadCustomBlockSourceErr",
+        -12703 => "kCMBlockBufferBadOffsetParameterErr",
+        -12704 => "kCMBlockBufferBadLengthParameterErr",
+        -12705 => "kCMBlockBufferBadPointerParameterErr",
+        -12706 => "kCMBlockBufferEmptyBBufErr",
+        -12707 => "kCMBlockBufferUnallocatedBlockErr",
+        -12708 => "kCMBlockBufferInsufficientSpaceErr",
+        // CoreMedia/CMFormatDescription.h
+        -12710 => "kCMFormatDescriptionError_InvalidParameter",
+        -12711 => "kCMFormatDescriptionError_AllocationFailed",
+        -12718 => "kCMFormatDescriptionError_ValueNotAvailable",
+        // CoreMedia/CMSampleBuffer.h
+        -12730 => "kCMSampleBufferError_AllocationFailed",
+        -12731 => "kCMSampleBufferError_RequiredParameterMissing",
+        -12732 => "kCMSampleBufferError_AlreadyHasDataBuffer",
+        -12733 => "kCMSampleBufferError_BufferNotReady",
+        -12734 => "kCMSampleBufferError_SampleIndexOutOfRange",
+        -12735 => "kCMSampleBufferError_BufferHasNoSampleSizes",
+        -12736 => "kCMSampleBufferError_BufferHasNoSampleTimingInfo",
+        -12737 => "kCMSampleBufferError_ArrayTooSmall",
+        -12738 => "kCMSampleBufferError_InvalidEntryCount",
+        -12739 => "kCMSampleBufferError_CannotSubdivide",
+        -12740 => "kCMSampleBufferError_SampleTimingInfoInvalid",
+        -12741 => "kCMSampleBufferError_InvalidMediaTypeForOperation",
+        -12742 => "kCMSampleBufferError_InvalidSampleData",
+        -12743 => "kCMSampleBufferError_InvalidMediaFormat",
+        -12744 => "kCMSampleBufferError_Invalidated",
+        // CoreVideo/CVReturn.h
+        -6660 => "kCVReturnError",
+        -6661 => "kCVReturnInvalidArgument",
+        -6662 => "kCVReturnAllocationFailed",
+        -6663 => "kCVReturnUnsupported",
+        -6670 => "kCVReturnInvalidDisplay",
+        -6671 => "kCVReturnDisplayLinkAlreadyRunning",
+        -6672 => "kCVReturnDisplayLinkNotRunning",
+        -6673 => "kCVReturnDisplayLinkCallbacksNotSet",
+        -6680 => "kCVReturnInvalidPixelFormat",
+        -6681 => "kCVReturnInvalidSize",
+        -6682 => "kCVReturnInvalidPixelBufferAttributes",
+        -6683 => "kCVReturnPixelBufferNotOpenGLCompatible",
+        -6684 => "kCVReturnPixelBufferNotMetalCompatible",
+        -6689 => "kCVReturnWouldExceedAllocationThreshold",
+        -6690 => "kCVReturnPoolAllocationFailed",
+        -6691 => "kCVReturnInvalidPoolAttributes",
+        -6692 => "kCVReturnRetry",
+        _ => return None,
+    })
+}
+
+/// Render an `OSStatus` / `CVReturn` for error messages: the numeric
+/// code plus the symbolic header name when known — e.g.
+/// `-12909 (kVTVideoDecoderBadDataErr)` — or just the number otherwise.
+pub fn describe_os_status(status: OSStatus) -> String {
+    match os_status_name(status) {
+        Some(name) => format!("{status} ({name})"),
+        None => status.to_string(),
+    }
+}
+
 // ─────────────────────────── CF helpers ───────────────────────────────────────
 
 /// Create a CFString from a static Rust string via the vtable.
@@ -1004,5 +1137,60 @@ mod tests {
         assert!(timing.duration.is_valid());
         assert!(timing.presentation_time_stamp.is_valid());
         assert!(!timing.decode_time_stamp.is_valid());
+    }
+
+    /// Spot-check the OSStatus name table across all four framework
+    /// error enums it covers, plus the unknown-code fallback.
+    #[test]
+    fn os_status_names() {
+        // VTErrors.h
+        assert_eq!(os_status_name(-12909), Some("kVTVideoDecoderBadDataErr"));
+        assert_eq!(
+            os_status_name(-12906),
+            Some("kVTCouldNotFindVideoDecoderErr")
+        );
+        assert_eq!(os_status_name(-12900), Some("kVTPropertyNotSupportedErr"));
+        assert_eq!(
+            os_status_name(-17692),
+            Some("kVTVideoDecoderNeedsRosettaErr")
+        );
+        // CMBlockBuffer.h / CMSampleBuffer.h / CMFormatDescription.h
+        assert_eq!(
+            os_status_name(-12700),
+            Some("kCMBlockBufferStructureAllocationFailedErr")
+        );
+        assert_eq!(
+            os_status_name(-12731),
+            Some("kCMSampleBufferError_RequiredParameterMissing")
+        );
+        assert_eq!(
+            os_status_name(-12710),
+            Some("kCMFormatDescriptionError_InvalidParameter")
+        );
+        // CVReturn.h
+        assert_eq!(os_status_name(-6661), Some("kCVReturnInvalidArgument"));
+        assert_eq!(os_status_name(-6680), Some("kCVReturnInvalidPixelFormat"));
+        // Unknown codes have no name.
+        assert_eq!(os_status_name(0), None);
+        assert_eq!(os_status_name(-1), None);
+        assert_eq!(os_status_name(-99999), None);
+
+        // Named constants agree with the table.
+        assert_eq!(os_status_name(K_VT_PARAMETER_ERR), Some("kVTParameterErr"));
+        assert_eq!(
+            os_status_name(K_VT_VIDEO_ENCODER_NOT_AVAILABLE_NOW_ERR),
+            Some("kVTVideoEncoderNotAvailableNowErr")
+        );
+    }
+
+    /// `describe_os_status` renders `code (kName)` for known codes and
+    /// the bare number otherwise.
+    #[test]
+    fn describe_os_status_format() {
+        assert_eq!(
+            describe_os_status(-12909),
+            "-12909 (kVTVideoDecoderBadDataErr)"
+        );
+        assert_eq!(describe_os_status(-42), "-42");
     }
 }

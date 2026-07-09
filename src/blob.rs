@@ -30,7 +30,7 @@ use oxideav_core::{
 
 use crate::encoder::{
     frame_duration_us, parse_constant_bit_rate, parse_data_rate_limits, parse_keyframe_interval,
-    parse_keyframe_interval_duration, resolve_expected_frame_rate,
+    parse_keyframe_interval_duration, resolve_expected_frame_rate, vt_error,
 };
 use crate::sys::{
     self, cf_number_i32, cf_string, CMSampleTimingInfo, CMTime,
@@ -83,7 +83,10 @@ unsafe extern "C" fn dec_callback(
     };
 
     if status != K_OS_STATUS_NO_ERROR {
-        guard.error = Some(format!("VT blob-decode callback OSStatus {status}"));
+        guard.error = Some(format!(
+            "VT blob-decode callback: OSStatus {}",
+            sys::describe_os_status(status)
+        ));
         return;
     }
     if image_buffer.is_null() {
@@ -100,7 +103,10 @@ unsafe extern "C" fn dec_callback(
 
     let ret = unsafe { (vt.cv_pb_lock)(image_buffer, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY) };
     if ret != 0 {
-        guard.error = Some(format!("CVPixelBufferLockBaseAddress: {ret}"));
+        guard.error = Some(format!(
+            "CVPixelBufferLockBaseAddress: {}",
+            sys::describe_os_status(ret)
+        ));
         return;
     }
 
@@ -1850,10 +1856,13 @@ impl BlobDecoder {
             }
         }
         if st != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "CMVideoFormatDescriptionCreate (codec 0x{:08x}): {st}",
-                self.codec_type
-            )));
+            return Err(vt_error(
+                &format!(
+                    "CMVideoFormatDescriptionCreate (codec 0x{:08x})",
+                    self.codec_type
+                ),
+                st,
+            ));
         }
 
         // Destination attributes: NV12 ('420v') so the callback gets a
@@ -1902,10 +1911,13 @@ impl BlobDecoder {
 
         if status != K_OS_STATUS_NO_ERROR {
             unsafe { (vt.cf_release)(fmt_desc) };
-            return Err(Error::other(format!(
-                "VTDecompressionSessionCreate (codec 0x{:08x}): {status}",
-                self.codec_type
-            )));
+            return Err(vt_error(
+                &format!(
+                    "VTDecompressionSessionCreate (codec 0x{:08x})",
+                    self.codec_type
+                ),
+                status,
+            ));
         }
 
         self.session = session;
@@ -1946,9 +1958,7 @@ impl BlobDecoder {
             )
         };
         if status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "CMBlockBufferCreateWithMemoryBlock: {status}"
-            )));
+            return Err(vt_error("CMBlockBufferCreateWithMemoryBlock", status));
         }
 
         let pts_eff = pts.unwrap_or(self.pts_counter);
@@ -1976,7 +1986,7 @@ impl BlobDecoder {
         };
         unsafe { (vt.cf_release)(block_buf) };
         if status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!("CMSampleBufferCreateReady: {status}")));
+            return Err(vt_error("CMSampleBufferCreateReady", status));
         }
 
         let dec_status = unsafe {
@@ -1990,9 +2000,7 @@ impl BlobDecoder {
         };
         unsafe { (vt.cf_release)(sample_buf) };
         if dec_status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "VTDecompressionSessionDecodeFrame: {dec_status}"
-            )));
+            return Err(vt_error("VTDecompressionSessionDecodeFrame", dec_status));
         }
         unsafe { (vt.vt_decomp_finish)(self.session) };
         Ok(())
@@ -2186,7 +2194,10 @@ unsafe extern "C" fn enc_callback(
     };
 
     if status != K_OS_STATUS_NO_ERROR {
-        guard.error = Some(format!("VT blob-encode callback OSStatus {status}"));
+        guard.error = Some(format!(
+            "VT blob-encode callback: OSStatus {}",
+            sys::describe_os_status(status)
+        ));
         return;
     }
     if sample_buffer.is_null() {
@@ -2212,7 +2223,10 @@ unsafe extern "C" fn enc_callback(
         (vt.cm_block_copy_data)(block_buf, 0, total_len, data.as_mut_ptr() as *mut c_void)
     };
     if st != K_OS_STATUS_NO_ERROR {
-        guard.error = Some(format!("CMBlockBufferCopyDataBytes: {st}"));
+        guard.error = Some(format!(
+            "CMBlockBufferCopyDataBytes: {}",
+            sys::describe_os_status(st)
+        ));
         return;
     }
     // No NAL conversion — JPEG/ProRes are already self-contained frames.
@@ -2271,9 +2285,10 @@ impl BlobEncoder {
         if status != K_OS_STATUS_NO_ERROR {
             // Reclaim the leaked Arc.
             let _ = unsafe { Arc::from_raw(state_raw as *const Mutex<EncCallbackState>) };
-            return Err(Error::other(format!(
-                "VTCompressionSessionCreate (codec 0x{codec_type:08x}): OSStatus {status}"
-            )));
+            return Err(vt_error(
+                &format!("VTCompressionSessionCreate (codec 0x{codec_type:08x})"),
+                status,
+            ));
         }
 
         // RealTime + AllowFrameReordering=false keep the test deterministic.
@@ -2561,9 +2576,7 @@ impl BlobEncoder {
         if ret != 0 {
             // Reclaim our box; the release callback won't fire.
             let _ = unsafe { Box::from_raw(boxes_raw as *mut PlaneBoxes) };
-            return Err(Error::other(format!(
-                "CVPixelBufferCreateWithPlanarBytes: CVReturn {ret}"
-            )));
+            return Err(vt_error("CVPixelBufferCreateWithPlanarBytes", ret));
         }
         Ok(pixel_buf)
     }
@@ -2632,17 +2645,16 @@ impl Encoder for BlobEncoder {
         };
         unsafe { (vt.cf_release)(pixel_buf) };
         if status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "VTCompressionSessionEncodeFrame: {status}"
-            )));
+            return Err(vt_error("VTCompressionSessionEncodeFrame", status));
         }
 
         let complete_status =
             unsafe { (vt.vt_comp_complete)(self.session, CMTime::make(i64::MAX, 1)) };
         if complete_status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "VTCompressionSessionCompleteFrames: {complete_status}"
-            )));
+            return Err(vt_error(
+                "VTCompressionSessionCompleteFrames",
+                complete_status,
+            ));
         }
 
         let mut guard = self
@@ -2682,9 +2694,10 @@ impl Encoder for BlobEncoder {
         let vt = sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
         let status = unsafe { (vt.vt_comp_complete)(self.session, CMTime::make(i64::MAX, 1)) };
         if status != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "VTCompressionSessionCompleteFrames (flush): {status}"
-            )));
+            return Err(vt_error(
+                "VTCompressionSessionCompleteFrames (flush)",
+                status,
+            ));
         }
         let mut guard = self
             .state

@@ -21,6 +21,8 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
 };
 
+use crate::encoder::vt_error;
+
 use crate::sys::{
     self, CMSampleTimingInfo, CMTime, K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE,
     VTDecompressionOutputCallbackRecord, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY,
@@ -134,7 +136,10 @@ unsafe extern "C" fn decomp_callback(
     };
 
     if status != K_OS_STATUS_NO_ERROR {
-        guard.error = Some(format!("VT decode callback OSStatus {status}"));
+        guard.error = Some(format!(
+            "VT decode callback: OSStatus {}",
+            sys::describe_os_status(status)
+        ));
         return;
     }
     if image_buffer.is_null() {
@@ -151,7 +156,10 @@ unsafe extern "C" fn decomp_callback(
 
     let ret = unsafe { (vt.cv_pb_lock)(image_buffer, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY) };
     if ret != 0 {
-        guard.error = Some(format!("CVPixelBufferLockBaseAddress: {ret}"));
+        guard.error = Some(format!(
+            "CVPixelBufferLockBaseAddress: {}",
+            sys::describe_os_status(ret)
+        ));
         return;
     }
 
@@ -278,9 +286,7 @@ fn create_vt_session(
     unsafe { (vt.cf_release)(pf_key) };
 
     if status != K_OS_STATUS_NO_ERROR {
-        Err(Error::other(format!(
-            "VTDecompressionSessionCreate: OSStatus {status}"
-        )))
+        Err(vt_error("VTDecompressionSessionCreate", status))
     } else {
         Ok(session)
     }
@@ -356,9 +362,7 @@ fn submit_nal_units(
     if status != K_OS_STATUS_NO_ERROR {
         // Free our copy since CF won't.
         unsafe { libc_free(data_copy) };
-        return Err(Error::other(format!(
-            "CMBlockBufferCreateWithMemoryBlock: {status}"
-        )));
+        return Err(vt_error("CMBlockBufferCreateWithMemoryBlock", status));
     }
 
     let timing = CMSampleTimingInfo {
@@ -385,7 +389,7 @@ fn submit_nal_units(
     unsafe { (vt.cf_release)(block_buf) };
 
     if status != K_OS_STATUS_NO_ERROR {
-        return Err(Error::other(format!("CMSampleBufferCreateReady: {status}")));
+        return Err(vt_error("CMSampleBufferCreateReady", status));
     }
 
     let dec_status = unsafe {
@@ -401,9 +405,7 @@ fn submit_nal_units(
     unsafe { (vt.cf_release)(sample_buf) };
 
     if dec_status != K_OS_STATUS_NO_ERROR {
-        return Err(Error::other(format!(
-            "VTDecompressionSessionDecodeFrame: {dec_status}"
-        )));
+        return Err(vt_error("VTDecompressionSessionDecodeFrame", dec_status));
     }
 
     Ok(())
@@ -493,9 +495,10 @@ impl H264VtDecoder {
             )
         };
         if st != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "CMVideoFormatDescriptionCreateFromH264ParameterSets: {st}"
-            )));
+            return Err(vt_error(
+                "CMVideoFormatDescriptionCreateFromH264ParameterSets",
+                st,
+            ));
         }
 
         let session = create_vt_session(vt, fmt_desc, &self.state)?;
@@ -694,9 +697,10 @@ impl HevcVtDecoder {
             )
         };
         if st != K_OS_STATUS_NO_ERROR {
-            return Err(Error::other(format!(
-                "CMVideoFormatDescriptionCreateFromHEVCParameterSets: {st}"
-            )));
+            return Err(vt_error(
+                "CMVideoFormatDescriptionCreateFromHEVCParameterSets",
+                st,
+            ));
         }
 
         let session = create_vt_session(vt, fmt_desc, &self.state)?;
