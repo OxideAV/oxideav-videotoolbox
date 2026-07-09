@@ -62,7 +62,7 @@ unit does not latch the session into a permanent error state.
 
 | Value | Specification | Behaviour |
 |-------|---------------|-----------|
-| `require` / `required` | `kVT*Specification_RequireHardwareAccelerated*` = true | Hardware only; session creation fails with typed `Error::Unsupported` when the media engine is absent / the format isn't hardware-supported / the hardware slot is busy. No silent software fallback. |
+| `require` / `required` | `kVT*Specification_RequireHardwareAccelerated*` = true | Hardware only; session creation fails when the media engine is absent / the format isn't hardware-supported / the hardware slot is busy — no silent software fallback. The header documents `kVTCouldNotFindVideo{De,En}coderErr` (→ typed `Error::Unsupported`); virtualized hosts have been observed returning `kVTInvalidSessionErr` (→ `Error::Other`). |
 | `enable` / `allow` | `kVT*Specification_EnableHardwareAccelerated*` = true | Prefer hardware, allow VT fallback (VT's documented default, stated explicitly). |
 | `disable` / `software` / `sw` | the Enable key = false | Force VT's internal software codec (distinct from the registry's pure-Rust fallback). |
 

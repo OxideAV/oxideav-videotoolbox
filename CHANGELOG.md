@@ -17,10 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (per `VTCompressionProperties.h`) on the compression side and
   `kVTVideoDecoderSpecification_{Require,Enable}HardwareAcceleratedVideoDecoder`
   (per `VTDecompressionProperties.h`) on the decompression side.
-  `require` makes session creation fail (typed `Error::Unsupported`)
-  when the machine lacks the media engine, the format isn't
-  hardware-supported, or the hardware slot is busy — no silent
-  software fallback; `disable` forces VT's internal software codec
+  `require` makes session creation fail when the machine lacks the
+  media engine, the format isn't hardware-supported, or the hardware
+  slot is busy — no silent software fallback; `disable` forces VT's internal software codec
   (distinct from the registry's pure-Rust fallback); absent keeps VT's
   default. Plumbing: new `sys` vtable entries for the `kCFBooleanTrue` /
   `kCFBooleanFalse` singletons and the
@@ -29,8 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helper, and a shared `HardwareMode` parser/builder. Hardware test
   `hardware_mode_specifications` proves `enable` / `disable` round-trip
   everywhere and that `require` either round-trips (media engine
-  present) or fails typed-`Unsupported`; on an M-series host all three
-  modes decode 4/4 frames.
+  present) or fails at session creation — the header documents
+  `kVTCouldNotFindVideo{De,En}coderErr` (→ typed `Unsupported`) for the
+  no-hardware case, though virtualized CI hosts have been observed
+  returning `kVTInvalidSessionErr` instead. On an M-series host all
+  three modes decode 4/4 frames.
 
 ### Fixed
 
