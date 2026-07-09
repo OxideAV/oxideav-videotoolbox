@@ -337,7 +337,7 @@ fn run_pts_survival(codec: &str) {
     };
 
     let mut decoded_pts: Vec<i64> = Vec::new();
-    let mut drain = |decoder: &mut Box<dyn Decoder>, decoded_pts: &mut Vec<i64>| loop {
+    let drain = |decoder: &mut Box<dyn Decoder>, decoded_pts: &mut Vec<i64>| loop {
         match decoder.receive_frame() {
             Ok(Frame::Video(vf)) => {
                 decoded_pts.push(vf.pts.expect("decoded frame must carry a PTS"))
