@@ -29,17 +29,15 @@ use oxideav_core::{
 };
 
 use crate::encoder::{
-    frame_duration_us, parse_constant_bit_rate, parse_data_rate_limits, parse_keyframe_interval,
-    parse_keyframe_interval_duration, resolve_expected_frame_rate, vt_error,
+    frame_duration_us, i420_to_nv12_pixel_buffer, parse_constant_bit_rate, parse_data_rate_limits,
+    parse_keyframe_interval, parse_keyframe_interval_duration, resolve_expected_frame_rate,
+    vt_error,
 };
 use crate::sys::{
     self, cf_number_i32, cf_string, CMSampleTimingInfo, CMTime,
     K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY,
     K_OS_STATUS_NO_ERROR,
 };
-
-// kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange = '420v'
-const K_CV_PIXEL_FORMAT_NV12: u32 = 0x34323076;
 
 // ─────────────────────────── libc shim ────────────────────────────────────────
 
@@ -2462,123 +2460,15 @@ impl BlobEncoder {
         }))
     }
 
+    /// Convert an I420 `VideoFrame` → biplanar NV12 `CVPixelBuffer` via
+    /// the shared converter in `encoder.rs` (one release-callback path
+    /// for all four VT encoders).
     fn frame_to_pixel_buffer(
         &self,
         vt: &sys::Vtable,
         frame: &VideoFrame,
     ) -> Result<sys::CVPixelBufferRef> {
-        if frame.planes.len() < 3 {
-            return Err(Error::invalid("expected I420 frame with 3 planes"));
-        }
-
-        let y_plane = &frame.planes[0];
-        let u_plane = &frame.planes[1];
-        let v_plane = &frame.planes[2];
-
-        let width = self.width;
-        let height = self.height;
-        let chroma_w = width.div_ceil(2);
-        let chroma_h = height.div_ceil(2);
-
-        let y_len = y_plane.stride * height;
-        let uv_len = chroma_w * 2 * chroma_h;
-
-        let mut y_data: Vec<u8> = vec![0u8; y_len];
-        let mut uv_data: Vec<u8> = vec![0u8; uv_len];
-
-        // Copy Y (possibly re-stride to width).
-        let y_rows = y_plane
-            .data
-            .len()
-            .checked_div(y_plane.stride)
-            .map(|r| height.min(r))
-            .unwrap_or(0);
-        for row in 0..y_rows {
-            let src_start = row * y_plane.stride;
-            let dst_start = row * width;
-            let copy_len = width.min(y_plane.stride);
-            if src_start + copy_len <= y_plane.data.len() && dst_start + copy_len <= y_len {
-                y_data[dst_start..dst_start + copy_len]
-                    .copy_from_slice(&y_plane.data[src_start..src_start + copy_len]);
-            }
-        }
-
-        // Interleave U + V → UV.
-        for row in 0..chroma_h {
-            let u_src = row * u_plane.stride;
-            let v_src = row * v_plane.stride;
-            let uv_dst = row * chroma_w * 2;
-            for col in 0..chroma_w {
-                let u_val = if u_src + col < u_plane.data.len() {
-                    u_plane.data[u_src + col]
-                } else {
-                    128
-                };
-                let v_val = if v_src + col < v_plane.data.len() {
-                    v_plane.data[v_src + col]
-                } else {
-                    128
-                };
-                uv_data[uv_dst + col * 2] = u_val;
-                uv_data[uv_dst + col * 2 + 1] = v_val;
-            }
-        }
-
-        let mut y_boxed = y_data.into_boxed_slice();
-        let mut uv_boxed = uv_data.into_boxed_slice();
-
-        let mut plane_ptrs: [*mut c_void; 2] = [
-            y_boxed.as_mut_ptr() as *mut c_void,
-            uv_boxed.as_mut_ptr() as *mut c_void,
-        ];
-        let plane_widths: [usize; 2] = [width, chroma_w];
-        let plane_heights: [usize; 2] = [height, chroma_h];
-        let plane_bpr: [usize; 2] = [width, chroma_w * 2];
-
-        struct PlaneBoxes {
-            _y: Box<[u8]>,
-            _uv: Box<[u8]>,
-        }
-        let boxes = Box::new(PlaneBoxes {
-            _y: y_boxed,
-            _uv: uv_boxed,
-        });
-        let boxes_raw = Box::into_raw(boxes) as *mut c_void;
-
-        unsafe extern "C" fn release_planes(
-            _release_ref_con: *mut c_void,
-            data_ptr: *const c_void,
-        ) {
-            let _ = data_ptr;
-        }
-
-        let mut pixel_buf: sys::CVPixelBufferRef = std::ptr::null_mut();
-        let ret = unsafe {
-            (vt.cv_pb_create_planar)(
-                std::ptr::null_mut(),
-                width,
-                height,
-                K_CV_PIXEL_FORMAT_NV12,
-                std::ptr::null_mut(),
-                0,
-                2,
-                plane_ptrs.as_mut_ptr(),
-                plane_widths.as_ptr(),
-                plane_heights.as_ptr(),
-                plane_bpr.as_ptr(),
-                Some(release_planes),
-                boxes_raw,
-                std::ptr::null_mut(),
-                &mut pixel_buf,
-            )
-        };
-
-        if ret != 0 {
-            // Reclaim our box; the release callback won't fire.
-            let _ = unsafe { Box::from_raw(boxes_raw as *mut PlaneBoxes) };
-            return Err(vt_error("CVPixelBufferCreateWithPlanarBytes", ret));
-        }
-        Ok(pixel_buf)
+        i420_to_nv12_pixel_buffer(vt, frame, self.width, self.height)
     }
 }
 

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every encoded frame leaked its full NV12 copy (pixel-buffer release
+  callback never freed, and had the wrong ABI).** Both encoder paths
+  hand heap-owned NV12 plane copies to
+  `CVPixelBufferCreateWithPlanarBytes` with a release callback so
+  CoreVideo can return the memory — but the callback body freed
+  nothing, so the entire frame copy (`~w×h×1.5` bytes) leaked on every
+  `send_frame`. The callback was also bound with the two-parameter
+  `CVPixelBufferReleaseBytesCallback` shape; per `CVPixelBuffer.h` the
+  planar variant takes **five** parameters (`releaseRefCon, dataPtr,
+  dataSize, numberOfPlanes, planeAddresses[]`). The binding now matches
+  the header and the callback reclaims the plane allocation. The two
+  near-identical converters in `encoder.rs` / `blob.rs` are consolidated
+  into one shared `i420_to_nv12_pixel_buffer` (which also right-sizes
+  the Y copy to `width×height` instead of `stride×height`). A
+  `LIVE_PLANE_BOXES` counter + `plane_boxes_released` hardware test pin
+  that the release callback fires and every plane copy is returned by
+  encoder teardown.
+
 ### Added
 
 - **`OSStatus` error taxonomy.** New `sys::os_status_name` /

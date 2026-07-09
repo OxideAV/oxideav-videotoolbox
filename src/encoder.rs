@@ -1023,126 +1023,174 @@ impl VtEncoder {
     }
 
     /// Convert an I420 `VideoFrame` → biplanar NV12 `CVPixelBuffer`.
-    ///
-    /// VT strongly prefers NV12 on Apple Silicon. We convert on-the-fly.
     fn frame_to_pixel_buffer(
         &self,
         vt: &sys::Vtable,
         frame: &oxideav_core::VideoFrame,
     ) -> Result<sys::CVPixelBufferRef> {
-        if frame.planes.len() < 3 {
-            return Err(Error::invalid("expected I420 frame with 3 planes"));
-        }
-
-        let y_plane = &frame.planes[0];
-        let u_plane = &frame.planes[1];
-        let v_plane = &frame.planes[2];
-
-        let width = self.width;
-        let height = self.height;
-        let chroma_w = width.div_ceil(2);
-        let chroma_h = height.div_ceil(2);
-
-        // Build NV12: Y plane + interleaved UV.
-        // Keep the data alive in a Box until the pixel buffer is released.
-        let y_len = y_plane.stride * height;
-        let uv_len = chroma_w * 2 * chroma_h;
-
-        let mut y_data: Vec<u8> = vec![0u8; y_len];
-        let mut uv_data: Vec<u8> = vec![0u8; uv_len];
-
-        // Copy Y (possibly re-stride).
-        for row in 0..height.min(y_plane.data.len() / y_plane.stride.max(1)) {
-            let src_start = row * y_plane.stride;
-            let dst_start = row * width;
-            let copy_len = width.min(y_plane.stride);
-            if src_start + copy_len <= y_plane.data.len() && dst_start + copy_len <= y_len {
-                y_data[dst_start..dst_start + copy_len]
-                    .copy_from_slice(&y_plane.data[src_start..src_start + copy_len]);
-            }
-        }
-
-        // Interleave U + V → UV.
-        for row in 0..chroma_h {
-            let u_src = row * u_plane.stride;
-            let v_src = row * v_plane.stride;
-            let uv_dst = row * chroma_w * 2;
-            for col in 0..chroma_w {
-                let u_val = if u_src + col < u_plane.data.len() {
-                    u_plane.data[u_src + col]
-                } else {
-                    128
-                };
-                let v_val = if v_src + col < v_plane.data.len() {
-                    v_plane.data[v_src + col]
-                } else {
-                    128
-                };
-                uv_data[uv_dst + col * 2] = u_val;
-                uv_data[uv_dst + col * 2 + 1] = v_val;
-            }
-        }
-
-        // Wrap in a Box so they stay alive.
-        let mut y_boxed = y_data.into_boxed_slice();
-        let mut uv_boxed = uv_data.into_boxed_slice();
-
-        let mut plane_ptrs: [*mut c_void; 2] = [
-            y_boxed.as_mut_ptr() as *mut c_void,
-            uv_boxed.as_mut_ptr() as *mut c_void,
-        ];
-        let plane_widths: [usize; 2] = [width, chroma_w];
-        let plane_heights: [usize; 2] = [height, chroma_h];
-        let plane_bpr: [usize; 2] = [width, chroma_w * 2];
-
-        // We pass a release callback to free our heap allocations.
-        struct PlaneBoxes {
-            _y: Box<[u8]>,
-            _uv: Box<[u8]>,
-        }
-        let boxes = Box::new(PlaneBoxes {
-            _y: y_boxed,
-            _uv: uv_boxed,
-        });
-        let boxes_raw = Box::into_raw(boxes) as *mut c_void;
-
-        unsafe extern "C" fn release_planes(
-            _release_ref_con: *mut c_void,
-            data_ptr: *const c_void,
-        ) {
-            // data_ptr is the opaque context we passed; we passed boxes_raw as release_ref_con.
-            let _ = data_ptr;
-        }
-
-        let mut pixel_buf: sys::CVPixelBufferRef = std::ptr::null_mut();
-        let ret = unsafe {
-            (vt.cv_pb_create_planar)(
-                std::ptr::null_mut(),
-                width,
-                height,
-                K_CV_PIXEL_FORMAT_NV12,
-                std::ptr::null_mut(), // dataPtr (base of all planes combined, can be NULL)
-                0,                    // dataSize
-                2,
-                plane_ptrs.as_mut_ptr(),
-                plane_widths.as_ptr(),
-                plane_heights.as_ptr(),
-                plane_bpr.as_ptr(),
-                Some(release_planes),
-                boxes_raw,
-                std::ptr::null_mut(),
-                &mut pixel_buf,
-            )
-        };
-
-        if ret != 0 {
-            // Free the boxes ourselves since the callback won't be called.
-            let _ = unsafe { Box::from_raw(boxes_raw as *mut PlaneBoxes) };
-            return Err(vt_error("CVPixelBufferCreateWithPlanarBytes", ret));
-        }
-
-        Ok(pixel_buf)
+        i420_to_nv12_pixel_buffer(vt, frame, self.width, self.height)
     }
+}
+
+/// Number of NV12 plane-copy allocations currently owned by outstanding
+/// `CVPixelBuffer`s (created below, freed by the release callback).
+/// Every submitted frame must eventually return to zero — the
+/// `plane_boxes_released` test pins that the release callback actually
+/// fires and frees.
+pub(crate) static LIVE_PLANE_BOXES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Heap-owned NV12 plane copies backing a `CVPixelBuffer`; freed by
+/// `release_planes` when CoreVideo destroys the buffer.
+struct PlaneBoxes {
+    _y: Box<[u8]>,
+    _uv: Box<[u8]>,
+}
+
+impl PlaneBoxes {
+    fn new(y: Box<[u8]>, uv: Box<[u8]>) -> Self {
+        LIVE_PLANE_BOXES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { _y: y, _uv: uv }
+    }
+}
+
+impl Drop for PlaneBoxes {
+    fn drop(&mut self) {
+        LIVE_PLANE_BOXES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `CVPixelBufferReleasePlanarBytesCallback` — invoked by CoreVideo when
+/// the pixel buffer is destroyed. Reclaims the `PlaneBoxes` allocation
+/// passed as `release_ref_con`. The signature matches the five-parameter
+/// planar-bytes callback prototype in `CVPixelBuffer.h` (an earlier
+/// revision used the two-parameter non-planar shape *and* never freed
+/// the refcon, leaking the full NV12 frame copy on every encoded frame).
+unsafe extern "C" fn release_planes(
+    release_ref_con: *mut c_void,
+    _data_ptr: *const c_void,
+    _data_size: usize,
+    _number_of_planes: usize,
+    _plane_addresses: *const *const c_void,
+) {
+    if !release_ref_con.is_null() {
+        // SAFETY: `release_ref_con` is the `Box::into_raw(PlaneBoxes)`
+        // this module handed to `CVPixelBufferCreateWithPlanarBytes`;
+        // CoreVideo invokes the release callback exactly once.
+        let _ = unsafe { Box::from_raw(release_ref_con as *mut PlaneBoxes) };
+    }
+}
+
+/// Convert an I420 `VideoFrame` → biplanar NV12 `CVPixelBuffer`
+/// (`'420v'`), the layout VT's hardware encoders prefer. Shared by the
+/// H.264 / HEVC path here and the MJPEG / ProRes path in `blob.rs`.
+///
+/// The NV12 copy is heap-owned (`PlaneBoxes`) and handed to CoreVideo
+/// with a release callback; it is freed when the last reference to the
+/// pixel buffer goes away.
+pub(crate) fn i420_to_nv12_pixel_buffer(
+    vt: &sys::Vtable,
+    frame: &oxideav_core::VideoFrame,
+    width: usize,
+    height: usize,
+) -> Result<sys::CVPixelBufferRef> {
+    if frame.planes.len() < 3 {
+        return Err(Error::invalid("expected I420 frame with 3 planes"));
+    }
+
+    let y_plane = &frame.planes[0];
+    let u_plane = &frame.planes[1];
+    let v_plane = &frame.planes[2];
+
+    let chroma_w = width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+
+    // Build NV12: Y plane + interleaved UV.
+    let y_len = width * height;
+    let uv_len = chroma_w * 2 * chroma_h;
+
+    let mut y_data: Vec<u8> = vec![0u8; y_len];
+    let mut uv_data: Vec<u8> = vec![0u8; uv_len];
+
+    // Copy Y (possibly re-stride to `width`).
+    let y_rows = y_plane
+        .data
+        .len()
+        .checked_div(y_plane.stride)
+        .map(|r| height.min(r))
+        .unwrap_or(0);
+    for row in 0..y_rows {
+        let src_start = row * y_plane.stride;
+        let dst_start = row * width;
+        let copy_len = width.min(y_plane.stride);
+        if src_start + copy_len <= y_plane.data.len() && dst_start + copy_len <= y_len {
+            y_data[dst_start..dst_start + copy_len]
+                .copy_from_slice(&y_plane.data[src_start..src_start + copy_len]);
+        }
+    }
+
+    // Interleave U + V → UV.
+    for row in 0..chroma_h {
+        let u_src = row * u_plane.stride;
+        let v_src = row * v_plane.stride;
+        let uv_dst = row * chroma_w * 2;
+        for col in 0..chroma_w {
+            let u_val = if u_src + col < u_plane.data.len() {
+                u_plane.data[u_src + col]
+            } else {
+                128
+            };
+            let v_val = if v_src + col < v_plane.data.len() {
+                v_plane.data[v_src + col]
+            } else {
+                128
+            };
+            uv_data[uv_dst + col * 2] = u_val;
+            uv_data[uv_dst + col * 2 + 1] = v_val;
+        }
+    }
+
+    let mut y_boxed = y_data.into_boxed_slice();
+    let mut uv_boxed = uv_data.into_boxed_slice();
+
+    let mut plane_ptrs: [*mut c_void; 2] = [
+        y_boxed.as_mut_ptr() as *mut c_void,
+        uv_boxed.as_mut_ptr() as *mut c_void,
+    ];
+    let plane_widths: [usize; 2] = [width, chroma_w];
+    let plane_heights: [usize; 2] = [height, chroma_h];
+    let plane_bpr: [usize; 2] = [width, chroma_w * 2];
+
+    let boxes_raw = Box::into_raw(Box::new(PlaneBoxes::new(y_boxed, uv_boxed))) as *mut c_void;
+
+    let mut pixel_buf: sys::CVPixelBufferRef = std::ptr::null_mut();
+    let ret = unsafe {
+        (vt.cv_pb_create_planar)(
+            std::ptr::null_mut(),
+            width,
+            height,
+            K_CV_PIXEL_FORMAT_NV12,
+            std::ptr::null_mut(), // dataPtr (base of all planes combined, can be NULL)
+            0,                    // dataSize
+            2,
+            plane_ptrs.as_mut_ptr(),
+            plane_widths.as_ptr(),
+            plane_heights.as_ptr(),
+            plane_bpr.as_ptr(),
+            Some(release_planes),
+            boxes_raw,
+            std::ptr::null_mut(),
+            &mut pixel_buf,
+        )
+    };
+
+    if ret != 0 {
+        // Free the boxes ourselves since the callback won't be called.
+        let _ = unsafe { Box::from_raw(boxes_raw as *mut PlaneBoxes) };
+        return Err(vt_error("CVPixelBufferCreateWithPlanarBytes", ret));
+    }
+
+    Ok(pixel_buf)
 }
 
 impl Drop for VtEncoder {
@@ -1306,6 +1354,67 @@ mod tests {
         resolve_expected_frame_rate, DataRateLimit,
     };
     use oxideav_core::{CodecId, CodecParameters, Rational};
+
+    /// The NV12 plane copies handed to `CVPixelBufferCreateWithPlanarBytes`
+    /// are freed when CoreVideo destroys the pixel buffer — i.e. the
+    /// five-parameter planar release callback actually fires and reclaims
+    /// the `PlaneBoxes` allocation. Before this test's commit the callback
+    /// was bound with the wrong (two-parameter) arity and freed nothing,
+    /// leaking the full NV12 frame copy on every encoded frame.
+    #[test]
+    fn plane_boxes_released() {
+        use super::LIVE_PLANE_BOXES;
+        use oxideav_core::{Frame, PixelFormat, VideoFrame, VideoPlane};
+        use std::sync::atomic::Ordering;
+
+        if crate::sys::vtable().is_err() {
+            eprintln!("oxideav-videotoolbox: framework unavailable, skipping plane-box test");
+            return;
+        }
+
+        let width = 64usize;
+        let height = 64usize;
+        let mut p = CodecParameters::video(CodecId::new("h264"));
+        p.width = Some(width as u32);
+        p.height = Some(height as u32);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+
+        let before = LIVE_PLANE_BOXES.load(Ordering::SeqCst);
+
+        let mut encoder = super::make_h264_encoder(&p).expect("encoder construction");
+        for i in 0..10i64 {
+            let chroma = width.div_ceil(2) * height.div_ceil(2);
+            let frame = VideoFrame {
+                pts: Some(i),
+                planes: vec![
+                    VideoPlane {
+                        stride: width,
+                        data: vec![(16 + i * 5) as u8; width * height],
+                    },
+                    VideoPlane {
+                        stride: width.div_ceil(2),
+                        data: vec![128u8; chroma],
+                    },
+                    VideoPlane {
+                        stride: width.div_ceil(2),
+                        data: vec![128u8; chroma],
+                    },
+                ],
+            };
+            encoder.send_frame(&Frame::Video(frame)).expect("send");
+            while encoder.receive_packet().is_ok() {}
+        }
+        encoder.flush().expect("flush");
+        drop(encoder);
+
+        // Every pixel buffer VT held has been released by session
+        // teardown; the release callback must have freed every plane box.
+        let after = LIVE_PLANE_BOXES.load(Ordering::SeqCst);
+        assert_eq!(
+            after, before,
+            "NV12 plane copies leaked: {before} live before, {after} after"
+        );
+    }
 
     /// `vt_error` classifies the "not available on this host" family as
     /// `Unsupported` (so the registry's software fallback retries), the

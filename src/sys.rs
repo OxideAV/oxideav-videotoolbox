@@ -360,6 +360,22 @@ pub type FnCVPixelBufferCreateWithBytes = unsafe extern "C" fn(
     pixel_buffer_out: *mut CVPixelBufferRef,
 ) -> CVReturn;
 
+/// `CVPixelBufferReleasePlanarBytesCallback` per CoreVideo's
+/// `CVPixelBuffer.h`: **five** parameters —
+/// `(releaseRefCon, dataPtr, dataSize, numberOfPlanes, planeAddresses[])`.
+/// (The two-parameter shape belongs to the non-planar
+/// `CVPixelBufferReleaseBytesCallback` used by
+/// `CVPixelBufferCreateWithBytes`; an earlier revision of this binding
+/// used that arity for the planar variant, which the C calling
+/// convention tolerated but which hid the plane-address array.)
+pub type CVPixelBufferReleasePlanarBytesCallback = unsafe extern "C" fn(
+    release_ref_con: *mut c_void,
+    data_ptr: *const c_void,
+    data_size: usize,
+    number_of_planes: usize,
+    plane_addresses: *const *const c_void,
+);
+
 pub type FnCVPixelBufferCreateWithPlanarBytes = unsafe extern "C" fn(
     allocator: CFAllocatorRef,
     width: usize,
@@ -372,7 +388,7 @@ pub type FnCVPixelBufferCreateWithPlanarBytes = unsafe extern "C" fn(
     plane_width: *const usize,
     plane_height: *const usize,
     plane_bytes_per_row: *const usize,
-    release_callback: Option<unsafe extern "C" fn(*mut c_void, *const c_void)>,
+    release_callback: Option<CVPixelBufferReleasePlanarBytesCallback>,
     release_ref_con: *mut c_void,
     pixel_buffer_attributes: CFDictionaryRef,
     pixel_buffer_out: *mut CVPixelBufferRef,
