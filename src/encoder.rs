@@ -1368,8 +1368,8 @@ impl oxideav_core::Encoder for VtEncoder {
             .state
             .lock()
             .map_err(|_| Error::other("lock poisoned"))?;
-        if let Some(ref e) = guard.error {
-            return Err(Error::other(e.clone()));
+        if let Some(e) = guard.error.take() {
+            return Err(Error::other(e));
         }
         while let Some((data, keyframe)) = guard.packets.pop_front() {
             let mut pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data)

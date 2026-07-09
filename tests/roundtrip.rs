@@ -478,6 +478,88 @@ fn hardware_mode_specifications() {
     }
 }
 
+/// A decoder survives a bad access unit: the error surfaces on (at
+/// most) the offending `send_packet` / the one after it, and the very
+/// same session then decodes subsequent valid packets. Errors recorded
+/// by the async output callback are take-once — one corrupt frame must
+/// not latch the session into a permanent error state.
+#[test]
+fn decoder_recovers_after_bad_packet() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping recovery test");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+
+    let mut p = CodecParameters::video(CodecId::new("mjpeg"));
+    p.width = Some(width as u32);
+    p.height = Some(height as u32);
+    p.pixel_format = Some(PixelFormat::Yuv420P);
+
+    // Produce one valid JPEG access unit via the VT encoder.
+    let mut encoder = vt_blob::make_jpeg_encoder(&p).expect("encoder construction");
+    encoder
+        .send_frame(&Frame::Video(synthetic_frame(width, height, 0, 0)))
+        .expect("send_frame");
+    let mut valid = Vec::new();
+    while let Ok(pkt) = encoder.receive_packet() {
+        valid.push(pkt);
+    }
+    encoder.flush().expect("flush");
+    while let Ok(pkt) = encoder.receive_packet() {
+        valid.push(pkt);
+    }
+    assert!(!valid.is_empty(), "no valid packet produced");
+
+    let mut decoder = vt_blob::make_jpeg_decoder(&p).expect("decoder construction");
+
+    // Feed garbage. The error may surface synchronously here or (via
+    // the async callback) on the next send — both are acceptable; a
+    // crash or a *permanently* latched error is not.
+    let garbage = oxideav_core::Packet::new(
+        0,
+        oxideav_core::TimeBase::new(1, 1_000_000),
+        vec![0xDE; 4096],
+    );
+    let _ = decoder.send_packet(&garbage);
+
+    // The same session must now decode valid data. Allow one extra
+    // attempt in case the garbage error was reported asynchronously and
+    // surfaces on the first valid send.
+    let mut frames = 0usize;
+    for attempt in 0..2 {
+        match decoder.send_packet(&valid[0]) {
+            Ok(()) => {}
+            Err(e) if attempt == 0 => {
+                println!("first valid send surfaced deferred error (ok): {e}");
+                continue;
+            }
+            Err(e) => panic!("decoder did not recover after bad packet: {e}"),
+        }
+        loop {
+            match decoder.receive_frame() {
+                Ok(_) => frames += 1,
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_frame error after recovery: {e}"),
+            }
+        }
+        if frames > 0 {
+            break;
+        }
+    }
+    let _ = decoder.flush();
+    while decoder.receive_frame().is_ok() {
+        frames += 1;
+    }
+    assert!(
+        frames > 0,
+        "decoder produced no frames from valid data after a bad packet"
+    );
+    println!("recovered: {frames} frame(s) decoded after garbage packet");
+}
+
 /// Session teardown is invalidate-then-CFRelease per the framework
 /// headers. This stress loop creates, uses, and drops many encoder +
 /// decoder sessions back to back; an over-release (double CFRelease) or

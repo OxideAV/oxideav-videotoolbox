@@ -2055,12 +2055,16 @@ impl Decoder for BlobDecoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         self.flushed = false;
 
-        // Bubble up any error the callback recorded.
+        // Surface (and clear) any error the async callback recorded since
+        // the last call. `take()` keeps one bad frame from latching the
+        // session into a permanent error state — VT decode errors are
+        // per-frame, and the session remains usable for the next access
+        // unit.
         if let Some(e) = self
             .state
             .lock()
             .ok()
-            .and_then(|g| g.error.as_ref().map(|s| Error::other(s.clone())))
+            .and_then(|mut g| g.error.take().map(Error::other))
         {
             return Err(e);
         }
@@ -2576,8 +2580,8 @@ impl Encoder for BlobEncoder {
             .state
             .lock()
             .map_err(|_| Error::other("lock poisoned"))?;
-        if let Some(ref e) = guard.error {
-            return Err(Error::other(e.clone()));
+        if let Some(e) = guard.error.take() {
+            return Err(Error::other(e));
         }
         while let Some(data) = guard.packets.pop_front() {
             // MJPEG and ProRes (the only codecs behind BlobEncoder) are

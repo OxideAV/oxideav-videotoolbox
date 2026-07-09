@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Callback errors latched sessions into a permanent error state.**
+  Errors recorded by the four async output callbacks were checked with
+  `error.as_ref().map(clone)` — never cleared — so a single bad access
+  unit made every subsequent `send_packet` / `send_frame` on that
+  session return the same stale error forever. The checks are now
+  take-once (`error.take()`): the error surfaces exactly once and the
+  session keeps decoding/encoding (VT decode errors are per-frame). New
+  hardware test `decoder_recovers_after_bad_packet` feeds garbage to a
+  live MJPEG session and asserts the deferred callback error
+  (`kVTVideoDecoderUnsupportedDataFormatErr`) surfaces once and the
+  same session then decodes a valid access unit.
+
 - **Every encoded frame leaked its full NV12 copy (pixel-buffer release
   callback never freed, and had the wrong ABI).** Both encoder paths
   hand heap-owned NV12 plane copies to

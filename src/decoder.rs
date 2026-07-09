@@ -568,11 +568,16 @@ impl oxideav_core::Decoder for H264VtDecoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         self.flushed = false;
 
+        // Surface (and clear) any error the async callback recorded since
+        // the last call. `take()` keeps one bad frame from latching the
+        // session into a permanent error state — VT decode errors are
+        // per-frame, and the session remains usable for the next access
+        // unit.
         if let Some(e) = self
             .state
             .lock()
             .ok()
-            .and_then(|g| g.error.as_ref().map(|s| Error::other(s.clone())))
+            .and_then(|mut g| g.error.take().map(Error::other))
         {
             return Err(e);
         }
@@ -766,11 +771,16 @@ impl oxideav_core::Decoder for HevcVtDecoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         self.flushed = false;
 
+        // Surface (and clear) any error the async callback recorded since
+        // the last call. `take()` keeps one bad frame from latching the
+        // session into a permanent error state — VT decode errors are
+        // per-frame, and the session remains usable for the next access
+        // unit.
         if let Some(e) = self
             .state
             .lock()
             .ok()
-            .and_then(|g| g.error.as_ref().map(|s| Error::other(s.clone())))
+            .and_then(|mut g| g.error.take().map(Error::other))
         {
             return Err(e);
         }
