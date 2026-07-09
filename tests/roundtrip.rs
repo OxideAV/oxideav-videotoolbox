@@ -445,6 +445,92 @@ fn mjpeg_pts_survival() {
     run_pts_survival("mjpeg");
 }
 
+/// Encoder output packets carry stream metadata: the keyframe flag
+/// (derived from the access unit's VCL NAL types for H.264/HEVC;
+/// unconditional for the intra-only MJPEG/ProRes), a DTS mirroring the
+/// PTS (frame reordering is disabled at session-create time), and a
+/// duration derived from the caller's frame rate.
+#[test]
+fn encoder_packets_carry_metadata() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping packet-metadata test");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+    let n_frames = 6usize;
+
+    for codec in ["h264", "mjpeg"] {
+        let mut p = CodecParameters::video(CodecId::new(codec));
+        p.width = Some(width as u32);
+        p.height = Some(height as u32);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+        p.frame_rate = Some(oxideav_core::Rational::new(30, 1));
+
+        let mut encoder: Box<dyn Encoder> = match codec {
+            "h264" => vt_encoder::make_h264_encoder(&p).expect("encoder construction"),
+            "mjpeg" => vt_blob::make_jpeg_encoder(&p).expect("encoder construction"),
+            _ => unreachable!(),
+        };
+
+        let mut packets = Vec::new();
+        for i in 0..n_frames {
+            let frame = synthetic_frame(width, height, i as u8, (i as i64) * 33_333);
+            encoder
+                .send_frame(&Frame::Video(frame))
+                .expect("send_frame");
+            loop {
+                match encoder.receive_packet() {
+                    Ok(pkt) => packets.push(pkt),
+                    Err(Error::NeedMore) => break,
+                    Err(e) => panic!("receive_packet error: {e}"),
+                }
+            }
+        }
+        encoder.flush().expect("encoder flush");
+        loop {
+            match encoder.receive_packet() {
+                Ok(pkt) => packets.push(pkt),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet (flush) error: {e}"),
+            }
+        }
+        assert!(!packets.is_empty(), "{codec}: no packets");
+
+        // The stream must open on a random-access point.
+        assert!(
+            packets[0].flags.keyframe,
+            "{codec}: first packet is not flagged as a keyframe"
+        );
+        for (i, pkt) in packets.iter().enumerate() {
+            // Reordering disabled → DTS mirrors PTS on every timed packet.
+            assert_eq!(
+                pkt.dts, pkt.pts,
+                "{codec} packet {i}: dts must mirror pts (no reordering)"
+            );
+            // 30 fps → 33 333 µs in the packets' 1/1_000_000 time base.
+            assert_eq!(
+                pkt.duration,
+                Some(33_333),
+                "{codec} packet {i}: duration not derived from frame rate"
+            );
+        }
+        if codec == "mjpeg" {
+            // Intra-only codec: every access unit is a sync sample.
+            assert!(
+                packets.iter().all(|p| p.flags.keyframe),
+                "mjpeg: all packets must be keyframes"
+            );
+        }
+        println!(
+            "{codec} metadata: {} packets, keyframes = {:?}",
+            packets.len(),
+            packets.iter().map(|p| p.flags.keyframe).collect::<Vec<_>>()
+        );
+    }
+}
+
 /// Round 9 — verifies that the new encoder knobs land without
 /// disrupting decode quality:
 ///

@@ -115,6 +115,20 @@ pub(crate) fn resolve_expected_frame_rate(params: &CodecParameters) -> Option<f6
     None
 }
 
+/// Per-frame duration in microseconds (the encoder output packets'
+/// `TimeBase::new(1, 1_000_000)`), derived from the same frame-rate
+/// resolution as `resolve_expected_frame_rate`. `None` when the caller
+/// supplied no usable cadence.
+pub(crate) fn frame_duration_us(params: &CodecParameters) -> Option<i64> {
+    let fps = resolve_expected_frame_rate(params)?;
+    let dur = (1_000_000.0 / fps).round();
+    if dur.is_finite() && dur >= 1.0 && dur <= i64::MAX as f64 {
+        Some(dur as i64)
+    } else {
+        None
+    }
+}
+
 /// One hard-cap segment of `kVTCompressionPropertyKey_DataRateLimits`.
 /// Per `VideoToolbox/VTCompressionProperties.h`, "each hard limit is
 /// described by a data size in bytes and a duration in seconds, and
@@ -441,7 +455,10 @@ const K_CV_PIXEL_FORMAT_NV12: u32 = 0x34323076;
 // ─────────────────────────── Callback state ───────────────────────────────────
 
 struct EncCallbackState {
-    packets: VecDeque<Vec<u8>>, // Annex-B encoded packets
+    /// `(annex_b_data, is_keyframe)` per encoded access unit. The
+    /// keyframe bit comes from the NAL-type scan in `extract_annex_b`
+    /// (IDR for H.264; IDR_W_RADL / IDR_N_LP / CRA for HEVC).
+    packets: VecDeque<(Vec<u8>, bool)>,
     error: Option<String>,
     is_hevc: bool,
 }
@@ -546,11 +563,16 @@ unsafe fn extract_hevc_param_sets(
 /// to Annex-B (start-code prefixed) for portability.
 /// If `is_hevc` and the format description contains parameter sets, they are
 /// prepended on every keyframe (IDR / CRA) packet.
+///
+/// Returns `(annex_b_data, is_keyframe)` — the keyframe bit is derived
+/// from the VCL NAL types in the access unit (IDR for H.264;
+/// IDR_W_RADL / IDR_N_LP / CRA for HEVC) and flows into the output
+/// `Packet`'s `flags.keyframe`.
 unsafe fn extract_annex_b(
     vt: &sys::Vtable,
     sample_buffer: sys::CMSampleBufferRef,
     is_hevc: bool,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     let block_buf = unsafe { (vt.cm_sample_get_data_buffer)(sample_buffer) };
     if block_buf.is_null() {
         return Err(Error::other("CMSampleBufferGetDataBuffer returned null"));
@@ -625,12 +647,12 @@ unsafe fn extract_annex_b(
             if !params.is_empty() {
                 let mut combined = params;
                 combined.extend_from_slice(&out);
-                return Ok(combined);
+                return Ok((combined, is_keyframe));
             }
         }
     }
 
-    Ok(out)
+    Ok((out, is_keyframe))
 }
 
 /// Extern-C callback — called by VT with each encoded sample buffer.
@@ -667,7 +689,7 @@ unsafe extern "C" fn comp_callback(
 
     let is_hevc = guard.is_hevc;
     match unsafe { extract_annex_b(vt, sample_buffer, is_hevc) } {
-        Ok(data) => guard.packets.push_back(data),
+        Ok(entry) => guard.packets.push_back(entry),
         Err(e) => guard.error = Some(e.to_string()),
     }
 }
@@ -683,6 +705,12 @@ pub struct VtEncoder {
     pts_counter: i64,
     width: usize,
     height: usize,
+    /// Per-frame duration in the output time base (µs), derived from the
+    /// caller's frame rate (`options["expected_frame_rate"]` or
+    /// `params.frame_rate`). `None` when no cadence is known — output
+    /// packets then carry `duration: None` and the CMTime duration falls
+    /// back to a nominal 1/30 s.
+    frame_duration_us: Option<i64>,
 }
 
 // SAFETY: VTCompressionSessionRef is thread-safe per Apple docs.
@@ -953,6 +981,7 @@ impl VtEncoder {
             pts_counter: 0,
             width,
             height,
+            frame_duration_us: frame_duration_us(params),
         }))
     }
 
@@ -1129,7 +1158,13 @@ impl oxideav_core::Encoder for VtEncoder {
         let pixel_buf = self.frame_to_pixel_buffer(vt, vf)?;
 
         let pts_time = CMTime::make(pts, 1_000_000);
-        let dur_time = CMTime::make(1, 30); // 30 fps default
+        // Frame duration from the caller's cadence; nominal 1/30 s when
+        // no frame rate is known (the value is a rate-control hint, not
+        // part of the bitstream).
+        let dur_time = match self.frame_duration_us {
+            Some(us) => CMTime::make(us, 1_000_000),
+            None => CMTime::make(1, 30),
+        };
 
         let status = unsafe {
             (vt.vt_comp_encode)(
@@ -1161,7 +1196,9 @@ impl oxideav_core::Encoder for VtEncoder {
             )));
         }
 
-        // Drain newly produced packets.
+        // Drain newly produced packets. Frame reordering is disabled at
+        // session-create time, so decode order equals presentation order
+        // and DTS mirrors PTS.
         let mut guard = self
             .state
             .lock()
@@ -1169,8 +1206,14 @@ impl oxideav_core::Encoder for VtEncoder {
         if let Some(ref e) = guard.error {
             return Err(Error::other(e.clone()));
         }
-        while let Some(data) = guard.packets.pop_front() {
-            let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data).with_pts(pts);
+        while let Some((data, keyframe)) = guard.packets.pop_front() {
+            let mut pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data)
+                .with_pts(pts)
+                .with_dts(pts)
+                .with_keyframe(keyframe);
+            if let Some(dur) = self.frame_duration_us {
+                pkt = pkt.with_duration(dur);
+            }
             self.output_queue.push_back(pkt);
         }
 
@@ -1199,8 +1242,11 @@ impl oxideav_core::Encoder for VtEncoder {
             .state
             .lock()
             .map_err(|_| Error::other("lock poisoned"))?;
-        while let Some(data) = guard.packets.pop_front() {
-            let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data);
+        while let Some((data, keyframe)) = guard.packets.pop_front() {
+            let mut pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data).with_keyframe(keyframe);
+            if let Some(dur) = self.frame_duration_us {
+                pkt = pkt.with_duration(dur);
+            }
             self.output_queue.push_back(pkt);
         }
         Ok(())
@@ -1220,11 +1266,38 @@ pub fn make_hevc_encoder(params: &CodecParameters) -> Result<Box<dyn oxideav_cor
 #[cfg(test)]
 mod tests {
     use super::{
-        h264_profile_string, hevc_profile_string, parse_constant_bit_rate, parse_data_rate_limits,
-        parse_keyframe_interval, parse_keyframe_interval_duration, resolve_expected_frame_rate,
-        DataRateLimit,
+        frame_duration_us, h264_profile_string, hevc_profile_string, parse_constant_bit_rate,
+        parse_data_rate_limits, parse_keyframe_interval, parse_keyframe_interval_duration,
+        resolve_expected_frame_rate, DataRateLimit,
     };
     use oxideav_core::{CodecId, CodecParameters, Rational};
+
+    /// `frame_duration_us` derives the per-frame duration (µs) from the
+    /// same cadence resolution as `resolve_expected_frame_rate` and
+    /// returns `None` when no usable frame rate exists.
+    #[test]
+    fn frame_duration_from_cadence() {
+        let mut p = CodecParameters::video(CodecId::new("h264"));
+        assert_eq!(frame_duration_us(&p), None);
+
+        p.frame_rate = Some(Rational::new(30, 1));
+        assert_eq!(frame_duration_us(&p), Some(33_333));
+
+        p.frame_rate = Some(Rational::new(30000, 1001));
+        assert_eq!(frame_duration_us(&p), Some(33_367)); // 1e6*1001/30000 rounded
+
+        // Explicit option overrides the Rational.
+        p.options
+            .insert("expected_frame_rate".to_string(), "50".to_string());
+        assert_eq!(frame_duration_us(&p), Some(20_000));
+
+        // Degenerate cadences yield None (no duration claim).
+        p.options = oxideav_core::CodecOptions::new();
+        p.frame_rate = Some(Rational::new(0, 1));
+        assert_eq!(frame_duration_us(&p), None);
+        p.frame_rate = Some(Rational::new(30, 0));
+        assert_eq!(frame_duration_us(&p), None);
+    }
 
     /// `h264_profile_string` accepts the documented short aliases
     /// case-insensitively and maps each to the canonical

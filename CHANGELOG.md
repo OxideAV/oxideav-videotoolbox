@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Encoder output packets carry stream metadata.** All four VT
+  encoders (H.264 / HEVC in `encoder.rs`, MJPEG / ProRes in `blob.rs`)
+  now populate:
+  - `flags.keyframe` — for H.264/HEVC from the access unit's VCL NAL
+    types (IDR; IDR_W_RADL / IDR_N_LP / CRA), which `extract_annex_b`
+    already computed but previously discarded; unconditionally `true`
+    for the intra-only MJPEG / ProRes.
+  - `dts` — mirrors `pts` (frame reordering is disabled at
+    session-create time, so decode order equals presentation order).
+  - `duration` — derived from the caller's frame rate
+    (`options["expected_frame_rate"]` or `params.frame_rate`) via a new
+    shared `frame_duration_us` helper; the same value now replaces the
+    hard-coded 1/30 s `CMTime` duration submitted with each frame.
+  New hardware test `encoder_packets_carry_metadata` pins first-packet
+  keyframe, `dts == pts`, and the 33 333 µs duration at 30 fps for both
+  encoder paths; `frame_duration_from_cadence` unit-tests the helper.
+
 ### Fixed
 
 - **Session teardown leaked every session object (and both encoders

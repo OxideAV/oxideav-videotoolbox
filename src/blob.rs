@@ -29,7 +29,7 @@ use oxideav_core::{
 };
 
 use crate::encoder::{
-    parse_constant_bit_rate, parse_data_rate_limits, parse_keyframe_interval,
+    frame_duration_us, parse_constant_bit_rate, parse_data_rate_limits, parse_keyframe_interval,
     parse_keyframe_interval_duration, resolve_expected_frame_rate,
 };
 use crate::sys::{
@@ -2230,6 +2230,9 @@ pub struct BlobEncoder {
     pts_counter: i64,
     width: usize,
     height: usize,
+    /// Per-frame duration in the output time base (µs), derived from the
+    /// caller's frame rate. `None` when no cadence is known.
+    frame_duration_us: Option<i64>,
 }
 
 // SAFETY: VTCompressionSessionRef is documented thread-safe.
@@ -2440,6 +2443,7 @@ impl BlobEncoder {
             pts_counter: 0,
             width,
             height,
+            frame_duration_us: frame_duration_us(params),
         }))
     }
 
@@ -2608,7 +2612,12 @@ impl Encoder for BlobEncoder {
         let pixel_buf = self.frame_to_pixel_buffer(vt, vf)?;
 
         let pts_time = CMTime::make(pts, 1_000_000);
-        let dur_time = CMTime::make(1, 30);
+        // Frame duration from the caller's cadence; nominal 1/30 s when
+        // no frame rate is known.
+        let dur_time = match self.frame_duration_us {
+            Some(us) => CMTime::make(us, 1_000_000),
+            None => CMTime::make(1, 30),
+        };
 
         let status = unsafe {
             (vt.vt_comp_encode)(
@@ -2644,7 +2653,16 @@ impl Encoder for BlobEncoder {
             return Err(Error::other(e.clone()));
         }
         while let Some(data) = guard.packets.pop_front() {
-            let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data).with_pts(pts);
+            // MJPEG and ProRes (the only codecs behind BlobEncoder) are
+            // intra-only: every access unit is a sync sample, so every
+            // packet is a keyframe and DTS mirrors PTS.
+            let mut pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data)
+                .with_pts(pts)
+                .with_dts(pts)
+                .with_keyframe(true);
+            if let Some(dur) = self.frame_duration_us {
+                pkt = pkt.with_duration(dur);
+            }
             self.output_queue.push_back(pkt);
         }
         Ok(())
@@ -2673,7 +2691,10 @@ impl Encoder for BlobEncoder {
             .lock()
             .map_err(|_| Error::other("lock poisoned"))?;
         while let Some(data) = guard.packets.pop_front() {
-            let pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data);
+            let mut pkt = Packet::new(0, TimeBase::new(1, 1_000_000), data).with_keyframe(true);
+            if let Some(dur) = self.frame_duration_us {
+                pkt = pkt.with_duration(dur);
+            }
             self.output_queue.push_back(pkt);
         }
         Ok(())
