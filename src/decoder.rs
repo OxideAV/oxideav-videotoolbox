@@ -21,7 +21,7 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
 };
 
-use crate::encoder::vt_error;
+use crate::encoder::{build_hw_spec_dict, parse_hardware_mode, vt_error, HardwareMode};
 
 use crate::sys::{
     self, CMSampleTimingInfo, CMTime, K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE,
@@ -240,10 +240,16 @@ unsafe extern "C" fn decomp_callback(
 /// Caller must call `cf_release` on the returned `fmt_desc` when done — but the
 /// session itself retains it, so the caller must retain it separately if they
 /// want to keep using it after releasing.
+///
+/// `hw_mode` (from `options["hardware"]`) selects the optional
+/// video-decoder-specification dictionary
+/// (`kVTVideoDecoderSpecification_{Require,Enable}HardwareAcceleratedVideoDecoder`
+/// per `VTDecompressionProperties.h`); `None` keeps VT's default policy.
 fn create_vt_session(
     vt: &sys::Vtable,
     fmt_desc: sys::CMVideoFormatDescriptionRef,
     state: &Arc<Mutex<CallbackState>>,
+    hw_mode: Option<HardwareMode>,
 ) -> Result<sys::VTDecompressionSessionRef> {
     let pixel_fmt_val = K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE as i32;
     let pixel_fmt_num = unsafe { sys::cf_number_i32(vt, pixel_fmt_val) };
@@ -269,18 +275,26 @@ fn create_vt_session(
         decomp_output_ref_con: state_raw,
     };
 
+    let hw_spec = match hw_mode {
+        Some(mode) => unsafe { build_hw_spec_dict(vt, mode, false) },
+        None => std::ptr::null_mut(),
+    };
+
     let mut session = std::ptr::null_mut();
     let status = unsafe {
         (vt.vt_decomp_create)(
             std::ptr::null_mut(),
             fmt_desc,
-            std::ptr::null_mut(),
+            hw_spec,
             dest_attrs,
             &record,
             &mut session,
         )
     };
 
+    if !hw_spec.is_null() {
+        unsafe { (vt.cf_release)(hw_spec) };
+    }
     unsafe { (vt.cf_release)(dest_attrs) };
     unsafe { (vt.cf_release)(pixel_fmt_num) };
     unsafe { (vt.cf_release)(pf_key) };
@@ -439,6 +453,8 @@ pub struct H264VtDecoder {
     output_queue: VecDeque<VideoFrame>,
     pts_counter: i64,
     flushed: bool,
+    /// Hardware-acceleration policy from `options["hardware"]`.
+    hw_mode: Option<HardwareMode>,
 }
 
 unsafe impl Send for H264VtDecoder {}
@@ -446,7 +462,6 @@ unsafe impl Send for H264VtDecoder {}
 impl H264VtDecoder {
     pub fn make(params: &CodecParameters) -> Result<Box<dyn oxideav_core::Decoder>> {
         sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
-        let _ = params;
         Ok(Box::new(H264VtDecoder {
             codec_id: CodecId::new("h264"),
             session: std::ptr::null_mut(),
@@ -457,6 +472,7 @@ impl H264VtDecoder {
             output_queue: VecDeque::new(),
             pts_counter: 0,
             flushed: false,
+            hw_mode: params.options.get("hardware").and_then(parse_hardware_mode),
         }))
     }
 
@@ -501,7 +517,7 @@ impl H264VtDecoder {
             ));
         }
 
-        let session = create_vt_session(vt, fmt_desc, &self.state)?;
+        let session = create_vt_session(vt, fmt_desc, &self.state, self.hw_mode)?;
 
         // Retain fmt_desc for our own use (the session also retains it).
         unsafe { (vt.cf_retain)(fmt_desc) };
@@ -637,6 +653,8 @@ pub struct HevcVtDecoder {
     output_queue: VecDeque<VideoFrame>,
     pts_counter: i64,
     flushed: bool,
+    /// Hardware-acceleration policy from `options["hardware"]`.
+    hw_mode: Option<HardwareMode>,
 }
 
 unsafe impl Send for HevcVtDecoder {}
@@ -644,7 +662,6 @@ unsafe impl Send for HevcVtDecoder {}
 impl HevcVtDecoder {
     pub fn make(params: &CodecParameters) -> Result<Box<dyn oxideav_core::Decoder>> {
         sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
-        let _ = params;
         Ok(Box::new(HevcVtDecoder {
             codec_id: CodecId::new("hevc"),
             session: std::ptr::null_mut(),
@@ -656,6 +673,7 @@ impl HevcVtDecoder {
             output_queue: VecDeque::new(),
             pts_counter: 0,
             flushed: false,
+            hw_mode: params.options.get("hardware").and_then(parse_hardware_mode),
         }))
     }
 
@@ -703,7 +721,7 @@ impl HevcVtDecoder {
             ));
         }
 
-        let session = create_vt_session(vt, fmt_desc, &self.state)?;
+        let session = create_vt_session(vt, fmt_desc, &self.state, self.hw_mode)?;
 
         unsafe { (vt.cf_retain)(fmt_desc) };
         self.session = session;

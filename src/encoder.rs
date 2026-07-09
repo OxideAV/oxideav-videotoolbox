@@ -115,6 +115,78 @@ pub(crate) fn resolve_expected_frame_rate(params: &CodecParameters) -> Option<f6
     None
 }
 
+/// Hardware-acceleration policy for a VT session, from
+/// `options["hardware"]`. Maps onto the CFBoolean session-specification
+/// keys VideoToolbox declares in `VTCompressionProperties.h` /
+/// `VTDecompressionProperties.h`:
+///
+/// * `Require` — `kVT*Specification_RequireHardwareAccelerated*` =
+///   true: hardware only; session creation fails (typically
+///   `kVTCouldNotFindVideo{De,En}coderErr`) when the machine lacks the
+///   hardware, the format isn't hardware-supported, or the hardware
+///   resource is busy. The typed error surfaces as
+///   `Error::Unsupported`, so a registry consumer can retry software.
+/// * `Enable` — `kVT*Specification_EnableHardwareAccelerated*` = true:
+///   prefer hardware, allow fallback (VT's documented default; useful
+///   to state explicitly).
+/// * `Disable` — the same Enable key set to false: force VT's internal
+///   software codec (distinct from the registry's pure-Rust fallback).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HardwareMode {
+    Require,
+    Enable,
+    Disable,
+}
+
+/// Parse `options["hardware"]`. Unknown / empty input returns `None`
+/// (no specification dictionary — VT default behaviour).
+pub(crate) fn parse_hardware_mode(opt: &str) -> Option<HardwareMode> {
+    match opt.trim().to_ascii_lowercase().as_str() {
+        "require" | "required" => Some(HardwareMode::Require),
+        "enable" | "enabled" | "allow" => Some(HardwareMode::Enable),
+        "disable" | "disabled" | "software" | "sw" => Some(HardwareMode::Disable),
+        _ => None,
+    }
+}
+
+/// Build the encoder/decoder specification dictionary for a hardware
+/// mode. `for_encoder` picks between the compression-session and
+/// decompression-session key families.
+///
+/// # Safety
+/// Caller must `cf_release` the returned dictionary when done (VT copies
+/// it at session-create time).
+pub(crate) unsafe fn build_hw_spec_dict(
+    vt: &sys::Vtable,
+    mode: HardwareMode,
+    for_encoder: bool,
+) -> sys::CFDictionaryRef {
+    let (key_str, value) = match (mode, for_encoder) {
+        (HardwareMode::Require, true) => {
+            ("RequireHardwareAcceleratedVideoEncoder", vt.cf_boolean_true)
+        }
+        (HardwareMode::Enable, true) => {
+            ("EnableHardwareAcceleratedVideoEncoder", vt.cf_boolean_true)
+        }
+        (HardwareMode::Disable, true) => {
+            ("EnableHardwareAcceleratedVideoEncoder", vt.cf_boolean_false)
+        }
+        (HardwareMode::Require, false) => {
+            ("RequireHardwareAcceleratedVideoDecoder", vt.cf_boolean_true)
+        }
+        (HardwareMode::Enable, false) => {
+            ("EnableHardwareAcceleratedVideoDecoder", vt.cf_boolean_true)
+        }
+        (HardwareMode::Disable, false) => {
+            ("EnableHardwareAcceleratedVideoDecoder", vt.cf_boolean_false)
+        }
+    };
+    let key = unsafe { sys::cf_string(vt, key_str) };
+    let dict = unsafe { sys::cf_dict1(vt, key, value) };
+    unsafe { (vt.cf_release)(key) };
+    dict
+}
+
 /// Map a non-zero `OSStatus` from a VideoToolbox / CoreMedia / CoreVideo
 /// call into a typed `oxideav_core::Error`, with the symbolic header
 /// name (per `sys::describe_os_status`) in the message.
@@ -788,6 +860,14 @@ impl VtEncoder {
         let state = EncCallbackState::new(is_hevc);
         let state_raw = Arc::into_raw(Arc::clone(&state)) as *mut c_void;
 
+        // Optional encoder-specification dictionary from
+        // `options["hardware"]` (require / enable / disable hardware
+        // acceleration). NULL keeps VT's default policy.
+        let hw_spec = match params.options.get("hardware").and_then(parse_hardware_mode) {
+            Some(mode) => unsafe { build_hw_spec_dict(vt, mode, true) },
+            None => std::ptr::null_mut(),
+        };
+
         let mut session: sys::VTCompressionSessionRef = std::ptr::null_mut();
         let status = unsafe {
             (vt.vt_comp_create)(
@@ -795,7 +875,7 @@ impl VtEncoder {
                 width as i32,
                 height as i32,
                 codec_type,
-                std::ptr::null_mut(), // encoder specification
+                hw_spec,              // encoder specification
                 std::ptr::null_mut(), // source image buffer attributes
                 std::ptr::null_mut(), // compressed data allocator
                 comp_callback,
@@ -803,6 +883,9 @@ impl VtEncoder {
                 &mut session,
             )
         };
+        if !hw_spec.is_null() {
+            unsafe { (vt.cf_release)(hw_spec) };
+        }
 
         if status != K_OS_STATUS_NO_ERROR {
             // Reclaim the leaked Arc.
@@ -1354,6 +1437,22 @@ mod tests {
         resolve_expected_frame_rate, DataRateLimit,
     };
     use oxideav_core::{CodecId, CodecParameters, Rational};
+
+    /// `parse_hardware_mode` maps the documented aliases onto the three
+    /// session-specification policies and rejects unknown input.
+    #[test]
+    fn hardware_mode_parser() {
+        use super::{parse_hardware_mode, HardwareMode};
+        assert_eq!(parse_hardware_mode("require"), Some(HardwareMode::Require));
+        assert_eq!(parse_hardware_mode("REQUIRED"), Some(HardwareMode::Require));
+        assert_eq!(parse_hardware_mode(" enable "), Some(HardwareMode::Enable));
+        assert_eq!(parse_hardware_mode("allow"), Some(HardwareMode::Enable));
+        assert_eq!(parse_hardware_mode("disable"), Some(HardwareMode::Disable));
+        assert_eq!(parse_hardware_mode("software"), Some(HardwareMode::Disable));
+        assert_eq!(parse_hardware_mode("sw"), Some(HardwareMode::Disable));
+        assert_eq!(parse_hardware_mode(""), None);
+        assert_eq!(parse_hardware_mode("maybe"), None);
+    }
 
     /// The NV12 plane copies handed to `CVPixelBufferCreateWithPlanarBytes`
     /// are freed when CoreVideo destroys the pixel buffer — i.e. the

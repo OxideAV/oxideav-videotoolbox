@@ -541,6 +541,20 @@ pub struct Vtable {
     /// freshly-created array retains and releases its `CFNumberRef`
     /// elements correctly. Used by the `DataRateLimits` write path.
     pub cf_type_array_callbacks: *const c_void,
+    /// `kCFTypeDictionaryKeyCallBacks` / `kCFTypeDictionaryValueCallBacks`
+    /// — the exported `CFDictionary{Key,Value}CallBacks` singletons for
+    /// `CFType` keys/values. Passing these to `CFDictionaryCreate` makes
+    /// the dictionary hash and compare keys with `CFEqual` (so a
+    /// runtime-created `CFString` key matches the framework's own
+    /// constant) and retain/release entries correctly. Used by the
+    /// hardware-acceleration session-specification dictionaries.
+    pub cf_type_dict_key_callbacks: *const c_void,
+    pub cf_type_dict_value_callbacks: *const c_void,
+    /// `kCFBooleanTrue` / `kCFBooleanFalse` — the process-lifetime
+    /// `CFBoolean` singletons, loaded from the exported `CFBooleanRef`
+    /// data symbols. Never release these.
+    pub cf_boolean_true: CFTypeRef,
+    pub cf_boolean_false: CFTypeRef,
     pub cf_release: FnCFRelease,
     pub cf_retain: FnCFRetain,
     // Keep libraries alive
@@ -790,6 +804,39 @@ fn load_vtable() -> Result<Vtable, String> {
             // `Symbol<*const c_void>` derefs to the address the linker
             // stored — i.e. the address of the `CFArrayCallBacks` struct.
             *s
+        },
+        // Like `kCFTypeArrayCallBacks`, the dictionary callback symbols
+        // *are* the callback structs — pass the symbol address itself.
+        cf_type_dict_key_callbacks: {
+            let s: libloading::Symbol<*const c_void> = unsafe {
+                cf.get(b"kCFTypeDictionaryKeyCallBacks\0")
+                    .map_err(|e| format!("dlsym kCFTypeDictionaryKeyCallBacks: {e}"))?
+            };
+            *s
+        },
+        cf_type_dict_value_callbacks: {
+            let s: libloading::Symbol<*const c_void> = unsafe {
+                cf.get(b"kCFTypeDictionaryValueCallBacks\0")
+                    .map_err(|e| format!("dlsym kCFTypeDictionaryValueCallBacks: {e}"))?
+            };
+            *s
+        },
+        // `kCFBooleanTrue` / `kCFBooleanFalse` are exported *variables*
+        // of type `CFBooleanRef` — the symbol address is the location of
+        // the pointer, so one extra load yields the singleton itself.
+        cf_boolean_true: {
+            let s: libloading::Symbol<*const CFTypeRef> = unsafe {
+                cf.get(b"kCFBooleanTrue\0")
+                    .map_err(|e| format!("dlsym kCFBooleanTrue: {e}"))?
+            };
+            unsafe { *(*s) }
+        },
+        cf_boolean_false: {
+            let s: libloading::Symbol<*const CFTypeRef> = unsafe {
+                cf.get(b"kCFBooleanFalse\0")
+                    .map_err(|e| format!("dlsym kCFBooleanFalse: {e}"))?
+            };
+            unsafe { *(*s) }
         },
         cf_release: sym!(cf, "CFRelease", FnCFRelease),
         cf_retain: sym!(cf, "CFRetain", FnCFRetain),
@@ -1073,6 +1120,30 @@ pub unsafe fn cf_array(vt: &Vtable, elements: &[CFTypeRef]) -> CFArrayRef {
     }
 }
 
+/// Create a one-entry `CFDictionary` with the `CFType` key/value
+/// callbacks, so lookups compare keys with `CFEqual` (a runtime-created
+/// `CFString` key matches the framework's own constant) and the
+/// dictionary retains its key/value.
+///
+/// # Safety
+/// `key` and `value` must be valid CF objects. Caller must `cf_release`
+/// the returned dictionary when done (and still owns `key` / `value` —
+/// the dictionary takes its own retains).
+pub unsafe fn cf_dict1(vt: &Vtable, key: CFTypeRef, value: CFTypeRef) -> CFDictionaryRef {
+    let keys: [*const c_void; 1] = [key as *const c_void];
+    let vals: [*const c_void; 1] = [value as *const c_void];
+    unsafe {
+        (vt.cf_dict_create)(
+            std::ptr::null_mut(),
+            keys.as_ptr(),
+            vals.as_ptr(),
+            1,
+            vt.cf_type_dict_key_callbacks,
+            vt.cf_type_dict_value_callbacks,
+        )
+    }
+}
+
 /// Create an empty CFDictionary (no entries) via the vtable.
 ///
 /// # Safety
@@ -1196,6 +1267,22 @@ mod tests {
         assert_eq!(
             os_status_name(K_VT_VIDEO_ENCODER_NOT_AVAILABLE_NOW_ERR),
             Some("kVTVideoEncoderNotAvailableNowErr")
+        );
+    }
+
+    /// The CFBoolean singletons and CFType dictionary callbacks resolve
+    /// to distinct non-null process-lifetime pointers.
+    #[test]
+    fn cf_data_symbols_resolve() {
+        let vt = vtable().expect("vtable load");
+        assert!(!vt.cf_boolean_true.is_null());
+        assert!(!vt.cf_boolean_false.is_null());
+        assert_ne!(vt.cf_boolean_true, vt.cf_boolean_false);
+        assert!(!vt.cf_type_dict_key_callbacks.is_null());
+        assert!(!vt.cf_type_dict_value_callbacks.is_null());
+        assert_ne!(
+            vt.cf_type_dict_key_callbacks,
+            vt.cf_type_dict_value_callbacks
         );
     }
 

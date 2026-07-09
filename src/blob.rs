@@ -29,9 +29,9 @@ use oxideav_core::{
 };
 
 use crate::encoder::{
-    frame_duration_us, i420_to_nv12_pixel_buffer, parse_constant_bit_rate, parse_data_rate_limits,
-    parse_keyframe_interval, parse_keyframe_interval_duration, resolve_expected_frame_rate,
-    vt_error,
+    build_hw_spec_dict, frame_duration_us, i420_to_nv12_pixel_buffer, parse_constant_bit_rate,
+    parse_data_rate_limits, parse_hardware_mode, parse_keyframe_interval,
+    parse_keyframe_interval_duration, resolve_expected_frame_rate, vt_error, HardwareMode,
 };
 use crate::sys::{
     self, cf_number_i32, cf_string, CMSampleTimingInfo, CMTime,
@@ -1731,6 +1731,8 @@ pub struct BlobDecoder {
     output_queue: VecDeque<VideoFrame>,
     pts_counter: i64,
     flushed: bool,
+    /// Hardware-acceleration policy from `options["hardware"]`.
+    hw_mode: Option<HardwareMode>,
 }
 
 // SAFETY: VTDecompressionSession is documented thread-safe; we never share
@@ -1773,6 +1775,7 @@ impl BlobDecoder {
             output_queue: VecDeque::new(),
             pts_counter: 0,
             flushed: false,
+            hw_mode: params.options.get("hardware").and_then(parse_hardware_mode),
         }))
     }
 
@@ -1889,12 +1892,20 @@ impl BlobDecoder {
             decomp_output_ref_con: state_raw,
         };
 
+        // Optional decoder-specification dictionary from
+        // `options["hardware"]` (require / enable / disable hardware
+        // acceleration). NULL keeps VT's default policy.
+        let hw_spec = match self.hw_mode {
+            Some(mode) => unsafe { build_hw_spec_dict(vt, mode, false) },
+            None => std::ptr::null_mut(),
+        };
+
         let mut session = std::ptr::null_mut();
         let status = unsafe {
             (vt.vt_decomp_create)(
                 std::ptr::null_mut(),
                 fmt_desc,
-                std::ptr::null_mut(),
+                hw_spec,
                 dest_attrs,
                 &record,
                 &mut session,
@@ -1902,6 +1913,9 @@ impl BlobDecoder {
         };
 
         unsafe {
+            if !hw_spec.is_null() {
+                (vt.cf_release)(hw_spec);
+            }
             (vt.cf_release)(dest_attrs);
             (vt.cf_release)(pixel_fmt_num);
             (vt.cf_release)(pf_key);
@@ -2264,6 +2278,14 @@ impl BlobEncoder {
         let state = EncCallbackState::new();
         let state_raw = Arc::into_raw(Arc::clone(&state)) as *mut c_void;
 
+        // Optional encoder-specification dictionary from
+        // `options["hardware"]` (require / enable / disable hardware
+        // acceleration). NULL keeps VT's default policy.
+        let hw_spec = match params.options.get("hardware").and_then(parse_hardware_mode) {
+            Some(mode) => unsafe { build_hw_spec_dict(vt, mode, true) },
+            None => std::ptr::null_mut(),
+        };
+
         let mut session: sys::VTCompressionSessionRef = std::ptr::null_mut();
         let status = unsafe {
             (vt.vt_comp_create)(
@@ -2271,7 +2293,7 @@ impl BlobEncoder {
                 width as i32,
                 height as i32,
                 codec_type,
-                std::ptr::null_mut(),
+                hw_spec,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 enc_callback,
@@ -2279,6 +2301,9 @@ impl BlobEncoder {
                 &mut session,
             )
         };
+        if !hw_spec.is_null() {
+            unsafe { (vt.cf_release)(hw_spec) };
+        }
 
         if status != K_OS_STATUS_NO_ERROR {
             // Reclaim the leaked Arc.

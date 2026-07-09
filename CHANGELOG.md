@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hardware-acceleration policy knob** — `options["hardware"]` =
+  `require` / `enable` (aliases `allow`) / `disable` (aliases
+  `software`, `sw`) builds the VT session-specification dictionary for
+  all four encoders *and* all nine decoders:
+  `kVTVideoEncoderSpecification_{Require,Enable}HardwareAcceleratedVideoEncoder`
+  (per `VTCompressionProperties.h`) on the compression side and
+  `kVTVideoDecoderSpecification_{Require,Enable}HardwareAcceleratedVideoDecoder`
+  (per `VTDecompressionProperties.h`) on the decompression side.
+  `require` makes session creation fail (typed `Error::Unsupported`)
+  when the machine lacks the media engine, the format isn't
+  hardware-supported, or the hardware slot is busy — no silent
+  software fallback; `disable` forces VT's internal software codec
+  (distinct from the registry's pure-Rust fallback); absent keeps VT's
+  default. Plumbing: new `sys` vtable entries for the `kCFBooleanTrue` /
+  `kCFBooleanFalse` singletons and the
+  `kCFTypeDictionary{Key,Value}CallBacks` structs (so the
+  specification dictionary compares keys with `CFEqual`), a `cf_dict1`
+  helper, and a shared `HardwareMode` parser/builder. Hardware test
+  `hardware_mode_specifications` proves `enable` / `disable` round-trip
+  everywhere and that `require` either round-trips (media engine
+  present) or fails typed-`Unsupported`; on an M-series host all three
+  modes decode 4/4 frames.
+
 ### Fixed
 
 - **Every encoded frame leaked its full NV12 copy (pixel-buffer release

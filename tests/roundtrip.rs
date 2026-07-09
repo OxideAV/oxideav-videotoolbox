@@ -388,6 +388,96 @@ fn run_pts_survival(codec: &str) {
     );
 }
 
+/// `options["hardware"]` drives the VT session-specification keys
+/// (`kVTVideoEncoderSpecification_{Require,Enable}HardwareAcceleratedVideoEncoder`
+/// and the decoder-side equivalents):
+///
+/// * `enable` (VT's documented default, stated explicitly) and
+///   `disable` (force VT's internal software codec) must both yield a
+///   working H.264 encode → decode round trip everywhere.
+/// * `require` is host-dependent: on machines with the media engine the
+///   session comes up and the round trip must work; on hosts without it
+///   (VMs, older hardware) session creation must fail with the *typed*
+///   `Unsupported` error (per the header: "return an error if this
+///   isn't possible"), never a silent software fallback.
+#[test]
+fn hardware_mode_specifications() {
+    if oxideav_videotoolbox::sys::vtable().is_err() {
+        eprintln!("oxideav-videotoolbox: framework unavailable, skipping hardware-mode test");
+        return;
+    }
+
+    let width = 320usize;
+    let height = 240usize;
+
+    let make_params = |mode: &str| {
+        let mut p = CodecParameters::video(CodecId::new("h264"));
+        p.width = Some(width as u32);
+        p.height = Some(height as u32);
+        p.pixel_format = Some(PixelFormat::Yuv420P);
+        p.options.insert("hardware".to_string(), mode.to_string());
+        p
+    };
+
+    let run = |mode: &str| -> Result<usize, Error> {
+        let p = make_params(mode);
+        let mut encoder = vt_encoder::make_h264_encoder(&p)?;
+        let mut packets = Vec::new();
+        for i in 0..4usize {
+            let frame = synthetic_frame(width, height, i as u8, (i as i64) * 33_333);
+            encoder.send_frame(&Frame::Video(frame))?;
+            loop {
+                match encoder.receive_packet() {
+                    Ok(pkt) => packets.push(pkt),
+                    Err(Error::NeedMore) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        encoder.flush()?;
+        while let Ok(pkt) = encoder.receive_packet() {
+            packets.push(pkt);
+        }
+
+        let mut decoder = vt_decoder::H264VtDecoder::make(&p)?;
+        let mut frames = 0usize;
+        for pkt in &packets {
+            decoder.send_packet(pkt)?;
+            loop {
+                match decoder.receive_frame() {
+                    Ok(_) => frames += 1,
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        decoder.flush()?;
+        while decoder.receive_frame().is_ok() {
+            frames += 1;
+        }
+        Ok(frames)
+    };
+
+    // enable + disable must work on every host.
+    for mode in ["enable", "disable"] {
+        let frames = run(mode).unwrap_or_else(|e| panic!("hardware={mode} round trip failed: {e}"));
+        assert!(frames > 0, "hardware={mode}: no frames decoded");
+        println!("hardware={mode}: {frames} frames decoded");
+    }
+
+    // require is host-dependent, but the failure mode is contractual.
+    match run("require") {
+        Ok(frames) => {
+            assert!(frames > 0, "hardware=require: no frames decoded");
+            println!("hardware=require: {frames} frames decoded (hardware codec present)");
+        }
+        Err(Error::Unsupported(msg)) => {
+            println!("hardware=require: unavailable on this host ({msg})");
+        }
+        Err(e) => panic!("hardware=require: expected success or Unsupported, got: {e}"),
+    }
+}
+
 /// Session teardown is invalidate-then-CFRelease per the framework
 /// headers. This stress loop creates, uses, and drops many encoder +
 /// decoder sessions back to back; an over-release (double CFRelease) or
