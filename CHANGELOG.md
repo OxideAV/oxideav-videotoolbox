@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.3...v0.0.4) - 2026-09-01
+
+### Added
+
+- hardware-acceleration policy knob (require / enable / disable) for every session
+- OSStatus error taxonomy — symbolic names + typed classification
+- encoder packets carry keyframe flag, DTS, and frame-rate-derived duration
+- extend VideoToolbox bridge to iOS (`target_os = "macos"` → `any(macos, ios)`)
+
+### Fixed
+
+- *(test)* hardware=require failure status is host-dependent — accept any session-create error
+- callback errors no longer latch sessions into a permanent error state
+- NV12 frame-copy leak on every encoded frame + planar release-callback ABI
+- release session objects on Drop; reclaim leaked encoder callback Arc
+- decompression callback ABI — recover decoded-frame PTS (was always None)
+- unknown DTS must be kCMTimeInvalid (flags=0), not a 'valid' i64::MIN sentinel
+
+### Other
+
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+- README — error taxonomy, timestamps/packet metadata, hardware policy knob
+- drop unneeded mut on pts-survival drain closure (clippy)
+- add CI / crates.io / docs.rs / MIT-license badges
+- refresh to current status, drop per-round changelog cruft
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round 14: rate-control knobs DataRateLimits + ConstantBitRate
+- round 13: cadence-knob property writes (MaxKeyFrameInterval / MaxKeyFrameIntervalDuration / ExpectedFrameRate)
+- round 12: expand H.264 + HEVC profile-alias map; fix HEVC Main42210 output value
+- round 11: VVC (H.266) video decode via VideoToolbox (decode-only)
+- round 10: AV1 av1C extension-atom path
+- round 9: encoder knobs (bit_rate / quality / profile / ProRes tag) across all VT encoders
+
 ### Added
 
 - **Hardware-acceleration policy knob** — `options["hardware"]` =
