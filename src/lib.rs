@@ -120,6 +120,7 @@
 //! workspace's clean-room rule (no embedding third-party codec source)
 //! does not apply to bridging a system OS framework.
 
+#[doc(hidden)] // raw dylib-loading FFI bindings — internal plumbing, not supported API
 pub mod sys;
 
 #[cfg(feature = "registry")]
