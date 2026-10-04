@@ -15,7 +15,7 @@ This crate is a **thin runtime-loaded bridge** — no compile-time link dependen
 Two distinct failure paths fall back automatically to the pure-Rust codec:
 
 1. **Load failure** — older OS, missing framework, sandboxed environment without VT entitlements. `register()` logs and returns without registering, so the SW codec is the only candidate at dispatch. On macOS this surfaces if `Library::new("/System/Library/Frameworks/...")` cannot map the framework; on iOS the system dyld has link-loaded the four frameworks at process start, so the only path that fires this branch is a `Library::this()` failure (effectively impossible for a running process — Apple's runtime always provides the frameworks on every supported iOS version).
-2. **Init failure** — `VTDecompressionSessionCreate` / `VTCompressionSessionCreate` returns a non-zero `OSStatus` for the requested parameters. Common triggers: stream above the device's max resolution, hardware encoder slot already busy (concurrent-session cap), unsupported pixel format, codec profile the device doesn't accelerate. The factory returns `Err`; the registry's `make_decoder_with` / `make_encoder_with` retries the next-priority impl (typically the SW one). On iOS this also catches the platform-specific gaps Apple documents — e.g. AV1 encode requires A17+, ProRes encode requires iPhone 13 Pro+, some `kVTCompressionPropertyKey_*` keys are macOS-only and return `kVTPropertyNotSupportedErr` (treated as non-fatal by the property-write helper).
+2. **Init failure** — `VTDecompressionSessionCreate` / `VTCompressionSessionCreate` returns a non-zero `OSStatus` for the requested parameters. Common triggers: stream above the device's max resolution, hardware encoder slot already busy (concurrent-session cap), unsupported pixel format, codec profile the device doesn't accelerate. The factory returns `Err`; `oxideav_pipeline::make_decoder_with` / `make_encoder_with` (the selection layer the pipeline and CLI use) retries the next-priority impl (typically the SW one). On iOS this also catches the platform-specific gaps Apple documents — e.g. AV1 encode requires A17+, ProRes encode requires iPhone 13 Pro+, some `kVTCompressionPropertyKey_*` keys are macOS-only and return `kVTPropertyNotSupportedErr` (treated as non-fatal by the property-write helper).
 
 ## Error taxonomy
 
@@ -96,7 +96,7 @@ Hardware factories register with `CodecCapabilities::with_priority(10)` — **lo
 
 ## Opt-out
 
-Users who want to force the pure-Rust path globally can pass `--no-hwaccel` to the `oxideav` CLI; this sets `CodecPreferences { no_hardware: true }`, which the pipeline forwards to `make_decoder_with` / `make_encoder_with` so HW factories are skipped at dispatch time. The runtime context still registers VT — `oxideav list` shows the `*_videotoolbox` rows regardless of the flag — only resolution is biased.
+Users who want to force the pure-Rust path globally can pass `--no-hwaccel` to the `oxideav` CLI; this sets `CodecPreferences { no_hardware: true }`, which the pipeline forwards to `oxideav_pipeline::make_decoder_with` / `make_encoder_with` so HW factories are skipped at dispatch time. The runtime context still registers VT — `oxideav list` shows the `*_videotoolbox` rows regardless of the flag — only resolution is biased.
 
 ## Coverage roadmap
 
