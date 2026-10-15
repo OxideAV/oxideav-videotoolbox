@@ -36,18 +36,21 @@ error surface:
 * `Error::InvalidData` — `kVTParameterErr`, `kVTVideoDecoderBadDataErr`.
 * `Error::Other` — malfunctions, allocation failures, unknown codes.
 
-Errors reported by VT's async output callbacks surface once on the next
-`send_packet` / `send_frame` and are then cleared — one corrupt access
-unit does not latch the session into a permanent error state.
+Errors reported by VT's output callbacks surface once — at the end of
+the `send_packet` / `send_frame` that caused them, at `flush`, or from
+`receive_frame` — and are then cleared: one corrupt access unit does
+not latch the session into a permanent error state, and a single still
+VideoToolbox cannot decode is an error rather than zero frames.
 
 ## Timestamps & packet metadata
 
-* **Decoded frames carry their PTS.** The decompression-output callback
-  receives the presentation time as a by-value `CMTime` (per the
-  seven-parameter prototype in `VTDecompressionSession.h`); the bridge
-  round-trips `packet.pts` through it, so `VideoFrame::pts` is the
-  caller's own timestamp in presentation order (or a sequential
-  decode-order index for packets that carried none).
+* **Decoded frames carry their PTS.** Each submitted access unit rides
+  a sequence stamp through the by-value `CMTime` of the
+  decompression-output callback (seven-parameter prototype in
+  `VTDecompressionSession.h`); the bridge matches the decoded picture
+  back to its packet, so `VideoFrame::pts` is the caller's own
+  timestamp (`None` for packets that carried none) and frames come out
+  in **display order** (see "Output order" below).
 * **Encoder packets carry stream metadata**: `flags.keyframe` (from the
   access unit's VCL NAL types for H.264/HEVC — IDR / IDR_W_RADL /
   IDR_N_LP / CRA — and unconditionally for the intra-only MJPEG /
@@ -105,7 +108,7 @@ Users who want to force the pure-Rust path globally can pass `--no-hwaccel` to t
 | H.264        | hardware          | hardware          | wired (≈ 51 dB PSNR_Y)  |
 | HEVC         | hardware          | hardware          | wired (≈ 54 dB PSNR_Y)  |
 | ProRes       | hardware          | hardware          | wired (≈ 52 dB PSNR_Y)  |
-| JPEG (MJPEG) | hardware          | hardware          | wired (≈ 36 dB PSNR_Y)  |
+| JPEG (MJPEG) | hardware (4:2:0 + grey scans; others fall back) | hardware | wired (58–73 dB vs the pure-Rust decode) |
 | MPEG-2       | hardware          | — (no VT encoder) | wired (≈ 61 dB PSNR_Y, decode-only) |
 | VP9          | hardware (M1+)    | — (no VT encoder) | wired (decode-only)     |
 | MPEG-4 Pt 2  | hardware          | — (no VT encoder) | wired (decode-only, VOL→ESDS extension atoms, ≈ 72 dB PSNR_Y) |
@@ -142,18 +145,71 @@ helpers so both paths have identical input semantics. Property keys are
 those declared in the macOS SDK header
 `VideoToolbox/VTCompressionProperties.h`.
 
+### Output labels
+
+A decoder's frames — and `Decoder::output_pixel_format()` — are
+labelled with the layout it **actually produces**. The label is
+negotiated once: the container's declared `CodecParameters::pixel_format`
+when VideoToolbox can emit it, otherwise the codec's own layout (H.264 /
+HEVC: the SPS's chroma format × bit depth; ProRes 422 flavours:
+`Yuv422P10Le`; ProRes 4444 flavours: `Yuv444P16Le`; MPEG-2 / MPEG-4 /
+VP9 / AV1 / VVC: `Yuv420P`; JPEG: read from the SOF). VideoToolbox is
+asked for exactly that layout through `destinationImageBufferAttributes`
+(the `pixbuf` module maps `PixelFormat` ⇄ `kCVPixelFormatType_*`: 8-bit
+4:2:0 / 4:2:2 / 4:4:4 in both ranges, grey, 10-bit 4:2:0 / 4:2:2 /
+4:4:4, 16-bit 4:2:2 / 4:4:4, BGRA; 4:1:1 and 4:4:0 are derived from a
+4:4:4 request by a software chroma re-sampling) and the buffer is
+converted into planar frames of that label. A declared layout
+VideoToolbox has no pixel format for (12-bit planar, CMYK, RGB, alpha
+planes, …) is refused at construction with a typed `Unsupported`, so the
+registry falls back to the pure-Rust decoder instead of getting
+mislabelled frames.
+
+**JPEG** is the measured exception: the VideoToolbox JPEG decompressor
+(hardware and its software path alike) decodes every source at 4:2:0 —
+a 4:2:2 / 4:4:4 output request only adds a pixel-transfer upsample
+(chroma ≈ 32 dB against the real samples, luma broken at odd sizes),
+4:4:0 / 4:1:1 scans fail outright and CMYK is rejected. The decoder
+therefore claims 4:2:0 and single-component scans only (`YuvJ420P` /
+`Gray8`, 58–73 dB against the pure-Rust decode at every size down to
+1×1) and returns `Unsupported` for everything else, which the pure-Rust
+decoder decodes exactly.
+
+### Output order
+
+VideoToolbox returns pictures in decode order on the M-series media
+engine (`kVTDecodeFrame_EnableTemporalProcessing` and the asynchronous
+flag only defer the callbacks). The H.264 / HEVC decoders derive every
+picture's order count from its slice header (`nalparse`: H.264 §8.2.1
+for all three `pic_order_cnt_type`s, H.265 §8.3.1) and hold pictures in
+a buffer sorted by order count, releasing them when the stream's reorder
+depth is exceeded (H.264 VUI `max_num_reorder_frames`, else the level's
+`MaxDpbFrames`; H.265 `sps_max_num_reorder_pics`), when the container's
+decode timeline (`dts < pts` seen) proves them due, at a new coded video
+sequence, and in full at `flush`. Known limit: a
+`memory_management_control_operation` equal to 5 is not detected (the
+order-count history resets at IDR pictures only). The intra-only and
+container-framed codecs (JPEG, ProRes, MPEG-2 / MPEG-4 Part 2 as framed
+here, VP9, AV1) are delivered as decoded.
+
 ### Decoder framing details
 
-Codecs without parameter sets (MJPEG `'jpeg'`, ProRes `'apcn'`) share
-one `blob.rs` `BlobDecoder` / `BlobEncoder` driver built on
-`CMVideoFormatDescriptionCreate(width, height, codecType)`. A
-pixel-format-adaptive decode callback inspects
-`CVPixelBufferGetPixelFormatType` and dispatches to one of four
-converters (NV12 `'420v'`/`'420f'`, packed UYVY `'2vuy'`, packed YUY2
-`'yuvs'`, biplanar 16-bit 4:2:2 `'sv22'`), so ProRes's 16-bit 4:2:2
-output is handled alongside the H.264 / HEVC NV12 path. ProRes flavour
-is selected from `CodecParameters::tag` (one of `apco` / `apcs` /
-`apcn` / `apch` / `ap4h` / `ap4x`), defaulting to ProRes 422.
+H.264 / HEVC accept both framings: the `avcC` / `hvcC` configuration
+record (or Annex-B parameter sets) in `CodecParameters::extradata`
+builds the session at construction, in-band parameter sets re-create it
+when they change, and each packet is read as length-prefixed (the
+record's `lengthSizeMinusOne + 1`, 4 without a record) or Annex B —
+a length prefix that spells a start code (`00 00 01 xx`) is resolved by
+the record's length size. Packets holding several coded pictures are
+split into access units on the H.264 §7.4.1.2.3 / H.265 §7.4.2.4.4
+boundaries.
+
+Codecs without parameter sets (MJPEG `'jpeg'`, ProRes) share one
+`blob.rs` `BlobDecoder` / `BlobEncoder` driver built on
+`CMVideoFormatDescriptionCreate(width, height, codecType)`. ProRes
+flavour is selected from `CodecParameters::tag` (one of `apco` / `apcs`
+/ `apcn` / `apch` / `ap4h` / `ap4x`) on both the encode and the decode
+side, defaulting to ProRes 422.
 
 Codecs whose elementary stream is not pre-framed get an in-codec
 `FrameSplit` framer that carves access units from the bitstream:
