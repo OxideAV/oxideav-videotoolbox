@@ -192,6 +192,17 @@ pub const K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_FULL_RANGE: u32 = 0x34323066;
 // kCVPixelBufferLockFlags_ReadOnly = 1
 pub const K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY: u64 = 1;
 
+/// `VTDecodeFrameFlags` (platform SDK `VideoToolbox/VTErrors.h`):
+/// `kVTDecodeFrame_EnableAsynchronousDecompression`.
+pub const K_VT_DECODE_FRAME_ENABLE_ASYNCHRONOUS_DECOMPRESSION: u32 = 1 << 0;
+/// `kVTDecodeFrame_DoNotOutputFrame`.
+pub const K_VT_DECODE_FRAME_DO_NOT_OUTPUT_FRAME: u32 = 1 << 1;
+/// `kVTDecodeFrame_EnableTemporalProcessing` — the decoder may hold
+/// frames and emit them in display order.
+pub const K_VT_DECODE_FRAME_ENABLE_TEMPORAL_PROCESSING: u32 = 1 << 3;
+/// `VTDecodeInfoFlags`: `kVTDecodeInfo_FrameDropped`.
+pub const K_VT_DECODE_INFO_FRAME_DROPPED: u32 = 1 << 1;
+
 // ─────────────────────────── Function pointer types ───────────────────────────
 
 // VideoToolbox
@@ -494,6 +505,9 @@ pub struct Vtable {
     pub vt_decomp_create: FnVTDecompressionSessionCreate,
     pub vt_decomp_decode: FnVTDecompressionSessionDecodeFrame,
     pub vt_decomp_finish: FnVTDecompressionSessionFinishDelayedFrames,
+    /// `VTDecompressionSessionWaitForAsynchronousFrames` — the barrier
+    /// that also finishes delayed (temporally re-ordered) frames.
+    pub vt_decomp_wait: FnVTDecompressionSessionFinishDelayedFrames,
     pub vt_decomp_invalidate: FnVTDecompressionSessionInvalidate,
     // VT encode
     pub vt_comp_create: FnVTCompressionSessionCreate,
@@ -555,6 +569,14 @@ pub struct Vtable {
     /// data symbols. Never release these.
     pub cf_boolean_true: CFTypeRef,
     pub cf_boolean_false: CFTypeRef,
+    /// `kCVPixelBufferPixelFormatTypeKey` — CoreVideo's exported
+    /// `CFStringRef` constant naming the pixel-format entry of a
+    /// pixel-buffer attributes dictionary. Loaded as a data symbol so the
+    /// `destinationImageBufferAttributes` dictionary carries the
+    /// framework's own key (a `CFString` built from the symbol's *name*
+    /// never matches, and the request is silently ignored). Never
+    /// release this.
+    pub cv_pixel_format_type_key: CFTypeRef,
     pub cf_release: FnCFRelease,
     pub cf_retain: FnCFRetain,
     // Keep libraries alive
@@ -644,6 +666,11 @@ fn load_vtable() -> Result<Vtable, String> {
         vt_decomp_finish: sym!(
             vt,
             "VTDecompressionSessionFinishDelayedFrames",
+            FnVTDecompressionSessionFinishDelayedFrames
+        ),
+        vt_decomp_wait: sym!(
+            vt,
+            "VTDecompressionSessionWaitForAsynchronousFrames",
             FnVTDecompressionSessionFinishDelayedFrames
         ),
         vt_decomp_invalidate: sym!(
@@ -835,6 +862,13 @@ fn load_vtable() -> Result<Vtable, String> {
             let s: libloading::Symbol<*const CFTypeRef> = unsafe {
                 cf.get(b"kCFBooleanFalse\0")
                     .map_err(|e| format!("dlsym kCFBooleanFalse: {e}"))?
+            };
+            unsafe { *(*s) }
+        },
+        cv_pixel_format_type_key: {
+            let s: libloading::Symbol<*const CFTypeRef> = unsafe {
+                cv.get(b"kCVPixelBufferPixelFormatTypeKey\0")
+                    .map_err(|e| format!("dlsym kCVPixelBufferPixelFormatTypeKey: {e}"))?
             };
             unsafe { *(*s) }
         },

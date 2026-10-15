@@ -129,6 +129,12 @@ pub mod blob;
 pub mod decoder;
 #[cfg(feature = "registry")]
 pub mod encoder;
+#[doc(hidden)] // H.264 / H.265 header parsing for output ordering — internal
+#[cfg(feature = "registry")]
+pub mod nalparse;
+#[doc(hidden)] // CVPixelBuffer ⇄ VideoFrame plumbing shared by the decoders
+#[cfg(feature = "registry")]
+pub mod pixbuf;
 
 /// Register VideoToolbox hardware factories: H.264 / HEVC / JPEG / ProRes
 /// decode + encode, plus MPEG-2 video, VP9, MPEG-4 Part 2, AV1, and VVC

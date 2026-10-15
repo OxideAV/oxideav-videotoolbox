@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use oxideav_core::{
     CodecId, CodecParameters, Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result,
-    TimeBase, VideoFrame, VideoPlane,
+    TimeBase, VideoFrame,
 };
 
 use crate::encoder::{
@@ -33,10 +33,10 @@ use crate::encoder::{
     parse_data_rate_limits, parse_hardware_mode, parse_keyframe_interval,
     parse_keyframe_interval_duration, resolve_expected_frame_rate, vt_error, HardwareMode,
 };
+use crate::pixbuf;
 use crate::sys::{
     self, cf_number_i32, cf_string, CMSampleTimingInfo, CMTime,
-    K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY,
-    K_OS_STATUS_NO_ERROR,
+    K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY, K_OS_STATUS_NO_ERROR,
 };
 
 // ─────────────────────────── libc shim ────────────────────────────────────────
@@ -51,7 +51,9 @@ unsafe fn libc_malloc(size: usize) -> *mut c_void {
 // ─────────────────────────── Callback state (decode) ─────────────────────────
 
 struct DecCallbackState {
-    frames: VecDeque<VideoFrame>,
+    /// Decoded frames with the label of the layout VideoToolbox handed
+    /// back (see `pixbuf::pixel_buffer_to_frame`).
+    frames: VecDeque<(VideoFrame, PixelFormat)>,
     error: Option<String>,
 }
 
@@ -108,16 +110,12 @@ unsafe extern "C" fn dec_callback(
         return;
     }
 
-    let width = unsafe { (vt.cv_pb_get_width)(image_buffer) };
-    let height = unsafe { (vt.cv_pb_get_height)(image_buffer) };
-    let pixel_fmt = unsafe { (vt.cv_pb_get_pixel_format)(image_buffer) };
-
-    let frame = decode_pixel_buffer(vt, image_buffer, width, height, pixel_fmt);
+    let frame = unsafe { pixbuf::pixel_buffer_to_frame(vt, image_buffer) };
 
     unsafe { (vt.cv_pb_unlock)(image_buffer, 0) };
 
     match frame {
-        Ok(mut f) => {
+        Ok((mut f, label)) => {
             // Recover the presentation timestamp VT hands back for this
             // frame. `submit_frame` wraps `packet.pts` (or a sequential
             // decode-order counter when the packet carried none) in a
@@ -127,433 +125,88 @@ unsafe extern "C" fn dec_callback(
             f.pts = presentation_time_stamp
                 .is_valid()
                 .then_some(presentation_time_stamp.value);
-            guard.frames.push_back(f);
+            guard.frames.push_back((f, label));
         }
         Err(e) => guard.error = Some(e),
     }
 }
 
-/// Convert a `CVPixelBuffer` (in one of several supported pixel formats)
-/// into a planar I420 `VideoFrame`. Handles 8-bit biplanar NV12 (`'420v'`,
-/// `'420f'`), 8-bit packed 4:2:2 (`'2vuy'` UYVY, `'yuvs'` YUY2), and 16-bit
-/// 4:2:2 (`'sv22'` biplanar, `'v216'` packed). Returns an error string for
-/// unsupported formats; the caller logs it.
-fn decode_pixel_buffer(
-    vt: &sys::Vtable,
-    image_buffer: sys::CVImageBufferRef,
-    width: usize,
-    height: usize,
-    pixel_fmt: u32,
-) -> std::result::Result<VideoFrame, String> {
-    let chroma_w = width.div_ceil(2);
-    let chroma_h = height.div_ceil(2);
-
-    match pixel_fmt {
-        // '420v' (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) or
-        // '420f' (kCVPixelFormatType_420YpCbCr8BiPlanarFullRange):
-        // biplanar Y + interleaved UV, 8 bit.
-        0x34323076 | 0x34323066 => Ok(decode_nv12(
-            vt,
-            image_buffer,
-            width,
-            height,
-            chroma_w,
-            chroma_h,
-        )),
-        // '2vuy' (kCVPixelFormatType_422YpCbCr8) packed UYVY 4:2:2.
-        0x32767579 => Ok(decode_uyvy_to_i420(
-            vt,
-            image_buffer,
-            width,
-            height,
-            chroma_w,
-            chroma_h,
-        )),
-        // 'yuvs' (kCVPixelFormatType_422YpCbCr8_yuvs) packed YUY2 4:2:2.
-        0x79757673 => Ok(decode_yuy2_to_i420(
-            vt,
-            image_buffer,
-            width,
-            height,
-            chroma_w,
-            chroma_h,
-        )),
-        // 'sv22' (kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange):
-        // biplanar 4:2:2 with 16-bit container per sample (10-12 bit
-        // value left-shifted; high byte = 8-bit video-range proxy).
-        // ProRes 422 decodes to this by default on Apple Silicon.
-        0x73763232 => Ok(decode_biplanar_16bit_422_to_i420(
-            vt,
-            image_buffer,
-            width,
-            height,
-            chroma_w,
-            chroma_h,
-        )),
-        // 'v216' (kCVPixelFormatType_422YpCbCr16): packed 4:2:2 with
-        // each component as little-endian 16-bit. Sample order per
-        // 2-pixel block: Cb0 Y0 Cr0 Y1 (8 bytes). ProRes 422 decodes to
-        // this on the Apple-hosted macos-latest x86_64 runner.
-        0x76323136 => Ok(decode_v216_to_i420(
-            vt,
-            image_buffer,
-            width,
-            height,
-            chroma_w,
-            chroma_h,
-        )),
-        other => Err(format!(
-            "unsupported CVPixelBuffer format 0x{other:08x} (decoded {width}x{height})"
-        )),
+/// Pixel layout a baseline / progressive JPEG frame decodes to, read
+/// from its SOF segment (T.81 §B.2.2): one component → `Gray8`; three
+/// components → the full-range `YuvJ4xxP` label of the luma sampling
+/// factors relative to the chroma ones (`Yuv411P` for H=4, 4:4:0 is
+/// reported as `YuvJ444P` like the pure-Rust decoder does). `None` for
+/// anything VideoToolbox cannot deliver truthfully: precisions other
+/// than 8, four-component (CMYK / YCCK) scans, lossless / hierarchical
+/// processes, or a stream with no SOF.
+pub fn jpeg_sof_label(data: &[u8]) -> Option<PixelFormat> {
+    let mut pos = 2usize; // past SOI
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
     }
-}
-
-/// Convert packed `'v216'` (Component Y'CbCr 16-bit 4:2:2, packed
-/// `[Cb0 Y0 Cr0 Y1]` little-endian per 2-pixel block) into planar I420.
-/// Container holds a 10..16-bit value left-justified; we take the high
-/// byte as an 8-bit video-range proxy.
-fn decode_v216_to_i420(
-    vt: &sys::Vtable,
-    image_buffer: sys::CVImageBufferRef,
-    width: usize,
-    height: usize,
-    chroma_w: usize,
-    chroma_h: usize,
-) -> VideoFrame {
-    let base = unsafe { (vt.cv_pb_get_base)(image_buffer) } as *const u8;
-    let bpr = unsafe { (vt.cv_pb_get_bpr)(image_buffer) };
-
-    let mut y_data = vec![0u8; width * height];
-    let mut cb_422 = vec![0u16; chroma_w * height];
-    let mut cr_422 = vec![0u16; chroma_w * height];
-
-    // 8 bytes per 2-pixel block (4 components × 2 bytes).
-    if !base.is_null() {
-        for row in 0..height {
-            let row_ptr = unsafe { base.add(row * bpr) };
-            // Bytes per row should be ≥ width * 4, but defensively clamp
-            // in case of stride padding.
-            let blocks = (bpr / 8).min(chroma_w);
-            for cx in 0..blocks {
-                let off = cx * 8;
-                let cb_lo = unsafe { *row_ptr.add(off) };
-                let cb_hi = unsafe { *row_ptr.add(off + 1) };
-                let y0_lo = unsafe { *row_ptr.add(off + 2) };
-                let y0_hi = unsafe { *row_ptr.add(off + 3) };
-                let cr_lo = unsafe { *row_ptr.add(off + 4) };
-                let cr_hi = unsafe { *row_ptr.add(off + 5) };
-                let y1_lo = unsafe { *row_ptr.add(off + 6) };
-                let y1_hi = unsafe { *row_ptr.add(off + 7) };
-                let cb = ((cb_hi as u16) << 8 | cb_lo as u16) >> 8;
-                let cr = ((cr_hi as u16) << 8 | cr_lo as u16) >> 8;
-                let y0 = ((y0_hi as u16) << 8 | y0_lo as u16) >> 8;
-                let y1 = ((y1_hi as u16) << 8 | y1_lo as u16) >> 8;
-                let px = cx * 2;
-                if px < width {
-                    y_data[row * width + px] = y0 as u8;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xFF {
+            pos += 1;
+            continue;
+        }
+        let marker = data[pos + 1];
+        if marker == 0xFF {
+            pos += 1;
+            continue;
+        }
+        // Stand-alone markers (RSTn, SOI, EOI, TEM) have no length.
+        if matches!(marker, 0x01 | 0xD0..=0xD9) {
+            pos += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        if len < 2 {
+            return None;
+        }
+        let seg = &data[pos + 4..data.len().min(pos + 2 + len)];
+        match marker {
+            // SOF0-2 (baseline / extended / progressive, Huffman) and the
+            // arithmetic twins SOF9-10: the DCT processes VT decodes.
+            0xC0 | 0xC1 | 0xC2 | 0xC9 | 0xCA => {
+                if seg.len() < 6 {
+                    return None;
                 }
-                if px + 1 < width {
-                    y_data[row * width + px + 1] = y1 as u8;
+                let precision = seg[0];
+                let nf = seg[5] as usize;
+                if precision != 8 || seg.len() < 6 + 3 * nf {
+                    return None;
                 }
-                cb_422[row * chroma_w + cx] = cb;
-                cr_422[row * chroma_w + cx] = cr;
-            }
-        }
-    }
-
-    let mut u_data = vec![0u8; chroma_w * chroma_h];
-    let mut v_data = vec![0u8; chroma_w * chroma_h];
-    for cy in 0..chroma_h {
-        let r0 = (cy * 2).min(height.saturating_sub(1));
-        let r1 = (cy * 2 + 1).min(height.saturating_sub(1));
-        for cx in 0..chroma_w {
-            let u = (cb_422[r0 * chroma_w + cx] + cb_422[r1 * chroma_w + cx]).div_ceil(2);
-            let v = (cr_422[r0 * chroma_w + cx] + cr_422[r1 * chroma_w + cx]).div_ceil(2);
-            u_data[cy * chroma_w + cx] = u as u8;
-            v_data[cy * chroma_w + cx] = v as u8;
-        }
-    }
-
-    VideoFrame {
-        pts: None,
-        planes: vec![
-            VideoPlane {
-                stride: width,
-                data: y_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: u_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: v_data,
-            },
-        ],
-    }
-}
-
-/// Convert biplanar 16-bit 4:2:2 (`'sv22'`, ProRes-default on Apple
-/// Silicon) into planar I420 8-bit. The 16-bit container holds a
-/// `[4096, 60160]` video-range value for luma, so the high byte is the
-/// 8-bit video-range proxy. Chroma is vertically averaged 2:1 to land
-/// in I420.
-fn decode_biplanar_16bit_422_to_i420(
-    vt: &sys::Vtable,
-    image_buffer: sys::CVImageBufferRef,
-    width: usize,
-    height: usize,
-    chroma_w: usize,
-    chroma_h: usize,
-) -> VideoFrame {
-    let y_ptr = unsafe { (vt.cv_pb_get_base_of_plane)(image_buffer, 0) } as *const u8;
-    let y_stride = unsafe { (vt.cv_pb_get_bpr_of_plane)(image_buffer, 0) };
-    let y_height = unsafe { (vt.cv_pb_get_height_of_plane)(image_buffer, 0) };
-    let cbcr_ptr = unsafe { (vt.cv_pb_get_base_of_plane)(image_buffer, 1) } as *const u8;
-    let cbcr_stride = unsafe { (vt.cv_pb_get_bpr_of_plane)(image_buffer, 1) };
-    let cbcr_height = unsafe { (vt.cv_pb_get_height_of_plane)(image_buffer, 1) };
-
-    let mut y_data = vec![0u8; width * height];
-    // Accumulate chroma at 4:2:2 (chroma_w × height) first, then average
-    // row pairs down to 4:2:0.
-    let mut cb_422 = vec![0u16; chroma_w * height];
-    let mut cr_422 = vec![0u16; chroma_w * height];
-
-    // Y plane: each sample is little-endian u16, take the high byte.
-    if !y_ptr.is_null() {
-        for row in 0..y_height.min(height) {
-            let row_ptr = unsafe { y_ptr.add(row * y_stride) };
-            let max_pix = (y_stride / 2).min(width);
-            for col in 0..max_pix {
-                let lo = unsafe { *row_ptr.add(col * 2) };
-                let hi = unsafe { *row_ptr.add(col * 2 + 1) };
-                // little-endian 16-bit; high byte already approximates the
-                // 8-bit video-range value.
-                let sample = (hi as u16) << 8 | lo as u16;
-                y_data[row * width + col] = (sample >> 8) as u8;
-            }
-        }
-    }
-
-    // CbCr plane: interleaved Cb,Cr pairs, each 16-bit.
-    // chroma_h here equals `height` for 4:2:2.
-    if !cbcr_ptr.is_null() {
-        let rows = cbcr_height.min(height);
-        for row in 0..rows {
-            let row_ptr = unsafe { cbcr_ptr.add(row * cbcr_stride) };
-            let pairs = (cbcr_stride / 4).min(chroma_w);
-            for cx in 0..pairs {
-                let cb_lo = unsafe { *row_ptr.add(cx * 4) };
-                let cb_hi = unsafe { *row_ptr.add(cx * 4 + 1) };
-                let cr_lo = unsafe { *row_ptr.add(cx * 4 + 2) };
-                let cr_hi = unsafe { *row_ptr.add(cx * 4 + 3) };
-                let cb = ((cb_hi as u16) << 8 | cb_lo as u16) >> 8;
-                let cr = ((cr_hi as u16) << 8 | cr_lo as u16) >> 8;
-                cb_422[row * chroma_w + cx] = cb;
-                cr_422[row * chroma_w + cx] = cr;
-            }
-        }
-    }
-
-    // 4:2:2 → 4:2:0: average chroma rows pairwise.
-    let mut u_data = vec![0u8; chroma_w * chroma_h];
-    let mut v_data = vec![0u8; chroma_w * chroma_h];
-    for cy in 0..chroma_h {
-        let r0 = (cy * 2).min(height.saturating_sub(1));
-        let r1 = (cy * 2 + 1).min(height.saturating_sub(1));
-        for cx in 0..chroma_w {
-            let u = (cb_422[r0 * chroma_w + cx] + cb_422[r1 * chroma_w + cx]).div_ceil(2);
-            let v = (cr_422[r0 * chroma_w + cx] + cr_422[r1 * chroma_w + cx]).div_ceil(2);
-            u_data[cy * chroma_w + cx] = u as u8;
-            v_data[cy * chroma_w + cx] = v as u8;
-        }
-    }
-
-    VideoFrame {
-        pts: None,
-        planes: vec![
-            VideoPlane {
-                stride: width,
-                data: y_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: u_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: v_data,
-            },
-        ],
-    }
-}
-
-fn decode_nv12(
-    vt: &sys::Vtable,
-    image_buffer: sys::CVImageBufferRef,
-    width: usize,
-    height: usize,
-    chroma_w: usize,
-    chroma_h: usize,
-) -> VideoFrame {
-    let y_ptr = unsafe { (vt.cv_pb_get_base_of_plane)(image_buffer, 0) } as *const u8;
-    let y_stride = unsafe { (vt.cv_pb_get_bpr_of_plane)(image_buffer, 0) };
-    let y_height = unsafe { (vt.cv_pb_get_height_of_plane)(image_buffer, 0) };
-    let uv_ptr = unsafe { (vt.cv_pb_get_base_of_plane)(image_buffer, 1) } as *const u8;
-    let uv_stride = unsafe { (vt.cv_pb_get_bpr_of_plane)(image_buffer, 1) };
-    let uv_height = unsafe { (vt.cv_pb_get_height_of_plane)(image_buffer, 1) };
-
-    let mut y_data = vec![0u8; width * height];
-    let mut u_data = vec![0u8; chroma_w * chroma_h];
-    let mut v_data = vec![0u8; chroma_w * chroma_h];
-
-    if !y_ptr.is_null() {
-        for row in 0..y_height.min(height) {
-            let row_len = width.min(y_stride);
-            let src = unsafe { std::slice::from_raw_parts(y_ptr.add(row * y_stride), row_len) };
-            let dst = row * width;
-            y_data[dst..dst + row_len].copy_from_slice(src);
-        }
-    }
-    if !uv_ptr.is_null() {
-        for row in 0..uv_height.min(chroma_h) {
-            let row_len = (chroma_w * 2).min(uv_stride);
-            let src = unsafe { std::slice::from_raw_parts(uv_ptr.add(row * uv_stride), row_len) };
-            let dst = row * chroma_w;
-            for col in 0..chroma_w {
-                u_data[dst + col] = if col * 2 < row_len { src[col * 2] } else { 128 };
-                v_data[dst + col] = if col * 2 + 1 < row_len {
-                    src[col * 2 + 1]
-                } else {
-                    128
+                let comps: Vec<(u8, u8)> = (0..nf)
+                    .map(|i| (seg[6 + 3 * i + 1] >> 4, seg[6 + 3 * i + 1] & 0x0F))
+                    .collect();
+                return match nf {
+                    1 => Some(PixelFormat::Gray8),
+                    3 => {
+                        let (h0, v0) = comps[0];
+                        let chroma_full = comps[1..].iter().all(|&(h, v)| h == 1 && v == 1);
+                        match (h0, v0) {
+                            _ if comps.iter().all(|&c| c == comps[0]) => {
+                                Some(PixelFormat::YuvJ444P)
+                            }
+                            (2, 2) if chroma_full => Some(PixelFormat::YuvJ420P),
+                            (2, 1) if chroma_full => Some(PixelFormat::YuvJ422P),
+                            (4, 1) if chroma_full => Some(PixelFormat::Yuv411P),
+                            (1, 2) if chroma_full => Some(PixelFormat::YuvJ444P),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
                 };
             }
+            // Lossless / hierarchical / differential SOFs: not decodable here.
+            0xC3 | 0xC5..=0xC7 | 0xCB | 0xCD..=0xCF => return None,
+            // Scan data follows; a SOF must precede the first SOS.
+            0xDA => return None,
+            _ => {}
         }
+        pos += 2 + len;
     }
-
-    VideoFrame {
-        pts: None,
-        planes: vec![
-            VideoPlane {
-                stride: width,
-                data: y_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: u_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: v_data,
-            },
-        ],
-    }
-}
-
-/// Convert packed UYVY (`'2vuy'`, 4:2:2 8-bit, sample order U Y V Y per
-/// 2 horizontal pixels) into planar I420 (4:2:0). Vertical chroma is
-/// 2:1 subsampled by averaging row pairs.
-fn decode_uyvy_to_i420(
-    vt: &sys::Vtable,
-    image_buffer: sys::CVImageBufferRef,
-    width: usize,
-    height: usize,
-    chroma_w: usize,
-    chroma_h: usize,
-) -> VideoFrame {
-    decode_packed_422_to_i420(vt, image_buffer, width, height, chroma_w, chroma_h, true)
-}
-
-/// Convert packed YUY2 (`'yuvs'`, sample order Y U Y V).
-fn decode_yuy2_to_i420(
-    vt: &sys::Vtable,
-    image_buffer: sys::CVImageBufferRef,
-    width: usize,
-    height: usize,
-    chroma_w: usize,
-    chroma_h: usize,
-) -> VideoFrame {
-    decode_packed_422_to_i420(vt, image_buffer, width, height, chroma_w, chroma_h, false)
-}
-
-fn decode_packed_422_to_i420(
-    vt: &sys::Vtable,
-    image_buffer: sys::CVImageBufferRef,
-    width: usize,
-    height: usize,
-    chroma_w: usize,
-    chroma_h: usize,
-    is_uyvy: bool,
-) -> VideoFrame {
-    // Packed 4:2:2 buffers are non-planar — CVPixelBufferGetBaseAddress
-    // gives the single-plane pointer.
-    let base = unsafe { (vt.cv_pb_get_base)(image_buffer) } as *const u8;
-    let bpr = unsafe { (vt.cv_pb_get_bpr)(image_buffer) };
-
-    let mut y_data = vec![0u8; width * height];
-    // Sum chroma into 4:2:2 then average vertically to 4:2:0.
-    let mut u_422 = vec![0u16; chroma_w * height];
-    let mut v_422 = vec![0u16; chroma_w * height];
-
-    if !base.is_null() {
-        for row in 0..height {
-            let row_ptr = unsafe { base.add(row * bpr) };
-            let row_bytes = bpr.min(width * 2);
-            let src = unsafe { std::slice::from_raw_parts(row_ptr, row_bytes) };
-            let mut x = 0usize;
-            while x + 4 <= row_bytes && x / 2 < width {
-                let (u, y0, v, y1) = if is_uyvy {
-                    (src[x], src[x + 1], src[x + 2], src[x + 3])
-                } else {
-                    (src[x + 1], src[x], src[x + 3], src[x + 2])
-                };
-                let px = x / 2;
-                if px < width {
-                    y_data[row * width + px] = y0;
-                }
-                if px + 1 < width {
-                    y_data[row * width + px + 1] = y1;
-                }
-                let cx = px / 2;
-                if cx < chroma_w {
-                    u_422[row * chroma_w + cx] = u as u16;
-                    v_422[row * chroma_w + cx] = v as u16;
-                }
-                x += 4;
-            }
-        }
-    }
-
-    let mut u_data = vec![0u8; chroma_w * chroma_h];
-    let mut v_data = vec![0u8; chroma_w * chroma_h];
-    for cy in 0..chroma_h {
-        let r0 = (cy * 2).min(height.saturating_sub(1));
-        let r1 = (cy * 2 + 1).min(height.saturating_sub(1));
-        for cx in 0..chroma_w {
-            let u = (u_422[r0 * chroma_w + cx] + u_422[r1 * chroma_w + cx]).div_ceil(2);
-            let v = (v_422[r0 * chroma_w + cx] + v_422[r1 * chroma_w + cx]).div_ceil(2);
-            u_data[cy * chroma_w + cx] = u as u8;
-            v_data[cy * chroma_w + cx] = v as u8;
-        }
-    }
-
-    VideoFrame {
-        pts: None,
-        planes: vec![
-            VideoPlane {
-                stride: width,
-                data: y_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: u_data,
-            },
-            VideoPlane {
-                stride: chroma_w,
-                data: v_data,
-            },
-        ],
-    }
+    None
 }
 
 // ─────────────────────────── Frame splitting ─────────────────────────────────
@@ -1725,6 +1378,17 @@ pub struct BlobDecoder {
     /// framers leave the field at `None` and the bare
     /// `(codec_type, width, height)` path covers them.
     extradata: Option<(&'static str, Vec<u8>)>,
+    /// Label of the frames this decoder delivers (see `pixbuf`): the
+    /// container's declared pixel format when VideoToolbox can emit it,
+    /// otherwise the codec's native layout (JPEG: read from the SOF of
+    /// the first packet). `None` until known.
+    target: Option<PixelFormat>,
+    /// `kCVPixelFormatType_*` requested from VideoToolbox for `target`,
+    /// and the label its buffers natively carry.
+    request: Option<(u32, PixelFormat)>,
+    /// JPEG is full range by definition (T.871); the 8-bit bi-planar
+    /// request families have distinct full-range codes.
+    full_range: bool,
     session: sys::VTDecompressionSessionRef,
     fmt_desc: sys::CMVideoFormatDescriptionRef,
     state: Arc<Mutex<DecCallbackState>>,
@@ -1762,6 +1426,24 @@ impl BlobDecoder {
                 "blob decoder requires width/height in CodecParameters",
             ));
         }
+        let full_range = codec_type == K_CM_VIDEO_CODEC_TYPE_JPEG;
+        // Negotiate the output label. A declared layout VideoToolbox has
+        // no pixel format for is a typed `Unsupported` so the registry
+        // falls back to the pure-Rust decoder rather than getting
+        // mislabelled frames.
+        let target = match params.pixel_format {
+            Some(pf) => Some(pf),
+            None if full_range => None, // read from the SOF of the first packet
+            None => Some(native_label_for_codec(codec_type)),
+        };
+        let request = match target {
+            Some(pf) => Some(pixbuf::request_for_label(pf, full_range).ok_or_else(|| {
+                Error::unsupported(format!(
+                    "videotoolbox: cannot deliver {codec_id} frames as {pf:?}"
+                ))
+            })?),
+            None => None,
+        };
         Ok(Box::new(BlobDecoder {
             codec_id: CodecId::new(codec_id),
             codec_type,
@@ -1769,6 +1451,9 @@ impl BlobDecoder {
             height,
             framer,
             extradata: None,
+            target,
+            request,
+            full_range,
             session: std::ptr::null_mut(),
             fmt_desc: std::ptr::null_mut(),
             state: DecCallbackState::new(),
@@ -1866,23 +1551,19 @@ impl BlobDecoder {
             ));
         }
 
-        // Destination attributes: NV12 ('420v') so the callback gets a
-        // predictable layout to convert to I420.
-        let pixel_fmt_val = K_CV_PIXEL_FORMAT_420_YPCBCRi8_BI_PLANAR_VIDEO_RANGE as i32;
-        let pixel_fmt_num = unsafe { cf_number_i32(vt, pixel_fmt_val) };
-        let pf_key = unsafe { cf_string(vt, "CVPixelBufferPixelFormatTypeKey") };
-
-        let keys: [*const c_void; 1] = [pf_key as *const c_void];
-        let vals: [*const c_void; 1] = [pixel_fmt_num as *const c_void];
-
+        // Destination attributes: the pixel format negotiated for the
+        // target label (`pixbuf::request_for_label`), keyed by the
+        // framework's own `kCVPixelBufferPixelFormatTypeKey` so the
+        // request is honoured.
+        let (fourcc, _) = self
+            .request
+            .unwrap_or((pixbuf::FOURCC_420V, PixelFormat::Yuv420P));
+        let pixel_fmt_num = unsafe { cf_number_i32(vt, fourcc as i32) };
         let dest_attrs = unsafe {
-            (vt.cf_dict_create)(
-                std::ptr::null_mut(),
-                keys.as_ptr(),
-                vals.as_ptr(),
-                1,
-                std::ptr::null(),
-                std::ptr::null(),
+            sys::cf_dict1(
+                vt,
+                vt.cv_pixel_format_type_key,
+                pixel_fmt_num as sys::CFTypeRef,
             )
         };
 
@@ -1918,7 +1599,6 @@ impl BlobDecoder {
             }
             (vt.cf_release)(dest_attrs);
             (vt.cf_release)(pixel_fmt_num);
-            (vt.cf_release)(pf_key);
         }
 
         if status != K_OS_STATUS_NO_ERROR {
@@ -2018,12 +1698,46 @@ impl BlobDecoder {
         Ok(())
     }
 
+    /// Move the callback's frames into the output queue, converting each
+    /// from the layout VideoToolbox delivered into the negotiated target
+    /// label. A frame that cannot be brought to the target is an error
+    /// (recorded, surfaced on the next call) — never a mislabelled frame.
     fn pull_frames(&mut self) {
-        if let Ok(mut g) = self.state.lock() {
-            while let Some(f) = g.frames.pop_front() {
-                self.output_queue.push_back(f);
+        let Ok(mut g) = self.state.lock() else {
+            return;
+        };
+        while let Some((f, native)) = g.frames.pop_front() {
+            let target = self.target.unwrap_or(native);
+            match pixbuf::deliver_as(f, native, target) {
+                Some(frame) => self.output_queue.push_back(frame),
+                None => {
+                    g.error = Some(format!(
+                        "VideoToolbox delivered {native:?} frames but the stream is labelled {target:?}"
+                    ));
+                }
             }
         }
+    }
+
+    /// Error recorded by the output callback since the last check, as a
+    /// typed error. Taken (cleared) so one bad frame does not latch the
+    /// session.
+    fn take_error(&self) -> Option<Error> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut g| g.error.take())
+            .map(|e| {
+                if e.contains("kVTVideoDecoderUnsupportedDataFormatErr")
+                    || e.contains("kVTParameterErr")
+                    || e.contains("kVTPixelTransferNotSupportedErr")
+                    || e.contains("kVTAllocationFailedErr")
+                {
+                    Error::unsupported(e)
+                } else {
+                    Error::other(e)
+                }
+            })
     }
 }
 
@@ -2060,13 +1774,46 @@ impl Decoder for BlobDecoder {
         // session into a permanent error state — VT decode errors are
         // per-frame, and the session remains usable for the next access
         // unit.
-        if let Some(e) = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|mut g| g.error.take().map(Error::other))
-        {
+        if let Some(e) = self.take_error() {
             return Err(e);
+        }
+
+        // JPEG: the SOF of the first frame decides whether VideoToolbox
+        // can deliver this picture truthfully, and (when the container
+        // declared no layout) which label it carries. Measured on the
+        // M-series media engine and on VT's own software path alike: the
+        // JPEG decompressor decodes every source at 4:2:0 — a 4:2:2 or
+        // 4:4:4 request only adds a pixel-transfer upsample (chroma
+        // ≈ 32 dB vs the real samples, luma broken at odd sizes), 4:4:0
+        // and 4:1:1 scans fail outright, CMYK is rejected. So the VT JPEG
+        // decoder claims 4:2:0 and single-component sources only; the
+        // rest is a typed `Unsupported` and the registry falls back to
+        // the pure-Rust decoder, which decodes them exactly.
+        if self.session.is_null() && self.full_range && !packet.data.is_empty() {
+            let label = jpeg_sof_label(&packet.data).ok_or_else(|| {
+                Error::unsupported(
+                    "videotoolbox: JPEG frame type (precision / components / process) \
+                     is not one VideoToolbox decodes",
+                )
+            })?;
+            if !matches!(label, PixelFormat::YuvJ420P | PixelFormat::Gray8) {
+                return Err(Error::unsupported(format!(
+                    "videotoolbox: JPEG decodes {label:?} scans at 4:2:0 only; \
+                     leaving them to the pure-Rust decoder"
+                )));
+            }
+            match self.target {
+                Some(t) if !pixbuf::same_layout(t, label) => {
+                    return Err(Error::unsupported(format!(
+                        "videotoolbox: JPEG scan is {label:?} but the stream is labelled {t:?}"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    self.target = Some(label);
+                    self.request = pixbuf::request_for_label(label, true);
+                }
+            }
         }
 
         // Before the session exists, sniff the codec's configuration record
@@ -2153,12 +1900,22 @@ impl Decoder for BlobDecoder {
             }
         }
         self.pull_frames();
+        // Decoding is synchronous here (no decode flags), so an error the
+        // callback recorded for *this* packet is already visible: report
+        // it now rather than on a next call that may never come (a
+        // single-frame still would otherwise decode to nothing, silently).
+        if let Some(e) = self.take_error() {
+            return Err(e);
+        }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
         if let Some(f) = self.output_queue.pop_front() {
             return Ok(Frame::Video(f));
+        }
+        if let Some(e) = self.take_error() {
+            return Err(e);
         }
         Err(if self.flushed {
             Error::Eof
@@ -2170,12 +1927,37 @@ impl Decoder for BlobDecoder {
     fn flush(&mut self) -> Result<()> {
         if !self.session.is_null() {
             if let Ok(vt) = sys::vtable() {
-                unsafe { (vt.vt_decomp_finish)(self.session) };
+                unsafe { (vt.vt_decomp_wait)(self.session) };
             }
         }
         self.pull_frames();
         self.flushed = true;
+        if let Some(e) = self.take_error() {
+            return Err(e);
+        }
         Ok(())
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.target
+    }
+}
+
+/// Default output label of a blob codec when the container declares no
+/// pixel format: 8-bit 4:2:0 for the MPEG / VP9 / AV1 / VVC family,
+/// 10-bit 4:2:2 for the ProRes 422 flavours and 16-bit 4:4:4 words for
+/// the ProRes 4444 flavours (their 12-bit samples arrive MSB-aligned in
+/// VideoToolbox's 16-bit bi-planar buffer).
+fn native_label_for_codec(codec_type: u32) -> PixelFormat {
+    match codec_type {
+        K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422
+        | K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_HQ
+        | K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_LT
+        | K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422_PROXY => PixelFormat::Yuv422P10Le,
+        K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444 | K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_4444_XQ => {
+            PixelFormat::Yuv444P16Le
+        }
+        _ => PixelFormat::Yuv420P,
     }
 }
 
@@ -2699,11 +2481,15 @@ pub fn make_jpeg_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 }
 
 pub fn make_prores_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    // Default-decode as ProRes 422 (apcn) — the format description carries the
-    // explicit type and VT internally dispatches to the right ProRes flavour
-    // once it sees the frame header. Container demuxers can pass a different
-    // fourcc via `CodecParameters::tag` in a future round.
-    BlobDecoder::make("prores", K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422, params)
+    // The flavour comes from the container's sample-entry fourcc in
+    // `CodecParameters::tag` (`apco` / `apcs` / `apcn` / `apch` / `ap4h` /
+    // `ap4x`), defaulting to ProRes 422. It drives the format description
+    // VideoToolbox decodes under *and* the default output label: the
+    // 4444 flavours are 12-bit 4:4:4 and come out as `Yuv444P16Le` when
+    // the container declares no layout, the 422 flavours as `Yuv422P10Le`.
+    let codec_type = prores_codec_type_for_tag(params.tag.as_ref())
+        .unwrap_or(K_CM_VIDEO_CODEC_TYPE_APPLE_PRORES_422);
+    BlobDecoder::make("prores", codec_type, params)
 }
 
 pub fn make_prores_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {

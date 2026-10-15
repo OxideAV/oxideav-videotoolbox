@@ -7,7 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every decoder's output pixel format was silently ignored by
+  VideoToolbox.** The `destinationImageBufferAttributes` dictionary was
+  keyed by a `CFString` spelling the *name* of the
+  `kCVPixelBufferPixelFormatTypeKey` symbol and created without the
+  `CFType` key callbacks, so the framework never found the entry and
+  every decoder got VideoToolbox's native buffer (NV12 for H.264 /
+  HEVC, full-range NV12 for JPEG, 16-bit 4:2:2 for ProRes) whatever was
+  asked. The real key is now loaded as the exported CoreVideo data
+  symbol (`sys::Vtable::cv_pixel_format_type_key`) and the dictionary
+  uses `CFEqual` key semantics, so requests are honoured — which is what
+  makes the truthful labels below possible.
+- **H.264 / HEVC from MP4 / Matroska decoded 0 frames.** The decoders
+  read Annex B only: the `avcC` / `hvcC` configuration record in
+  `CodecParameters::extradata` was ignored and the containers'
+  length-prefixed samples found no start codes, so no session was ever
+  created and nothing was reported. Both records (ISO/IEC 14496-15
+  §5.3.3 / §8.3.3) and Annex-B extradata are parsed at construction
+  (the session and `output_pixel_format` exist before the first packet),
+  each packet's framing is detected (a length prefix that spells a start
+  code — `00 00 01 xx` for a 256–511-byte sample — is resolved by the
+  record's length size), and packets holding several coded pictures are
+  split into access units on the H.264 §7.4.1.2.3 / H.265 §7.4.2.4.4
+  boundaries. The umbrella `convert_h264_cropping` /
+  `convert_h264_stream_fit` suites go from 0 decoded frames to
+  byte-exact with the pure-Rust decoder on every container.
+- **H.264 / HEVC frames came out in decode order.** VideoToolbox never
+  re-orders on the M-series media engine (measured:
+  `kVTDecodeFrame_EnableTemporalProcessing` and the asynchronous flag
+  only defer the callbacks). The decoders now derive every picture's
+  order count from its slice header (H.264 §8.2.1 for all three
+  `pic_order_cnt_type`s, H.265 §8.3.1; new `nalparse` module with SPS /
+  PPS / slice-header-prefix parsers) and hold pictures in a bounded
+  buffer sized by the stream's reorder depth (VUI
+  `max_num_reorder_frames`, else Table A-1 `MaxDpbFrames`;
+  `sps_max_num_reorder_pics`), released early by the container's decode
+  timeline when it has one and in full at a new coded video sequence or
+  `flush` (now the `VTDecompressionSessionWaitForAsynchronousFrames`
+  barrier). B-frame streams are byte-exact with the pure-Rust decode in
+  every framing; `VideoFrame::pts` is the packet's own stamp (`None` for
+  stamp-less packets, no more synthetic decode-order indices).
+- **JPEG frames were mislabelled.** A 4:4:4 JPEG came out as 4:2:0
+  planes under the stream's `YuvJ444P` label (the umbrella
+  `convert small444.jpg x.heic` "plane 1: stride 28 < 56" failure).
+  Measured on the media engine and on VideoToolbox's own software path:
+  the JPEG decompressor decodes every source at 4:2:0 — a 4:2:2 / 4:4:4
+  request only adds a pixel-transfer upsample (chroma ≈ 32 dB, luma
+  broken at odd sizes), 4:4:0 / 4:1:1 scans fail and CMYK is rejected.
+  The decoder now reads the SOF of the first frame and claims 4:2:0 and
+  single-component scans only (delivered as `YuvJ420P` / `Gray8` with
+  exact plane geometry, 58–73 dB against the pure-Rust decode at every
+  size down to 1×1); every other scan, precision or component count is a
+  typed `Unsupported` so the registry falls back to the pure-Rust
+  decoder, which decodes them exactly.
+- **Errors recorded by the output callback after the last packet were
+  never reported** (`flush` / `receive_frame` did not look), so a
+  single still VideoToolbox could not decode yielded zero frames with
+  no error. Decode errors now surface at the end of the `send_packet`
+  that caused them, at `flush`, and from `receive_frame`.
+- **`make_prores_decoder` ignored `CodecParameters::tag`** and opened
+  every stream as ProRes 422; the flavour (`apco` … `ap4x`) now drives
+  the format description like the encoder's does.
+
 ### Added
+
+- **Truthful output labels for every decoder.** A decoder's frames (and
+  `Decoder::output_pixel_format`) carry the layout it actually
+  produces: the container's declared `PixelFormat` when VideoToolbox can
+  emit it (4:2:0 / 4:2:2 / 4:4:4 at 8 bits in both ranges, grey,
+  10-bit 4:2:0 / 4:2:2 / 4:4:4, 16-bit 4:2:2 / 4:4:4, BGRA; 4:1:1 and
+  4:4:0 by a software chroma re-sampling of a 4:4:4 request), otherwise
+  the codec's own layout (H.264 / HEVC: the SPS's chroma format × bit
+  depth; ProRes 422: `Yuv422P10Le`; ProRes 4444: `Yuv444P16Le`; the
+  rest: `Yuv420P`). A declared layout VideoToolbox has no pixel format
+  for is refused at construction with a typed `Unsupported`. New
+  `pixbuf` module (`request_for_label`, `pixel_buffer_to_frame` for
+  every honoured `kCVPixelFormatType_*`, `geometry_matches`).
+- `sys`: `VTDecompressionSessionWaitForAsynchronousFrames` in the vtable,
+  the `VTDecodeFrameFlags` constants, and the
+  `kCVPixelBufferPixelFormatTypeKey` data symbol.
+- `decoder`: public `NalVtDecoder` / `NalCodec` core behind the
+  historical `H264VtDecoder::make` / `HevcVtDecoder::make`, plus the
+  framing helpers (`annex_b_nals`, `length_prefixed_nals`,
+  `packet_nals`, `split_access_units`, `ParamSets::from_extradata`);
+  `blob::jpeg_sof_label`.
+- Tests: `nal_framing` (vendored 48×32 B-frame H.264 / HEVC fixtures in
+  both framings: count, cropping, label geometry, display order ≥ 45 dB,
+  flush tail, stamps carried), `jpeg_layouts` (the 6 samplings × 6 sizes
+  + CMYK matrix against the black-box reference decoder), and
+  `decode_sweep` (H.264 / HEVC / MPEG-2 / MPEG-4 Part 2 / VP9 / AV1 /
+  MJPEG / ProRes 422 + 4444: count, label geometry, monotone stamps,
+  flush, ≥ 40 dB). All pass by reporting "unavailable" when the
+  framework, codec or producer is absent.
+
+### Added (earlier in this cycle)
 
 - **Hardware-acceleration policy knob** — `options["hardware"]` =
   `require` / `enable` (aliases `allow`) / `disable` (aliases
