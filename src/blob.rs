@@ -29,20 +29,20 @@ use oxideav_core::{
 };
 
 use crate::encoder::{
-    build_hw_spec_dict, frame_duration_us, i420_to_nv12_pixel_buffer, parse_constant_bit_rate,
-    parse_data_rate_limits, parse_hardware_mode, parse_keyframe_interval,
-    parse_keyframe_interval_duration, resolve_expected_frame_rate, vt_error, HardwareMode,
+    HardwareMode, build_hw_spec_dict, frame_duration_us, i420_to_nv12_pixel_buffer,
+    parse_constant_bit_rate, parse_data_rate_limits, parse_hardware_mode, parse_keyframe_interval,
+    parse_keyframe_interval_duration, resolve_expected_frame_rate, vt_error,
 };
 use crate::pixbuf;
 use crate::sys::{
-    self, cf_number_i32, cf_string, CMSampleTimingInfo, CMTime,
-    K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY, K_OS_STATUS_NO_ERROR,
+    self, CMSampleTimingInfo, CMTime, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY, K_OS_STATUS_NO_ERROR,
+    cf_number_i32, cf_string,
 };
 
 // ─────────────────────────── libc shim ────────────────────────────────────────
 
 unsafe fn libc_malloc(size: usize) -> *mut c_void {
-    extern "C" {
+    unsafe extern "C" {
         fn malloc(size: usize) -> *mut c_void;
     }
     unsafe { malloc(size) }
@@ -840,11 +840,7 @@ pub fn parse_av1_seq_header_fields(payload: &[u8]) -> Av1SeqHeaderFields {
         return out;
     }
     let bit_depth = if out.seq_profile == 2 && out.high_bitdepth == 1 {
-        if out.twelve_bit == 1 {
-            12
-        } else {
-            10
-        }
+        if out.twelve_bit == 1 { 12 } else { 10 }
     } else if out.high_bitdepth == 1 {
         10
     } else {
@@ -869,10 +865,11 @@ pub fn parse_av1_seq_header_fields(payload: &[u8]) -> Av1SeqHeaderFields {
         out.chroma_subsampling_x = 1;
         out.chroma_subsampling_y = 0;
     }
-    if out.chroma_subsampling_x == 1 && out.chroma_subsampling_y == 1 {
-        if let Some(csp) = br.read(2) {
-            out.chroma_sample_position = csp as u8;
-        }
+    if out.chroma_subsampling_x == 1
+        && out.chroma_subsampling_y == 1
+        && let Some(csp) = br.read(2)
+    {
+        out.chroma_sample_position = csp as u8;
     }
     out
 }
@@ -1097,10 +1094,10 @@ pub fn extract_vvc_nals_of_type(buf: &[u8], nut: u8) -> Vec<&[u8]> {
     let mut out: Vec<&[u8]> = Vec::new();
     for (off, len) in split_vvc_nal_units(buf) {
         let nal = &buf[off..off + len];
-        if let Some(t) = vvc_nal_unit_type(nal) {
-            if t == nut {
-                out.push(nal);
-            }
+        if let Some(t) = vvc_nal_unit_type(nal)
+            && t == nut
+        {
+            out.push(nal);
         }
     }
     out
@@ -1127,22 +1124,21 @@ pub fn extract_vvc_config_prefix(buf: &[u8]) -> Option<&[u8]> {
         if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
             // Start code at [i..i+3]; NAL starts at i+3. Check VCL.
             let nal_off = i + 3;
-            if nal_off + 2 <= buf.len() {
-                if let Some(nut) = vvc_nal_unit_type(&buf[nal_off..nal_off + 2]) {
-                    if vvc_is_vcl_nut(nut) {
-                        // Back up past an optional preceding zero_byte (the
-                        // 4-byte start code form `00 00 00 01`).
-                        let mut prefix_end = i;
-                        if prefix_end > 0 && buf[prefix_end - 1] == 0 {
-                            prefix_end -= 1;
-                        }
-                        return if prefix_end == 0 {
-                            None
-                        } else {
-                            Some(&buf[..prefix_end])
-                        };
-                    }
+            if nal_off + 2 <= buf.len()
+                && let Some(nut) = vvc_nal_unit_type(&buf[nal_off..nal_off + 2])
+                && vvc_is_vcl_nut(nut)
+            {
+                // Back up past an optional preceding zero_byte (the
+                // 4-byte start code form `00 00 00 01`).
+                let mut prefix_end = i;
+                if prefix_end > 0 && buf[prefix_end - 1] == 0 {
+                    prefix_end -= 1;
                 }
+                return if prefix_end == 0 {
+                    None
+                } else {
+                    Some(&buf[..prefix_end])
+                };
             }
             i += 3;
         } else {
@@ -1834,25 +1830,24 @@ impl Decoder for BlobDecoder {
         if self.session.is_null() && self.extradata.is_none() {
             match self.framer {
                 FrameSplit::Mpeg4PartTwoEs => {
-                    if let Some(vol) = extract_mpeg4_part_two_vol(&packet.data) {
-                        if !vol.is_empty() {
-                            self.extradata = Some(("esds", build_mpeg4_part_two_esds(vol)));
-                        }
+                    if let Some(vol) = extract_mpeg4_part_two_vol(&packet.data)
+                        && !vol.is_empty()
+                    {
+                        self.extradata = Some(("esds", build_mpeg4_part_two_esds(vol)));
                     }
                 }
                 FrameSplit::Av1Whole => {
-                    if let Some(sh) = extract_av1_sequence_header_obu(&packet.data) {
-                        if !sh.is_empty() {
-                            self.extradata = Some(("av1C", build_av1c_config_record(sh)));
-                        }
+                    if let Some(sh) = extract_av1_sequence_header_obu(&packet.data)
+                        && !sh.is_empty()
+                    {
+                        self.extradata = Some(("av1C", build_av1c_config_record(sh)));
                     }
                 }
                 FrameSplit::VvcEs => {
-                    if let Some(prefix) = extract_vvc_config_prefix(&packet.data) {
-                        if !prefix.is_empty() {
-                            self.extradata =
-                                Some(("vvcC", build_vvc_decoder_config_record(prefix)));
-                        }
+                    if let Some(prefix) = extract_vvc_config_prefix(&packet.data)
+                        && !prefix.is_empty()
+                    {
+                        self.extradata = Some(("vvcC", build_vvc_decoder_config_record(prefix)));
                     }
                 }
                 _ => {}
@@ -1925,10 +1920,10 @@ impl Decoder for BlobDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        if !self.session.is_null() {
-            if let Ok(vt) = sys::vtable() {
-                unsafe { (vt.vt_decomp_wait)(self.session) };
-            }
+        if !self.session.is_null()
+            && let Ok(vt) = sys::vtable()
+        {
+            unsafe { (vt.vt_decomp_wait)(self.session) };
         }
         self.pull_frames();
         self.flushed = true;
@@ -2137,17 +2132,17 @@ impl BlobEncoder {
         // the JPEG quality scale that drives the standard quant tables).
         // The ProRes encoder accepts the property but treats it as a
         // hint; profile selection (via codec type) is the main lever.
-        if let Some(q_raw) = params.options.get("quality") {
-            if let Ok(q) = q_raw.parse::<f32>() {
-                if q.is_finite() && (0.0..=1.0).contains(&q) {
-                    let q_val = unsafe { sys::cf_number_f32(vt, q) };
-                    let q_key = unsafe { cf_string(vt, "Quality") };
-                    unsafe {
-                        (vt.vt_session_set_property)(session, q_key, q_val);
-                        (vt.cf_release)(q_key);
-                        (vt.cf_release)(q_val);
-                    }
-                }
+        if let Some(q_raw) = params.options.get("quality")
+            && let Ok(q) = q_raw.parse::<f32>()
+            && q.is_finite()
+            && (0.0..=1.0).contains(&q)
+        {
+            let q_val = unsafe { sys::cf_number_f32(vt, q) };
+            let q_key = unsafe { cf_string(vt, "Quality") };
+            unsafe {
+                (vt.vt_session_set_property)(session, q_key, q_val);
+                (vt.cf_release)(q_key);
+                (vt.cf_release)(q_val);
             }
         }
 
@@ -2158,15 +2153,15 @@ impl BlobEncoder {
         // is also intra-only, so VT silently ignores the property here.
         // The plumbing is identical to the H.264 / HEVC paths in
         // `encoder.rs` to keep the bridge surface uniform.
-        if let Some(kfi_raw) = params.options.get("keyframe_interval") {
-            if let Some(kfi) = parse_keyframe_interval(kfi_raw) {
-                let kfi_val = unsafe { cf_number_i32(vt, kfi) };
-                let kfi_key = unsafe { cf_string(vt, "MaxKeyFrameInterval") };
-                unsafe {
-                    (vt.vt_session_set_property)(session, kfi_key, kfi_val);
-                    (vt.cf_release)(kfi_key);
-                    (vt.cf_release)(kfi_val);
-                }
+        if let Some(kfi_raw) = params.options.get("keyframe_interval")
+            && let Some(kfi) = parse_keyframe_interval(kfi_raw)
+        {
+            let kfi_val = unsafe { cf_number_i32(vt, kfi) };
+            let kfi_key = unsafe { cf_string(vt, "MaxKeyFrameInterval") };
+            unsafe {
+                (vt.vt_session_set_property)(session, kfi_key, kfi_val);
+                (vt.cf_release)(kfi_key);
+                (vt.cf_release)(kfi_val);
             }
         }
 
@@ -2174,15 +2169,15 @@ impl BlobEncoder {
         // (seconds, CFNumber<Float64>). Same SDK property as the H.264 /
         // HEVC paths; MJPEG / ProRes are intra-only and ignore it but VT
         // accepts the property unconditionally.
-        if let Some(kfd_raw) = params.options.get("keyframe_interval_duration") {
-            if let Some(kfd) = parse_keyframe_interval_duration(kfd_raw) {
-                let kfd_val = unsafe { sys::cf_number_f64(vt, kfd) };
-                let kfd_key = unsafe { cf_string(vt, "MaxKeyFrameIntervalDuration") };
-                unsafe {
-                    (vt.vt_session_set_property)(session, kfd_key, kfd_val);
-                    (vt.cf_release)(kfd_key);
-                    (vt.cf_release)(kfd_val);
-                }
+        if let Some(kfd_raw) = params.options.get("keyframe_interval_duration")
+            && let Some(kfd) = parse_keyframe_interval_duration(kfd_raw)
+        {
+            let kfd_val = unsafe { sys::cf_number_f64(vt, kfd) };
+            let kfd_key = unsafe { cf_string(vt, "MaxKeyFrameIntervalDuration") };
+            unsafe {
+                (vt.vt_session_set_property)(session, kfd_key, kfd_val);
+                (vt.cf_release)(kfd_key);
+                (vt.cf_release)(kfd_val);
             }
         }
 
@@ -2208,22 +2203,22 @@ impl BlobEncoder {
         // ProRes ignores it (ProRes is fixed-CBR per profile). The
         // plumbing is uniform across all encoder paths to keep the
         // bridge surface minimal.
-        if let Some(drl_raw) = params.options.get("data_rate_limits") {
-            if let Some(segments) = parse_data_rate_limits(drl_raw) {
-                let mut elements: Vec<sys::CFTypeRef> = Vec::with_capacity(segments.len() * 2);
-                for seg in &segments {
-                    elements.push(unsafe { cf_number_i32(vt, seg.bytes) });
-                    elements.push(unsafe { sys::cf_number_f64(vt, seg.seconds) });
-                }
-                let arr = unsafe { sys::cf_array(vt, &elements) };
-                let drl_key = unsafe { cf_string(vt, "DataRateLimits") };
-                unsafe {
-                    (vt.vt_session_set_property)(session, drl_key, arr);
-                    (vt.cf_release)(drl_key);
-                    (vt.cf_release)(arr);
-                    for e in elements {
-                        (vt.cf_release)(e);
-                    }
+        if let Some(drl_raw) = params.options.get("data_rate_limits")
+            && let Some(segments) = parse_data_rate_limits(drl_raw)
+        {
+            let mut elements: Vec<sys::CFTypeRef> = Vec::with_capacity(segments.len() * 2);
+            for seg in &segments {
+                elements.push(unsafe { cf_number_i32(vt, seg.bytes) });
+                elements.push(unsafe { sys::cf_number_f64(vt, seg.seconds) });
+            }
+            let arr = unsafe { sys::cf_array(vt, &elements) };
+            let drl_key = unsafe { cf_string(vt, "DataRateLimits") };
+            unsafe {
+                (vt.vt_session_set_property)(session, drl_key, arr);
+                (vt.cf_release)(drl_key);
+                (vt.cf_release)(arr);
+                for e in elements {
+                    (vt.cf_release)(e);
                 }
             }
         }
@@ -2236,15 +2231,15 @@ impl BlobEncoder {
         // returns `kVTPropertyNotSupportedErr` since the profile dictates
         // its CBR target. Failure is non-fatal, matching every other
         // knob in this list.
-        if let Some(cbr_raw) = params.options.get("constant_bit_rate") {
-            if let Some(cbr) = parse_constant_bit_rate(cbr_raw) {
-                let cbr_val = unsafe { cf_number_i32(vt, cbr) };
-                let cbr_key = unsafe { cf_string(vt, "ConstantBitRate") };
-                unsafe {
-                    (vt.vt_session_set_property)(session, cbr_key, cbr_val);
-                    (vt.cf_release)(cbr_key);
-                    (vt.cf_release)(cbr_val);
-                }
+        if let Some(cbr_raw) = params.options.get("constant_bit_rate")
+            && let Some(cbr) = parse_constant_bit_rate(cbr_raw)
+        {
+            let cbr_val = unsafe { cf_number_i32(vt, cbr) };
+            let cbr_key = unsafe { cf_string(vt, "ConstantBitRate") };
+            unsafe {
+                (vt.vt_session_set_property)(session, cbr_key, cbr_val);
+                (vt.cf_release)(cbr_key);
+                (vt.cf_release)(cbr_val);
             }
         }
 
@@ -2722,13 +2717,13 @@ pub fn make_vvc_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 #[cfg(test)]
 mod tests {
     use super::{
+        Av1SeqHeaderFields, VVC_NUT_AUD, VVC_NUT_DCI, VVC_NUT_IDR_W_RADL, VVC_NUT_OPI, VVC_NUT_PH,
+        VVC_NUT_PPS, VVC_NUT_PREFIX_APS, VVC_NUT_SPS, VVC_NUT_TRAIL, VVC_NUT_VPS,
         build_av1c_config_record, build_mpeg4_part_two_esds, build_vvc_decoder_config_record,
         extract_av1_sequence_header_obu, extract_mpeg4_part_two_vol, extract_vvc_config_prefix,
         extract_vvc_nals_of_type, parse_av1_seq_header_fields, split_mpeg2_access_units,
         split_mpeg4_part_two_access_units, split_vvc_access_units, split_vvc_nal_units,
-        vvc_is_vcl_nut, vvc_nal_unit_type, Av1SeqHeaderFields, VVC_NUT_AUD, VVC_NUT_DCI,
-        VVC_NUT_IDR_W_RADL, VVC_NUT_OPI, VVC_NUT_PH, VVC_NUT_PPS, VVC_NUT_PREFIX_APS, VVC_NUT_SPS,
-        VVC_NUT_TRAIL, VVC_NUT_VPS,
+        vvc_is_vcl_nut, vvc_nal_unit_type,
     };
 
     // Start codes: B3 = sequence header, B8 = GOP, 00 = picture, B5 = ext.

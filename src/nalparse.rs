@@ -683,7 +683,7 @@ impl HevcPictureInfo {
     /// that never become `prevTid0Pic` (§8.3.1).
     fn excluded_from_prev_tid0(&self) -> bool {
         let t = self.nal_unit_type;
-        (t <= 14 && t % 2 == 0) || (6..=9).contains(&t)
+        (t <= 14 && t.is_multiple_of(2)) || (6..=9).contains(&t)
     }
 }
 
@@ -802,7 +802,7 @@ mod tests {
     /// Build a NAL payload from a bit string ("0"/"1" characters).
     fn bits(s: &str) -> Vec<u8> {
         let mut s = s.replace(' ', "");
-        while s.len() % 8 != 0 {
+        while !s.len().is_multiple_of(8) {
             s.push('0');
         }
         s.as_bytes()

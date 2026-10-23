@@ -23,7 +23,7 @@ mod common;
 use common::*;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Error, PixelFormat, TimeBase};
 use oxideav_videotoolbox::decoder::{
-    annex_b_nals, split_access_units, NalCodec, NalVtDecoder, ParamSets,
+    NalCodec, NalVtDecoder, ParamSets, annex_b_nals, split_access_units,
 };
 
 const W: u32 = 48;

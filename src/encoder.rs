@@ -97,19 +97,19 @@ pub(crate) fn parse_keyframe_interval_duration(opt: &str) -> Option<f64> {
 /// the actual presentation rate, but Apple recommends setting it to the
 /// real-time frame rate when the stream targets a known cadence.
 pub(crate) fn resolve_expected_frame_rate(params: &CodecParameters) -> Option<f64> {
-    if let Some(raw) = params.options.get("expected_frame_rate") {
-        if let Ok(v) = raw.trim().parse::<f64>() {
-            if v.is_finite() && v > 0.0 {
-                return Some(v);
-            }
-        }
+    if let Some(raw) = params.options.get("expected_frame_rate")
+        && let Ok(v) = raw.trim().parse::<f64>()
+        && v.is_finite()
+        && v > 0.0
+    {
+        return Some(v);
     }
-    if let Some(r) = params.frame_rate {
-        if r.den != 0 {
-            let v = r.as_f64();
-            if v.is_finite() && v > 0.0 {
-                return Some(v);
-            }
+    if let Some(r) = params.frame_rate
+        && r.den != 0
+    {
+        let v = r.as_f64();
+        if v.is_finite() && v > 0.0 {
+            return Some(v);
         }
     }
     None
@@ -535,14 +535,14 @@ fn hevc_profile_string(opt: &str) -> Option<&'static str> {
     match lower.as_str() {
         "main" | "main_auto" | "main_autolevel" => return Some("HEVC_Main_AutoLevel"),
         "main10" | "main_10" | "main10_auto" | "main10_autolevel" => {
-            return Some("HEVC_Main10_AutoLevel")
+            return Some("HEVC_Main10_AutoLevel");
         }
         // Round 9 input aliases — kept verbatim.
         "main4_2_2_10" | "main422_10" => return Some("HEVC_Main42210_AutoLevel"),
         // New input aliases — the canonical SDK-symbol form and the
         // value-form (no underscores).
         "main42210" | "main_42210" | "main_4_2_2_10_autolevel" => {
-            return Some("HEVC_Main42210_AutoLevel")
+            return Some("HEVC_Main42210_AutoLevel");
         }
         "" => return None,
         _ => {}
@@ -959,17 +959,17 @@ impl VtEncoder {
         // Apple's H.264 / HEVC encoders document this as a hint that
         // interacts with the rate-control mode (it is the primary knob
         // in constant-quality mode and biases the encoder otherwise).
-        if let Some(q_raw) = params.options.get("quality") {
-            if let Ok(q) = q_raw.parse::<f32>() {
-                if q.is_finite() && (0.0..=1.0).contains(&q) {
-                    let q_val = unsafe { sys::cf_number_f32(vt, q) };
-                    let q_key = unsafe { sys::cf_string(vt, K_VT_QUALITY) };
-                    unsafe {
-                        (vt.vt_session_set_property)(session, q_key, q_val);
-                        (vt.cf_release)(q_key);
-                        (vt.cf_release)(q_val);
-                    }
-                }
+        if let Some(q_raw) = params.options.get("quality")
+            && let Ok(q) = q_raw.parse::<f32>()
+            && q.is_finite()
+            && (0.0..=1.0).contains(&q)
+        {
+            let q_val = unsafe { sys::cf_number_f32(vt, q) };
+            let q_key = unsafe { sys::cf_string(vt, K_VT_QUALITY) };
+            unsafe {
+                (vt.vt_session_set_property)(session, q_key, q_val);
+                (vt.cf_release)(q_key);
+                (vt.cf_release)(q_val);
             }
         }
 
@@ -981,15 +981,15 @@ impl VtEncoder {
         // upper bound; unparseable / negative input is ignored so the
         // encoder keeps VT's built-in default (also "no cap" on Apple
         // hardware encoders unless the caller asks for one).
-        if let Some(kfi_raw) = params.options.get("keyframe_interval") {
-            if let Some(kfi) = parse_keyframe_interval(kfi_raw) {
-                let kfi_val = unsafe { sys::cf_number_i32(vt, kfi) };
-                let kfi_key = unsafe { sys::cf_string(vt, K_VT_MAX_KEY_FRAME_INTERVAL) };
-                unsafe {
-                    (vt.vt_session_set_property)(session, kfi_key, kfi_val);
-                    (vt.cf_release)(kfi_key);
-                    (vt.cf_release)(kfi_val);
-                }
+        if let Some(kfi_raw) = params.options.get("keyframe_interval")
+            && let Some(kfi) = parse_keyframe_interval(kfi_raw)
+        {
+            let kfi_val = unsafe { sys::cf_number_i32(vt, kfi) };
+            let kfi_key = unsafe { sys::cf_string(vt, K_VT_MAX_KEY_FRAME_INTERVAL) };
+            unsafe {
+                (vt.vt_session_set_property)(session, kfi_key, kfi_val);
+                (vt.cf_release)(kfi_key);
+                (vt.cf_release)(kfi_val);
             }
         }
 
@@ -998,15 +998,15 @@ impl VtEncoder {
         // (CFNumber<seconds> per the SDK header). Apple documents both
         // duration- and frame-count-based caps as composable: VT picks
         // whichever forces a keyframe first. 0 disables the duration cap.
-        if let Some(kfd_raw) = params.options.get("keyframe_interval_duration") {
-            if let Some(kfd) = parse_keyframe_interval_duration(kfd_raw) {
-                let kfd_val = unsafe { sys::cf_number_f64(vt, kfd) };
-                let kfd_key = unsafe { sys::cf_string(vt, K_VT_MAX_KEY_FRAME_INTERVAL_DURATION) };
-                unsafe {
-                    (vt.vt_session_set_property)(session, kfd_key, kfd_val);
-                    (vt.cf_release)(kfd_key);
-                    (vt.cf_release)(kfd_val);
-                }
+        if let Some(kfd_raw) = params.options.get("keyframe_interval_duration")
+            && let Some(kfd) = parse_keyframe_interval_duration(kfd_raw)
+        {
+            let kfd_val = unsafe { sys::cf_number_f64(vt, kfd) };
+            let kfd_key = unsafe { sys::cf_string(vt, K_VT_MAX_KEY_FRAME_INTERVAL_DURATION) };
+            unsafe {
+                (vt.vt_session_set_property)(session, kfd_key, kfd_val);
+                (vt.cf_release)(kfd_key);
+                (vt.cf_release)(kfd_val);
             }
         }
 
@@ -1034,26 +1034,26 @@ impl VtEncoder {
         // documented rejection set so VT receives a well-formed array
         // or no array at all (the encoder keeps its default rate
         // control).
-        if let Some(drl_raw) = params.options.get("data_rate_limits") {
-            if let Some(segments) = parse_data_rate_limits(drl_raw) {
-                // Build a CFArray of CFNumbers alternating bytes-i32,
-                // seconds-Float64. CoreFoundation copies each value at
-                // CFNumberCreate time; we release every element after the
-                // array retains it via `kCFTypeArrayCallBacks`.
-                let mut elements: Vec<sys::CFTypeRef> = Vec::with_capacity(segments.len() * 2);
-                for seg in &segments {
-                    elements.push(unsafe { sys::cf_number_i32(vt, seg.bytes) });
-                    elements.push(unsafe { sys::cf_number_f64(vt, seg.seconds) });
-                }
-                let arr = unsafe { sys::cf_array(vt, &elements) };
-                let drl_key = unsafe { sys::cf_string(vt, K_VT_DATA_RATE_LIMITS) };
-                unsafe {
-                    (vt.vt_session_set_property)(session, drl_key, arr);
-                    (vt.cf_release)(drl_key);
-                    (vt.cf_release)(arr);
-                    for e in elements {
-                        (vt.cf_release)(e);
-                    }
+        if let Some(drl_raw) = params.options.get("data_rate_limits")
+            && let Some(segments) = parse_data_rate_limits(drl_raw)
+        {
+            // Build a CFArray of CFNumbers alternating bytes-i32,
+            // seconds-Float64. CoreFoundation copies each value at
+            // CFNumberCreate time; we release every element after the
+            // array retains it via `kCFTypeArrayCallBacks`.
+            let mut elements: Vec<sys::CFTypeRef> = Vec::with_capacity(segments.len() * 2);
+            for seg in &segments {
+                elements.push(unsafe { sys::cf_number_i32(vt, seg.bytes) });
+                elements.push(unsafe { sys::cf_number_f64(vt, seg.seconds) });
+            }
+            let arr = unsafe { sys::cf_array(vt, &elements) };
+            let drl_key = unsafe { sys::cf_string(vt, K_VT_DATA_RATE_LIMITS) };
+            unsafe {
+                (vt.vt_session_set_property)(session, drl_key, arr);
+                (vt.cf_release)(drl_key);
+                (vt.cf_release)(arr);
+                for e in elements {
+                    (vt.cf_release)(e);
                 }
             }
         }
@@ -1067,15 +1067,15 @@ impl VtEncoder {
         // `VTSessionSetProperty`; we treat that as non-fatal so the
         // encoder keeps its default mode, matching every prior
         // round-9 / round-13 knob's failure semantics.
-        if let Some(cbr_raw) = params.options.get("constant_bit_rate") {
-            if let Some(cbr) = parse_constant_bit_rate(cbr_raw) {
-                let cbr_val = unsafe { sys::cf_number_i32(vt, cbr) };
-                let cbr_key = unsafe { sys::cf_string(vt, K_VT_CONSTANT_BIT_RATE) };
-                unsafe {
-                    (vt.vt_session_set_property)(session, cbr_key, cbr_val);
-                    (vt.cf_release)(cbr_key);
-                    (vt.cf_release)(cbr_val);
-                }
+        if let Some(cbr_raw) = params.options.get("constant_bit_rate")
+            && let Some(cbr) = parse_constant_bit_rate(cbr_raw)
+        {
+            let cbr_val = unsafe { sys::cf_number_i32(vt, cbr) };
+            let cbr_key = unsafe { sys::cf_string(vt, K_VT_CONSTANT_BIT_RATE) };
+            unsafe {
+                (vt.vt_session_set_property)(session, cbr_key, cbr_val);
+                (vt.cf_release)(cbr_key);
+                (vt.cf_release)(cbr_val);
             }
         }
 
@@ -1432,9 +1432,9 @@ pub fn make_hevc_encoder(params: &CodecParameters) -> Result<Box<dyn oxideav_cor
 #[cfg(test)]
 mod tests {
     use super::{
-        frame_duration_us, h264_profile_string, hevc_profile_string, parse_constant_bit_rate,
-        parse_data_rate_limits, parse_keyframe_interval, parse_keyframe_interval_duration,
-        resolve_expected_frame_rate, DataRateLimit,
+        DataRateLimit, frame_duration_us, h264_profile_string, hevc_profile_string,
+        parse_constant_bit_rate, parse_data_rate_limits, parse_keyframe_interval,
+        parse_keyframe_interval_duration, resolve_expected_frame_rate,
     };
     use oxideav_core::{CodecId, CodecParameters, Rational};
 
@@ -1442,7 +1442,7 @@ mod tests {
     /// session-specification policies and rejects unknown input.
     #[test]
     fn hardware_mode_parser() {
-        use super::{parse_hardware_mode, HardwareMode};
+        use super::{HardwareMode, parse_hardware_mode};
         assert_eq!(parse_hardware_mode("require"), Some(HardwareMode::Require));
         assert_eq!(parse_hardware_mode("REQUIRED"), Some(HardwareMode::Require));
         assert_eq!(parse_hardware_mode(" enable "), Some(HardwareMode::Enable));

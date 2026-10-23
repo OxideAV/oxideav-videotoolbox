@@ -43,10 +43,10 @@ use oxideav_core::{
     CodecId, CodecParameters, Decoder, Error, Frame, Packet, PixelFormat, Result, VideoFrame,
 };
 
-use crate::encoder::{build_hw_spec_dict, parse_hardware_mode, vt_error, HardwareMode};
+use crate::encoder::{HardwareMode, build_hw_spec_dict, parse_hardware_mode, vt_error};
 use crate::nalparse::{
-    h264_slice_info, hevc_slice_info, H264PocState, H264Pps, H264Sps, HevcPocState, HevcPps,
-    HevcSps,
+    H264PocState, H264Pps, H264Sps, HevcPocState, HevcPps, HevcSps, h264_slice_info,
+    hevc_slice_info,
 };
 use crate::pixbuf;
 use crate::sys::{
@@ -158,11 +158,7 @@ pub fn packet_nals(buf: &[u8], length_size: Option<usize>) -> Vec<&[u8]> {
     match length_size {
         Some(ls) => {
             let (nals, exact) = length_prefixed_walk(buf, ls);
-            if exact {
-                nals
-            } else {
-                annex_b_nals(buf)
-            }
+            if exact { nals } else { annex_b_nals(buf) }
         }
         None if starts_with_start_code(buf) => annex_b_nals(buf),
         None => length_prefixed_nals(buf, 4),
@@ -633,14 +629,14 @@ fn submit_access_unit(
 
 // Minimal libc shim — just malloc/free.
 unsafe fn libc_malloc(size: usize) -> *mut c_void {
-    extern "C" {
+    unsafe extern "C" {
         fn malloc(size: usize) -> *mut c_void;
     }
     unsafe { malloc(size) }
 }
 
 unsafe fn libc_free(ptr: *mut c_void) {
-    extern "C" {
+    unsafe extern "C" {
         fn free(ptr: *mut c_void);
     }
     unsafe { free(ptr) }
@@ -823,13 +819,13 @@ impl NalVtDecoder {
     pub fn make(codec: NalCodec, params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         sys::vtable().map_err(|e| Error::unsupported(format!("videotoolbox: {e}")))?;
         let declared = params.pixel_format;
-        if let Some(pf) = declared {
-            if pixbuf::request_for_label(pf, false).is_none() {
-                return Err(Error::unsupported(format!(
-                    "videotoolbox: cannot deliver {} frames as {pf:?}",
-                    codec.id()
-                )));
-            }
+        if let Some(pf) = declared
+            && pixbuf::request_for_label(pf, false).is_none()
+        {
+            return Err(Error::unsupported(format!(
+                "videotoolbox: cannot deliver {} frames as {pf:?}",
+                codec.id()
+            )));
         }
         let mut dec = NalVtDecoder {
             codec,
@@ -1211,11 +1207,11 @@ impl Decoder for NalVtDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        if !self.session.is_null() {
-            if let Ok(vt) = sys::vtable() {
-                // Barrier: waits for every outstanding callback.
-                unsafe { (vt.vt_decomp_wait)(self.session) };
-            }
+        if !self.session.is_null()
+            && let Ok(vt) = sys::vtable()
+        {
+            // Barrier: waits for every outstanding callback.
+            unsafe { (vt.vt_decomp_wait)(self.session) };
         }
         self.pull_frames();
         self.release(usize::MAX);
@@ -1230,10 +1226,10 @@ impl Decoder for NalVtDecoder {
         // Drop in-flight and queued output; keep the parameter sets and
         // the session (the next packet decodes from a fresh random-access
         // point).
-        if !self.session.is_null() {
-            if let Ok(vt) = sys::vtable() {
-                unsafe { (vt.vt_decomp_wait)(self.session) };
-            }
+        if !self.session.is_null()
+            && let Ok(vt) = sys::vtable()
+        {
+            unsafe { (vt.vt_decomp_wait)(self.session) };
         }
         if let Ok(mut g) = self.state.lock() {
             g.frames.clear();

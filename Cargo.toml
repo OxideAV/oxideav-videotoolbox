@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-videotoolbox"
 version = "0.0.4"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-videotoolbox"
 homepage = "https://github.com/OxideAV/oxideav-videotoolbox"

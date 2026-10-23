@@ -236,7 +236,7 @@ fn shift_words(plane: &mut [u8], shift: u32) {
     if shift == 0 {
         return;
     }
-    for w in plane.chunks_exact_mut(2) {
+    for w in plane.as_chunks_mut::<2>().0 {
         let v = u16::from_le_bytes([w[0], w[1]]) >> shift;
         w.copy_from_slice(&v.to_le_bytes());
     }

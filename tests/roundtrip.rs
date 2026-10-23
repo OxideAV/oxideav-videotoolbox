@@ -1576,11 +1576,11 @@ fn vp9_decode_against_ffmpeg() {
             }
         }
     }
-    if let Some(e) = session_err {
-        if decoded.is_empty() {
-            eprintln!("VT VP9 decoder errored at decode time: {e}; skipping");
-            return;
-        }
+    if let Some(e) = session_err
+        && decoded.is_empty()
+    {
+        eprintln!("VT VP9 decoder errored at decode time: {e}; skipping");
+        return;
     }
 
     decoder.flush().expect("decoder flush");
@@ -2067,11 +2067,11 @@ fn av1_decode_against_ffmpeg() {
             }
         }
     }
-    if let Some(e) = session_err {
-        if decoded.is_empty() {
-            eprintln!("VT AV1 decoder errored at decode time: {e}; skipping");
-            return;
-        }
+    if let Some(e) = session_err
+        && decoded.is_empty()
+    {
+        eprintln!("VT AV1 decoder errored at decode time: {e}; skipping");
+        return;
     }
 
     decoder.flush().expect("decoder flush");
