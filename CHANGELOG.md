@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - edition 2024, MSRV 1.95
+- loader: the four Apple frameworks are opened and resolved through the `dlsym` crate instead of `libloading` (`Library::open` on macOS, `Library::this()` = `dlsym(RTLD_DEFAULT, …)` on iOS); `sys::Vtable` still owns the handles its pointers were resolved from, so the public `vtable()` / `framework()` API and the `&str` error surface are unchanged; the `Library` fields of `sys::Framework` / `sys::FrameworkSmoke` are now `dlsym::Library`
 
 ## [0.0.4](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.3...v0.0.4) - 2026-10-15
 

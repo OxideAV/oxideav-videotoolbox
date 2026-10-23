@@ -8,13 +8,13 @@ Apple-platform (macOS + iOS) VideoToolbox hardware decode/encode bridge for the 
 
 Apple's [VideoToolbox](https://developer.apple.com/documentation/videotoolbox) exposes the dedicated media engine on Apple Silicon (and the equivalent IP on Intel Macs). For codecs the chip supports natively this is **5-50× faster** than software decoding and orders of magnitude more energy-efficient.
 
-This crate is a **thin runtime-loaded bridge** — no compile-time link dependency on VideoToolbox, no Objective-C / Swift. The framework is opened via [`libloading`] on first use.
+This crate is a **thin runtime-loaded bridge** — no compile-time link dependency on VideoToolbox, no Objective-C / Swift. The framework is opened via [`dlsym`](https://crates.io/crates/dlsym) on first use.
 
 ## Fallback behaviour
 
 Two distinct failure paths fall back automatically to the pure-Rust codec:
 
-1. **Load failure** — older OS, missing framework, sandboxed environment without VT entitlements. `register()` logs and returns without registering, so the SW codec is the only candidate at dispatch. On macOS this surfaces if `Library::new("/System/Library/Frameworks/...")` cannot map the framework; on iOS the system dyld has link-loaded the four frameworks at process start, so the only path that fires this branch is a `Library::this()` failure (effectively impossible for a running process — Apple's runtime always provides the frameworks on every supported iOS version).
+1. **Load failure** — older OS, missing framework, sandboxed environment without VT entitlements. `register()` logs and returns without registering, so the SW codec is the only candidate at dispatch. On macOS this surfaces if `dlsym::Library::open("/System/Library/Frameworks/...")` cannot map the framework; on iOS the system dyld has link-loaded the four frameworks at process start, so the only path that fires this branch is a `Library::this()` failure (effectively impossible for a running process — Apple's runtime always provides the frameworks on every supported iOS version).
 2. **Init failure** — `VTDecompressionSessionCreate` / `VTCompressionSessionCreate` returns a non-zero `OSStatus` for the requested parameters. Common triggers: stream above the device's max resolution, hardware encoder slot already busy (concurrent-session cap), unsupported pixel format, codec profile the device doesn't accelerate. The factory returns `Err`; `oxideav_pipeline::make_decoder_with` / `make_encoder_with` (the selection layer the pipeline and CLI use) retries the next-priority impl (typically the SW one). On iOS this also catches the platform-specific gaps Apple documents — e.g. AV1 encode requires A17+, ProRes encode requires iPhone 13 Pro+, some `kVTCompressionPropertyKey_*` keys are macOS-only and return `kVTPropertyNotSupportedErr` (treated as non-fatal by the property-write helper).
 
 ## Error taxonomy
@@ -80,8 +80,8 @@ The whole crate is `#![cfg(any(target_os = "macos", target_os = "ios"))]`. On Li
 
 Symbol-loading shape differs by platform:
 
-* **macOS** — `libloading::Library::new("/System/Library/Frameworks/<Name>.framework/<Name>")` opens each of VideoToolbox / CoreVideo / CoreMedia / CoreFoundation via `dlopen` at first use. **No compile-time link dependency.**
-* **iOS** — the four Apple system frameworks are link-loaded at process start by the system dyld via `build.rs` (`cargo:rustc-link-lib=framework=VideoToolbox` etc.). At runtime `libloading::os::unix::Library::this()` returns the host process's `RTLD_DEFAULT` handle and every framework symbol resolves via `dlsym` against the dyld shared cache.
+* **macOS** — `dlsym::Library::open("/System/Library/Frameworks/<Name>.framework/<Name>")` opens each of VideoToolbox / CoreVideo / CoreMedia / CoreFoundation via `dlopen` at first use. **No compile-time link dependency.**
+* **iOS** — the four Apple system frameworks are link-loaded at process start by the system dyld via `build.rs` (`cargo:rustc-link-lib=framework=VideoToolbox` etc.). At runtime `dlsym::Library::this()` returns the host process's `RTLD_DEFAULT` handle and every framework symbol resolves via `dlsym` against the dyld shared cache.
 
 The vtable assembly code and every call site are identical across the two branches — the only difference is the `sys::open()` helper.
 

@@ -13,7 +13,7 @@
 //! | CoreMedia        | `CMSampleBuffer*`, `CMVideoFormatDescription*`   |
 //! | CoreFoundation   | `CFRetain` / `CFRelease` / `CFNumber*` / `CFDictionary*` |
 
-use libloading::Library;
+use dlsym::Library;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -642,13 +642,20 @@ fn load_vtable() -> Result<Vtable, String> {
     let cm = open("/System/Library/Frameworks/CoreMedia.framework/CoreMedia")?;
     let cf = open("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")?;
 
+    // Resolve one symbol from `$lib` as `$ty` and detach it from the
+    // library borrow. Detaching is sound because the `Vtable` stores the
+    // four `Library` handles next to the pointers, so a pointer can never
+    // outlive the mapping it was resolved from.
     macro_rules! sym {
         ($lib:expr, $name:expr, $ty:ty) => {{
-            let s: libloading::Symbol<$ty> = unsafe {
-                $lib.get(concat!($name, "\0").as_bytes())
+            // SAFETY: `$ty` is the C signature (or data pointer type) of
+            // `$name` as declared in the framework header; see above for
+            // why the pointer may leave the `Symbol` borrow.
+            unsafe {
+                $lib.get::<$ty>($name)
                     .map_err(|e| format!("dlsym {}: {}", $name, e))?
-            };
-            *s
+                    .into_inner()
+            }
         }};
     }
 
@@ -760,11 +767,22 @@ fn load_vtable() -> Result<Vtable, String> {
             "CMSampleBufferGetFormatDescription",
             FnCMSampleBufferGetFormatDescription
         ),
-        cv_pb_create_planar: sym!(
-            cv,
-            "CVPixelBufferCreateWithPlanarBytes",
-            FnCVPixelBufferCreateWithPlanarBytes
-        ),
+        // `CVPixelBufferCreateWithPlanarBytes` takes 14 arguments — past the
+        // 12-argument cap of dlsym's function-pointer `SymbolType` impls —
+        // so it is resolved as a data address and re-typed here, with the
+        // null check `Library::get` would otherwise perform for us.
+        cv_pb_create_planar: {
+            let addr = sym!(cv, "CVPixelBufferCreateWithPlanarBytes", *const c_void);
+            if addr.is_null() {
+                return Err("dlsym CVPixelBufferCreateWithPlanarBytes: null address".into());
+            }
+            // SAFETY: the address was resolved from CoreVideo under this
+            // exact exported name and is non-null; `FnCVPixelBufferCreateWithPlanarBytes`
+            // is its header signature. `cv` is kept alive in `_cv` below.
+            unsafe {
+                std::mem::transmute::<*const c_void, FnCVPixelBufferCreateWithPlanarBytes>(addr)
+            }
+        },
         cv_pb_lock: sym!(
             cv,
             "CVPixelBufferLockBaseAddress",
@@ -823,54 +841,35 @@ fn load_vtable() -> Result<Vtable, String> {
         // raw pointer and pass the *pointer* (not the value) to
         // `CFArrayCreate` so the freshly-created array retains/releases
         // its `CFType` elements correctly.
-        cf_type_array_callbacks: {
-            let s: libloading::Symbol<*const c_void> = unsafe {
-                cf.get(b"kCFTypeArrayCallBacks\0")
-                    .map_err(|e| format!("dlsym kCFTypeArrayCallBacks: {e}"))?
-            };
-            // `Symbol<*const c_void>` derefs to the address the linker
-            // stored — i.e. the address of the `CFArrayCallBacks` struct.
-            *s
-        },
+        // A data symbol resolved as `*const c_void` *is* the address the
+        // linker stored — i.e. the address of the `CFArrayCallBacks` struct.
+        cf_type_array_callbacks: sym!(cf, "kCFTypeArrayCallBacks", *const c_void),
         // Like `kCFTypeArrayCallBacks`, the dictionary callback symbols
         // *are* the callback structs — pass the symbol address itself.
-        cf_type_dict_key_callbacks: {
-            let s: libloading::Symbol<*const c_void> = unsafe {
-                cf.get(b"kCFTypeDictionaryKeyCallBacks\0")
-                    .map_err(|e| format!("dlsym kCFTypeDictionaryKeyCallBacks: {e}"))?
-            };
-            *s
-        },
-        cf_type_dict_value_callbacks: {
-            let s: libloading::Symbol<*const c_void> = unsafe {
-                cf.get(b"kCFTypeDictionaryValueCallBacks\0")
-                    .map_err(|e| format!("dlsym kCFTypeDictionaryValueCallBacks: {e}"))?
-            };
-            *s
-        },
+        cf_type_dict_key_callbacks: sym!(cf, "kCFTypeDictionaryKeyCallBacks", *const c_void),
+        cf_type_dict_value_callbacks: sym!(cf, "kCFTypeDictionaryValueCallBacks", *const c_void),
         // `kCFBooleanTrue` / `kCFBooleanFalse` are exported *variables*
         // of type `CFBooleanRef` — the symbol address is the location of
         // the pointer, so one extra load yields the singleton itself.
+        //
+        // SAFETY: the symbol is a process-lifetime `CFBooleanRef` variable
+        // exported by CoreFoundation; reading it once through the resolved
+        // address is a plain aligned load.
         cf_boolean_true: {
-            let s: libloading::Symbol<*const CFTypeRef> = unsafe {
-                cf.get(b"kCFBooleanTrue\0")
-                    .map_err(|e| format!("dlsym kCFBooleanTrue: {e}"))?
-            };
-            unsafe { *(*s) }
+            let p = sym!(cf, "kCFBooleanTrue", *const CFTypeRef);
+            unsafe { *p }
         },
         cf_boolean_false: {
-            let s: libloading::Symbol<*const CFTypeRef> = unsafe {
-                cf.get(b"kCFBooleanFalse\0")
-                    .map_err(|e| format!("dlsym kCFBooleanFalse: {e}"))?
-            };
-            unsafe { *(*s) }
+            let p = sym!(cf, "kCFBooleanFalse", *const CFTypeRef);
+            // SAFETY: as for `kCFBooleanTrue`.
+            unsafe { *p }
         },
         cv_pixel_format_type_key: {
-            let s: libloading::Symbol<*const CFTypeRef> = unsafe {
-                cv.get(b"kCVPixelBufferPixelFormatTypeKey\0")
-                    .map_err(|e| format!("dlsym kCVPixelBufferPixelFormatTypeKey: {e}"))?
-            };
-            unsafe { *(*s) }
+            let p = sym!(cv, "kCVPixelBufferPixelFormatTypeKey", *const CFTypeRef);
+            // SAFETY: `kCVPixelBufferPixelFormatTypeKey` is CoreVideo's
+            // exported `CFStringRef` constant variable; same shape as the
+            // booleans.
+            unsafe { *p }
         },
         cf_release: sym!(cf, "CFRelease", FnCFRelease),
         cf_retain: sym!(cf, "CFRetain", FnCFRetain),
@@ -885,29 +884,28 @@ fn load_vtable() -> Result<Vtable, String> {
 fn open(path: &str) -> Result<Library, String> {
     // SAFETY: dlopen on a fixed system framework path with no init
     // callbacks; equivalent to a normal program startup load.
-    unsafe { Library::new(path) }.map_err(|e| format!("dlopen {path}: {e}"))
+    unsafe { Library::open(path) }.map_err(|e| format!("dlopen {path}: {e}"))
 }
 
 #[cfg(target_os = "ios")]
 fn open(_path: &str) -> Result<Library, String> {
     // On iOS the four system frameworks are link-loaded at process
     // start via build.rs `cargo:rustc-link-lib=framework=...`
-    // directives. `os::unix::Library::this()` returns a handle equivalent
+    // directives. `dlsym::Library::this()` returns a handle equivalent
     // to `dlopen(NULL, ...)` — the host process's `RTLD_DEFAULT` —
-    // and subsequent `Symbol::get(b"VT...")` calls resolve every
+    // and subsequent `Library::get::<T>("VT...")` calls resolve every
     // VT / CV / CM / CF symbol the vtable needs from the dyld shared
     // cache. The `_path` argument is unused on iOS (sandboxed apps
     // cannot reliably `dlopen` `/System/...` paths), but the four call
     // sites keep their string arguments for parity with the macOS branch.
     //
-    // `os::unix::Library::this()` is safe to call — it maps the
+    // `dlsym::Library::this()` is safe to call — it maps the
     // already-loaded process image and is documented as the
     // `dlopen(NULL, ...)` equivalent. Resolving link-loaded framework
     // symbols from that handle is the iOS-conventional pattern. The
     // Library is materialised once on the first vtable load and
     // cached for the lifetime of the process.
-    let lib_unix = libloading::os::unix::Library::this();
-    Ok(Library::from(lib_unix))
+    Library::this().map_err(|e| format!("dlopen(NULL) for {_path}: {e}"))
 }
 
 // ─────────────────────────── OSStatus taxonomy ────────────────────────────────
@@ -1208,16 +1206,27 @@ mod tests {
         let fw = framework().expect("framework load");
         // Verify a stable VT entry point resolves so we know the
         // dyld cache served the right binary.
-        let _: libloading::Symbol<unsafe extern "C" fn()> = unsafe {
+        // SAFETY: only the address is inspected — the symbols are never
+        // called through these (deliberately wrong) zero-argument types.
+        let vt_create = unsafe {
             fw.video_toolbox
-                .get(b"VTDecompressionSessionCreate\0")
+                .get::<unsafe extern "C" fn()>("VTDecompressionSessionCreate")
                 .expect("VTDecompressionSessionCreate symbol")
         };
-        let _: libloading::Symbol<unsafe extern "C" fn()> = unsafe {
+        assert!(!vt_create.as_ptr().is_null());
+        let cf_retain = unsafe {
             fw.core_foundation
-                .get(b"CFRetain\0")
+                .get::<unsafe extern "C" fn()>("CFRetain")
                 .expect("CFRetain symbol")
         };
+        assert!(!cf_retain.as_ptr().is_null());
+        // A symbol that does not exist is reported as such, not as a
+        // null address or a panic.
+        let missing = unsafe {
+            fw.core_foundation
+                .get::<unsafe extern "C" fn()>("OxideAVNoSuchSymbol")
+        };
+        assert!(matches!(missing, Err(dlsym::Error::SymbolNotFound { .. })));
     }
 
     /// Verify the full vtable resolves all symbols.

@@ -11,7 +11,7 @@
 //!
 //! Symbol-loading shape:
 //!
-//! * **macOS:** `libloading::Library::new("/System/Library/Frameworks/<Name>.framework/<Name>")`
+//! * **macOS:** `dlsym::Library::open("/System/Library/Frameworks/<Name>.framework/<Name>")`
 //!   opens each of VideoToolbox / CoreVideo / CoreMedia / CoreFoundation
 //!   via `dlopen` at first use. **No compile-time link dependency** —
 //!   load failure (older OS, missing framework, sandboxed environment
@@ -21,7 +21,7 @@
 //! * **iOS:** the four frameworks are link-loaded at process start by
 //!   the system dyld (see `build.rs` which emits the conventional
 //!   `cargo:rustc-link-lib=framework=...` directives). At runtime
-//!   `libloading::Library::this()` returns the host process's
+//!   `dlsym::Library::this()` returns the host process's
 //!   `RTLD_DEFAULT` handle and every framework symbol resolves via the
 //!   dyld shared cache. The `register()` graceful-failure path still
 //!   exists structurally but rarely fires on iOS — Apple's runtime

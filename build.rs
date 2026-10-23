@@ -5,7 +5,7 @@
 // at runtime the way the macOS branch does — sandboxed iOS apps do not get to
 // open absolute system paths. Instead we let the system dyld link-load the four
 // frameworks at process start, and then resolve symbols at runtime via
-// `libloading::os::unix::Library::this()` (i.e. `dlsym(RTLD_DEFAULT, ...)`).
+// `dlsym::Library::this()` (i.e. `dlsym(RTLD_DEFAULT, ...)`).
 //
 // On macOS we keep the existing dlopen-at-first-use code path in `sys.rs`, so
 // the build script is a no-op there: macOS binaries have no compile-time

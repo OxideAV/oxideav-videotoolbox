@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-videotoolbox"
 homepage = "https://github.com/OxideAV/oxideav-videotoolbox"
 authors = ["Mark Karpeles"]
-description = "Apple-platform (macOS + iOS) VideoToolbox hardware decode/encode bridge for the oxideav framework — runtime-loaded via libloading on macOS, link-loaded + dlsym on iOS"
+description = "Apple-platform (macOS + iOS) VideoToolbox hardware decode/encode bridge for the oxideav framework — runtime-loaded via dlsym on macOS, link-loaded + dlsym(RTLD_DEFAULT) on iOS"
 readme = "README.md"
 keywords = ["videotoolbox", "macos", "ios", "hardware", "video"]
 categories = ["multimedia::encoding", "multimedia::video", "hardware-support"]
@@ -18,11 +18,11 @@ categories = ["multimedia::encoding", "multimedia::video", "hardware-support"]
 # `default-features = false` and avoid the framework dependency tree.
 oxideav-core = { version = "0.1", optional = true }
 
-# libloading is pulled on macOS + iOS targets — every non-Apple-platform
-# build ships a stub `register()` that's a no-op (the crate body itself
-# is `#![cfg(any(target_os = "macos", target_os = "ios"))]`).
+# `dlsym` (the runtime loader) is pulled on macOS + iOS targets — every
+# non-Apple-platform build ships a stub `register()` that's a no-op (the
+# crate body itself is `#![cfg(any(target_os = "macos", target_os = "ios"))]`).
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-libloading = "0.8"
+dlsym = "0.0.2"
 
 [features]
 default = ["registry"]
