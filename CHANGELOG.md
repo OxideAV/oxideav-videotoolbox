@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.5...v0.0.6) - 2026-11-07
+
+### Other
+
+- oxideav-bitstream floor at the released 0.0.4
+- API hygiene: non_exhaustive NalCodec/framing records, hide NAL and blob framing helpers
+
 ### Changed
 
 - `#[non_exhaustive]` on `NalCodec`, `FrameSplit`, `ParamSets` and
