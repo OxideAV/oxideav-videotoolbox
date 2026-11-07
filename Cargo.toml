@@ -20,7 +20,7 @@ oxideav-core = { version = "0.1", optional = true }
 # Parameter-set / sequence-header parsing for the decoders' stream-level
 # output description (picture size after cropping). Hardware bridges
 # take their bitstream facts from this crate, never from a codec crate.
-oxideav-bitstream = { version = "0.0.3", optional = true }
+oxideav-bitstream = { version = "0.0.4", optional = true }
 
 # `dlsym` (the runtime loader) is pulled on macOS + iOS targets — every
 # non-Apple-platform build ships a stub `register()` that's a no-op (the
