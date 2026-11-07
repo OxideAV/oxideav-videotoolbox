@@ -175,6 +175,43 @@ therefore claims 4:2:0 and single-component scans only (`YuvJ420P` /
 1×1) and returns `Unsupported` for everything else, which the pure-Rust
 decoder decodes exactly.
 
+### Output description and mid-stream shape changes
+
+Every decoder implements the core output-description contract:
+`Decoder::output_params()` answers the picture size and label of the
+frames, `output_params_generation()` moves when they change, and
+`receive_frame` returns one `Frame::StreamParams` event (payload ==
+`output_params()`) immediately before the first frame of a new shape —
+never for the first shape, never for repeated identical headers, after
+every queued picture of the old shape, and the same way across `flush`
+drains and after `reset`. The shape is taken from the geometry
+VideoToolbox actually delivered each picture in, so the event always
+sits at the real boundary.
+
+Before the first frame the description is a prediction: H.264 / HEVC
+from the first SPS (the size after frame cropping / the conformance
+window, read with `oxideav-bitstream`, and the negotiated label) —
+available at construction with an `avcC` / `hvcC` record, else after
+the first packet; the blob codecs from the container size, refined by
+the first picture's own header.
+
+A shape change re-creates the session where VideoToolbox needs it:
+
+| Codec | Detected from | Re-negotiated |
+|---|---|---|
+| H.264 / HEVC | new SPS (any parameter-set change) | size, chroma format × bit depth (e.g. HEVC Main → Main 10) |
+| JPEG | SOF of each image | size; `YuvJ420P` ⇄ `Gray8` when undeclared |
+| MPEG-2 | sequence header (+ sequence extension) | size |
+| AV1 | new sequence header OBU (`av1C` rebuilt) | size |
+| VP9 | key-frame uncompressed header | size (not measurable on hosts without a VP9 decoder) |
+| MPEG-4 Part 2 / VVC | new VOL / parameter sets (`esds` / `vvcC` rebuilt) | record only — the session keeps the container size |
+| ProRes | — | none |
+
+MPEG-4 Part 2 and ProRes size switches are refused with an error (every
+picture of the old shape still comes out first) rather than delivered
+mislabelled: the bridge does not parse the VOL / ProRes frame-header
+picture size.
+
 ### Output order
 
 VideoToolbox returns pictures in decode order on the M-series media

@@ -246,8 +246,8 @@ fn plane(stride: usize, data: Vec<u8>) -> VideoPlane {
     VideoPlane { stride, data }
 }
 
-/// Convert a locked `CVPixelBuffer` into a planar [`VideoFrame`] and the
-/// label that frame carries. Every `kCVPixelFormatType_*` named in
+/// Convert a locked `CVPixelBuffer` into a planar [`VideoFrame`], the
+/// label that frame carries and the buffer's `(width, height)`. Every `kCVPixelFormatType_*` named in
 /// [`label_for_fourcc`] is handled; anything else is an error naming
 /// the code so the caller can report it.
 ///
@@ -264,7 +264,7 @@ fn plane(stride: usize, data: Vec<u8>) -> VideoPlane {
 pub unsafe fn pixel_buffer_to_frame(
     vt: &sys::Vtable,
     image_buffer: sys::CVImageBufferRef,
-) -> Result<(VideoFrame, PixelFormat), String> {
+) -> Result<(VideoFrame, PixelFormat, (u32, u32)), String> {
     let width = unsafe { (vt.cv_pb_get_width)(image_buffer) };
     let height = unsafe { (vt.cv_pb_get_height)(image_buffer) };
     let fourcc = unsafe { (vt.cv_pb_get_pixel_format)(image_buffer) };
@@ -394,7 +394,11 @@ pub unsafe fn pixel_buffer_to_frame(
         _ => unreachable!("label_for_fourcc admitted an unhandled code"),
     };
 
-    Ok((VideoFrame { pts: None, planes }, label))
+    Ok((
+        VideoFrame { pts: None, planes },
+        label,
+        (width as u32, height as u32),
+    ))
 }
 
 /// Chroma plane dimensions of `label` for a `width × height` picture.

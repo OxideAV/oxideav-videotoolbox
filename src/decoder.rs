@@ -33,7 +33,18 @@
 //!   VideoToolbox can emit it, otherwise the layout the SPS describes
 //!   (chroma format × bit depth). VideoToolbox is asked for exactly that
 //!   layout and the frames are converted into it, so
-//!   [`Decoder::output_pixel_format`] and the planes always agree.
+//!   [`Decoder::output_pixel_format`] and the planes always agree. A
+//!   new SPS describing a different layout (an 8-bit → 10-bit switch)
+//!   re-negotiates the label when the session is re-created.
+//! * **Output description.** [`Decoder::output_params`] answers the
+//!   picture size after cropping (ITU-T H.264 §7.4.2.1.1 frame cropping,
+//!   H.265 §7.4.3.2.1 conformance window, read with `oxideav-bitstream`)
+//!   and the label from the first parameter sets, before the first frame.
+//!   Each decoded picture carries the geometry VideoToolbox delivered it
+//!   in, and the first picture of a different shape is preceded by one
+//!   [`Frame::StreamParams`] event and one
+//!   [`Decoder::output_params_generation`] bump — after every queued
+//!   picture of the old shape, also across `flush` drains and `reset`.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
@@ -49,6 +60,7 @@ use crate::nalparse::{
     hevc_slice_info,
 };
 use crate::pixbuf;
+use crate::shape::{Shape, ShapeTracker};
 use crate::sys::{
     self, CMSampleTimingInfo, CMTime, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY, K_OS_STATUS_NO_ERROR,
 };
@@ -378,10 +390,16 @@ fn parse_hvcc(buf: &[u8]) -> Option<ParamSets> {
 
 // ─────────────────────────── Callback state ───────────────────────────────────
 
+/// A decoded picture as the output callback files it: the frame, the
+/// label VideoToolbox delivered it in, the buffer's `(width, height)`
+/// and the sequence stamp it was submitted with.
+type Delivered = (VideoFrame, PixelFormat, (u32, u32), Option<i64>);
+
 struct CallbackState {
-    /// Decoded pictures with the label VideoToolbox delivered them in and
-    /// the sequence stamp they were submitted with.
-    frames: VecDeque<(VideoFrame, PixelFormat, Option<i64>)>,
+    /// Decoded pictures with the label VideoToolbox delivered them in,
+    /// the buffer's `(width, height)` and the sequence stamp they were
+    /// submitted with.
+    frames: VecDeque<Delivered>,
     error: Option<String>,
 }
 
@@ -446,13 +464,13 @@ unsafe extern "C" fn decomp_callback(
     unsafe { (vt.cv_pb_unlock)(image_buffer, 0) };
 
     match frame {
-        Ok((f, label)) => {
+        Ok((f, label, dims)) => {
             // The CMTime handed back is the sequence stamp the sample was
             // submitted with.
             let seq = (presentation_time_stamp.is_valid()
                 && presentation_time_stamp.timescale == SEQ_TIMESCALE)
                 .then_some(presentation_time_stamp.value);
-            guard.frames.push_back((f, label, seq));
+            guard.frames.push_back((f, label, dims, seq));
         }
         Err(e) => guard.error = Some(e),
     }
@@ -665,6 +683,7 @@ struct Held {
     poc: i64,
     seq: i64,
     frame: VideoFrame,
+    shape: Shape,
 }
 
 /// Parsed parameter sets and order-count history of one codec.
@@ -766,6 +785,24 @@ impl OrderState {
     }
 }
 
+/// Output picture size an SPS NAL unit (header included) describes:
+/// the coded size minus the H.264 frame-cropping rectangle
+/// (§7.4.2.1.1, eq. 7-19 … 7-22) or the H.265 conformance window
+/// (§7.4.3.2.1). `None` when the SPS does not parse.
+pub fn sps_output_size(codec: NalCodec, nal: &[u8]) -> Option<(u32, u32)> {
+    let (w, h) = match codec {
+        NalCodec::H264 => {
+            let s = oxideav_bitstream::h264::parse_sps_nal(nal).ok()?;
+            (s.display_width(), s.display_height())
+        }
+        NalCodec::Hevc => {
+            let s = oxideav_bitstream::hevc::parse_sps_nal(nal).ok()?;
+            (s.display_width(), s.display_height())
+        }
+    };
+    (w > 0 && h > 0).then_some((w, h))
+}
+
 // ─────────────────────────── Shared NAL-stream decoder ───────────────────────
 
 /// The H.264 / HEVC decoder core (see the module docs).
@@ -782,8 +819,14 @@ pub struct NalVtDecoder {
     session_params: ParamSets,
     /// Label of the delivered frames, once negotiated.
     target: Option<PixelFormat>,
-    /// Container-declared label (takes precedence over the SPS layout).
+    /// Container-declared label (takes precedence over the SPS layout
+    /// while the stream keeps the layout it started with).
     declared: Option<PixelFormat>,
+    /// SPS layout of the first negotiation (`Some(None)`: negotiated
+    /// without a readable layout).
+    first_layout: Option<Option<PixelFormat>>,
+    /// SPS layout `target` was negotiated for.
+    target_layout: Option<PixelFormat>,
     /// `kCVPixelFormatType_*` requested for `target`.
     request: Option<u32>,
     /// Order-count bookkeeping.
@@ -803,10 +846,12 @@ pub struct NalVtDecoder {
     latest_dts: Option<i64>,
     dts_timeline: bool,
     next_seq: i64,
-    output_queue: VecDeque<VideoFrame>,
+    output_queue: VecDeque<(VideoFrame, Shape)>,
     flushed: bool,
     /// Hardware-acceleration policy from `options["hardware"]`.
     hw_mode: Option<HardwareMode>,
+    /// Stream-level output description and its change generation.
+    shape: ShapeTracker,
 }
 
 unsafe impl Send for NalVtDecoder {}
@@ -837,6 +882,8 @@ impl NalVtDecoder {
             session_params: ParamSets::default(),
             target: None,
             declared,
+            first_layout: None,
+            target_layout: None,
             request: None,
             order: OrderState::new(codec),
             pending: HashMap::new(),
@@ -849,6 +896,7 @@ impl NalVtDecoder {
             output_queue: VecDeque::new(),
             flushed: false,
             hw_mode: params.options.get("hardware").and_then(parse_hardware_mode),
+            shape: ShapeTracker::new(CodecId::new(codec.id())),
         };
         if let Some(ps) = ParamSets::from_extradata(codec, &params.extradata) {
             for (slot, set) in ps.sets.iter().enumerate() {
@@ -858,22 +906,28 @@ impl NalVtDecoder {
             }
             dec.params = ps;
             // With a configuration record the session can be built now,
-            // so `output_pixel_format` is known before the first packet.
+            // so `output_params` is known before the first packet.
             dec.ensure_session()?;
         }
         Ok(Box::new(dec))
     }
 
-    /// Negotiate the output label: the container's declaration, else the
-    /// layout the active SPS describes, else 8-bit 4:2:0.
+    /// Negotiate the output label: the container's declaration (while the
+    /// stream keeps the layout it started with), else the layout the
+    /// active SPS describes, else 8-bit 4:2:0. Re-negotiated only when
+    /// the SPS layout changes.
     fn negotiate_target(&mut self) -> Result<()> {
-        if self.target.is_some() {
-            return Ok(());
-        }
         let sps_label = self.params.sets[1]
             .first()
             .and_then(|sps| self.order.sps_label(sps));
-        let label = self.declared.or(sps_label).unwrap_or(PixelFormat::Yuv420P);
+        if self.target.is_some() && (sps_label == self.target_layout || sps_label.is_none()) {
+            return Ok(());
+        }
+        let first = *self.first_layout.get_or_insert(sps_label);
+        let declared = self
+            .declared
+            .filter(|_| sps_label.is_none() || sps_label == first);
+        let label = declared.or(sps_label).unwrap_or(PixelFormat::Yuv420P);
         let full_range = label.implied_color_range() == Some(oxideav_core::ColorRange::Full);
         let (request, _) = pixbuf::request_for_label(label, full_range).ok_or_else(|| {
             Error::unsupported(format!(
@@ -882,8 +936,19 @@ impl NalVtDecoder {
             ))
         })?;
         self.target = Some(label);
+        self.target_layout = sps_label;
         self.request = Some(request);
         Ok(())
+    }
+
+    /// State the output description the active parameter sets predict
+    /// (only effective until the first frame has been returned).
+    fn predict_shape(&mut self) {
+        let size = self.params.sets[1]
+            .first()
+            .and_then(|sps| sps_output_size(self.codec, sps));
+        self.shape
+            .predict(size.map(|s| s.0), size.map(|s| s.1), self.target);
     }
 
     fn ensure_session(&mut self) -> Result<()> {
@@ -953,6 +1018,7 @@ impl NalVtDecoder {
         self.session = session;
         self.fmt_desc = fmt_desc;
         self.session_params = self.params.clone();
+        self.predict_shape();
 
         Ok(())
     }
@@ -989,11 +1055,11 @@ impl NalVtDecoder {
     /// the negotiated target label, matched to their submission
     /// metadata), then release whatever is due in display order.
     fn pull_frames(&mut self) {
-        let mut arrived: Vec<(VideoFrame, PixelFormat, Option<i64>)> = Vec::new();
+        let mut arrived: Vec<Delivered> = Vec::new();
         if let Ok(mut g) = self.state.lock() {
             arrived.extend(g.frames.drain(..));
         }
-        for (f, native, seq) in arrived {
+        for (f, native, (width, height), seq) in arrived {
             let target = self.target.unwrap_or(native);
             let Some(mut frame) = pixbuf::deliver_as(f, native, target) else {
                 if let Ok(mut g) = self.state.lock() {
@@ -1002,6 +1068,11 @@ impl NalVtDecoder {
                     ));
                 }
                 continue;
+            };
+            let shape = Shape {
+                width,
+                height,
+                pixel_format: target,
             };
             let seq = seq.unwrap_or(-1);
             let meta = self.pending.remove(&seq).unwrap_or(Submitted {
@@ -1022,13 +1093,14 @@ impl NalVtDecoder {
                             poc,
                             seq,
                             frame,
+                            shape,
                         },
                     );
                 }
                 // Unreadable slice header: decode order, ahead of nothing.
                 None => {
                     self.release(usize::MAX);
-                    self.output_queue.push_back(frame);
+                    self.output_queue.push_back((frame, shape));
                 }
             }
         }
@@ -1063,7 +1135,7 @@ impl NalVtDecoder {
     fn release(&mut self, n: usize) {
         let n = n.min(self.held.len());
         for h in self.held.drain(..n) {
-            self.output_queue.push_back(h.frame);
+            self.output_queue.push_back((h.frame, h.shape));
         }
     }
 
@@ -1193,8 +1265,15 @@ impl Decoder for NalVtDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.output_queue.pop_front() {
-            return Ok(Frame::Video(f));
+        if let Some(&(_, shape)) = self.output_queue.front() {
+            if self.shape.announce(shape)
+                && let Some(p) = self.shape.params()
+            {
+                return Ok(Frame::StreamParams(Box::new(p)));
+            }
+            if let Some((f, _)) = self.output_queue.pop_front() {
+                return Ok(Frame::Video(f));
+            }
         }
         if let Some(e) = self.take_error() {
             return Err(e);
@@ -1251,7 +1330,15 @@ impl Decoder for NalVtDecoder {
     }
 
     fn output_pixel_format(&self) -> Option<PixelFormat> {
-        self.target
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        self.shape.params()
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.shape.generation()
     }
 }
 

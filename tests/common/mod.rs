@@ -6,6 +6,8 @@
 //! absent on the host.
 #![allow(dead_code)]
 
+pub mod shape;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

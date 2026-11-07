@@ -76,7 +76,7 @@
 //! `main` / `main10` / `main4_2_2_10` for HEVC) flow into
 //! `kVTCompressionPropertyKey_ProfileLevel`; and the ProRes encoder's
 //! `params.tag` selects one of the six `kCMVideoCodecType_AppleProRes*`
-//! flavours (`apco` / `apcs` / `apcn` [default] / `apch` / `ap4h` /
+//! flavours (`apco` / `apcs` / `apcn` (default) / `apch` / `ap4h` /
 //! `ap4x`). Round 10 closed the AV1 av1C extension-atom path. Round 11
 //! added VVC (H.266) video decode via `kCMVideoCodecType_VVC = 'vvc1'` —
 //! decode-only (no VVC compression session yet exposed by VideoToolbox).
@@ -132,6 +132,9 @@ pub mod encoder;
 #[doc(hidden)] // H.264 / H.265 header parsing for output ordering — internal
 #[cfg(feature = "registry")]
 pub mod nalparse;
+#[cfg(feature = "registry")]
+mod shape;
+
 #[doc(hidden)] // CVPixelBuffer ⇄ VideoFrame plumbing shared by the decoders
 #[cfg(feature = "registry")]
 pub mod pixbuf;

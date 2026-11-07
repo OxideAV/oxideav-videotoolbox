@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- decoders implement the core output-description contract: `output_params()` (picture size + label; H.264 / HEVC from the first SPS's cropped size before the first frame), `output_params_generation()`, and one `Frame::StreamParams` event immediately before the first frame of each new shape — after the queued frames of the old shape, across `flush` drains and after `reset`, never for the first shape or for repeated identical parameter sets
+- H.264 / HEVC: a new SPS with another chroma format × bit depth re-negotiates the output label when the session is re-created (HEVC 8-bit → 10-bit splices decode as `Yuv420P` → `Yuv420P10Le`)
+- blob decoders re-create the session when an access unit's own header changes the coded size: JPEG SOF (and `YuvJ420P` ⇄ `Gray8` when undeclared), MPEG-2 sequence header + extension, VP9 key frames, AV1 sequence header (`av1C` rebuilt); MPEG-4 Part 2 / VVC rebuild their `esds` / `vvcC` record on a new VOL / parameter set
+- `BlobDecoder::reset` drops in-flight and queued output without a drain
+- dependency on `oxideav-bitstream` (SPS / sequence-header sizes) under the `registry` feature
+- tests: `stream_params` (vendored spliced H.264 / HEVC fixtures incl. HEVC Main → Main 10) and `stream_params_blob` (MJPEG size + layout, MPEG-2, AV1 size switches; MPEG-4 Part 2 / ProRes switches refused)
+
+### Fixed
+
+- MPEG-2 / MPEG-4 Part 2 elementary-stream framers: a sequence header / GOP / VOL between two pictures now opens the unit of the following picture instead of trailing the previous one
+
 ### Changed
 
 - edition 2024, MSRV 1.95

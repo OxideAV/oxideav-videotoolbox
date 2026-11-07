@@ -17,6 +17,10 @@ categories = ["multimedia::encoding", "multimedia::video", "hardware-support"]
 # tooling consumers can depend on `oxideav-videotoolbox` with
 # `default-features = false` and avoid the framework dependency tree.
 oxideav-core = { version = "0.1", optional = true }
+# Parameter-set / sequence-header parsing for the decoders' stream-level
+# output description (picture size after cropping). Hardware bridges
+# take their bitstream facts from this crate, never from a codec crate.
+oxideav-bitstream = { version = "0.0.3", optional = true }
 
 # `dlsym` (the runtime loader) is pulled on macOS + iOS targets — every
 # non-Apple-platform build ships a stub `register()` that's a no-op (the
@@ -31,4 +35,4 @@ default = ["registry"]
 # `oxideav-core` so the crate can plug into the `oxideav` framework
 # registry. Default-on; turn off for tooling that just wants the raw
 # VideoToolbox bridge bindings without the framework.
-registry = ["dep:oxideav-core"]
+registry = ["dep:oxideav-core", "dep:oxideav-bitstream"]

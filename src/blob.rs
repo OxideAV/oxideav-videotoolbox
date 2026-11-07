@@ -18,6 +18,14 @@
 //! consumed/emitted. MPEG-2 is the exception: its input is an *elementary*
 //! stream, so the decoder uses a `FrameSplit::Mpeg2Es` framer to carve
 //! per-picture access units before submission.
+//!
+//! Output description: before the first frame the decoder states the
+//! container's picture size and the negotiated label; every decoded
+//! picture then carries the geometry VideoToolbox delivered it in, and
+//! the first picture of a different shape (an MJPEG stream switching
+//! size, a VP9 / AV1 key frame at a new resolution, a new MPEG-2
+//! sequence header) is preceded by one `Frame::StreamParams` event and
+//! one `output_params_generation` bump.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -34,6 +42,7 @@ use crate::encoder::{
     parse_keyframe_interval_duration, resolve_expected_frame_rate, vt_error,
 };
 use crate::pixbuf;
+use crate::shape::{Shape, ShapeTracker};
 use crate::sys::{
     self, CMSampleTimingInfo, CMTime, K_CV_PIXEL_BUFFER_LOCK_FLAGS_READ_ONLY, K_OS_STATUS_NO_ERROR,
     cf_number_i32, cf_string,
@@ -52,8 +61,9 @@ unsafe fn libc_malloc(size: usize) -> *mut c_void {
 
 struct DecCallbackState {
     /// Decoded frames with the label of the layout VideoToolbox handed
-    /// back (see `pixbuf::pixel_buffer_to_frame`).
-    frames: VecDeque<(VideoFrame, PixelFormat)>,
+    /// back and the buffer's `(width, height)` (see
+    /// `pixbuf::pixel_buffer_to_frame`).
+    frames: VecDeque<(VideoFrame, PixelFormat, (u32, u32))>,
     error: Option<String>,
 }
 
@@ -115,7 +125,7 @@ unsafe extern "C" fn dec_callback(
     unsafe { (vt.cv_pb_unlock)(image_buffer, 0) };
 
     match frame {
-        Ok((mut f, label)) => {
+        Ok((mut f, label, dims)) => {
             // Recover the presentation timestamp VT hands back for this
             // frame. `submit_frame` wraps `packet.pts` (or a sequential
             // decode-order counter when the packet carried none) in a
@@ -125,7 +135,7 @@ unsafe extern "C" fn dec_callback(
             f.pts = presentation_time_stamp
                 .is_valid()
                 .then_some(presentation_time_stamp.value);
-            guard.frames.push_back((f, label));
+            guard.frames.push_back((f, label, dims));
         }
         Err(e) => guard.error = Some(e),
     }
@@ -140,6 +150,41 @@ unsafe extern "C" fn dec_callback(
 /// than 8, four-component (CMYK / YCCK) scans, lossless / hierarchical
 /// processes, or a stream with no SOF.
 pub fn jpeg_sof_label(data: &[u8]) -> Option<PixelFormat> {
+    let seg = jpeg_sof_segment(data)?;
+    if seg.len() < 6 {
+        return None;
+    }
+    let precision = seg[0];
+    let nf = seg[5] as usize;
+    if precision != 8 || seg.len() < 6 + 3 * nf {
+        return None;
+    }
+    let comps: Vec<(u8, u8)> = (0..nf)
+        .map(|i| (seg[6 + 3 * i + 1] >> 4, seg[6 + 3 * i + 1] & 0x0F))
+        .collect();
+    match nf {
+        1 => Some(PixelFormat::Gray8),
+        3 => {
+            let (h0, v0) = comps[0];
+            let chroma_full = comps[1..].iter().all(|&(h, v)| h == 1 && v == 1);
+            match (h0, v0) {
+                _ if comps.iter().all(|&c| c == comps[0]) => Some(PixelFormat::YuvJ444P),
+                (2, 2) if chroma_full => Some(PixelFormat::YuvJ420P),
+                (2, 1) if chroma_full => Some(PixelFormat::YuvJ422P),
+                (4, 1) if chroma_full => Some(PixelFormat::Yuv411P),
+                (1, 2) if chroma_full => Some(PixelFormat::YuvJ444P),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Body (after the length field) of the first SOF segment of a JPEG
+/// image when it is one of the DCT processes VideoToolbox decodes
+/// (SOF0-2 Huffman, SOF9-10 arithmetic); `None` for lossless /
+/// hierarchical / differential SOFs, a scan before any SOF, or no SOI.
+fn jpeg_sof_segment(data: &[u8]) -> Option<&[u8]> {
     let mut pos = 2usize; // past SOI
     if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
         return None;
@@ -165,39 +210,7 @@ pub fn jpeg_sof_label(data: &[u8]) -> Option<PixelFormat> {
         }
         let seg = &data[pos + 4..data.len().min(pos + 2 + len)];
         match marker {
-            // SOF0-2 (baseline / extended / progressive, Huffman) and the
-            // arithmetic twins SOF9-10: the DCT processes VT decodes.
-            0xC0 | 0xC1 | 0xC2 | 0xC9 | 0xCA => {
-                if seg.len() < 6 {
-                    return None;
-                }
-                let precision = seg[0];
-                let nf = seg[5] as usize;
-                if precision != 8 || seg.len() < 6 + 3 * nf {
-                    return None;
-                }
-                let comps: Vec<(u8, u8)> = (0..nf)
-                    .map(|i| (seg[6 + 3 * i + 1] >> 4, seg[6 + 3 * i + 1] & 0x0F))
-                    .collect();
-                return match nf {
-                    1 => Some(PixelFormat::Gray8),
-                    3 => {
-                        let (h0, v0) = comps[0];
-                        let chroma_full = comps[1..].iter().all(|&(h, v)| h == 1 && v == 1);
-                        match (h0, v0) {
-                            _ if comps.iter().all(|&c| c == comps[0]) => {
-                                Some(PixelFormat::YuvJ444P)
-                            }
-                            (2, 2) if chroma_full => Some(PixelFormat::YuvJ420P),
-                            (2, 1) if chroma_full => Some(PixelFormat::YuvJ422P),
-                            (4, 1) if chroma_full => Some(PixelFormat::Yuv411P),
-                            (1, 2) if chroma_full => Some(PixelFormat::YuvJ444P),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-            }
+            0xC0 | 0xC1 | 0xC2 | 0xC9 | 0xCA => return Some(seg),
             // Lossless / hierarchical / differential SOFs: not decodable here.
             0xC3 | 0xC5..=0xC7 | 0xCB | 0xCD..=0xCF => return None,
             // Scan data follows; a SOF must precede the first SOS.
@@ -255,99 +268,88 @@ pub enum FrameSplit {
 /// Split an MPEG-2 elementary-stream buffer into per-picture access units.
 ///
 /// MPEG-2 start codes are `00 00 01 xx`. The picture start code is
-/// `00 00 01 00`. Each access unit we emit is "everything from one
-/// picture-start-code boundary up to (but not including) the next picture
-/// start code", with any leading sequence header (`b3`), GOP header (`b8`),
-/// or extension (`b5`) bytes that precede the first picture attached to it.
-/// VideoToolbox accepts a sequence-header-prefixed picture as a complete
-/// MPEG-2 access unit.
+/// `00 00 01 00`. Each access unit is one picture with the headers that
+/// precede it: a sequence header (`b3`, with its extensions) or GOP
+/// header (`b8`) between two pictures opens the unit of the *following*
+/// picture (ISO/IEC 13818-2 §6.2.1), and everything before the first
+/// picture rides on the first unit. VideoToolbox accepts a
+/// sequence-header-prefixed picture as a complete MPEG-2 access unit,
+/// and a new sequence header is how a mid-stream size change arrives.
 fn split_mpeg2_access_units(buf: &[u8]) -> Vec<&[u8]> {
-    // Collect byte offsets of every picture start code (00 00 01 00).
-    let mut picture_starts: Vec<usize> = Vec::new();
-    let mut i = 0usize;
-    while i + 4 <= buf.len() {
-        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && buf[i + 3] == 0 {
-            picture_starts.push(i);
-            i += 4;
-        } else {
-            i += 1;
-        }
-    }
-
-    if picture_starts.is_empty() {
-        // No picture start code at all — hand the whole buffer to VT and let
-        // it decide. (Defensive: shouldn't happen for a valid ES.)
-        return if buf.is_empty() {
-            Vec::new()
-        } else {
-            vec![buf]
-        };
-    }
-
-    let mut units: Vec<&[u8]> = Vec::new();
-    for (idx, &start) in picture_starts.iter().enumerate() {
-        // For the first picture, include any leading sequence/GOP/extension
-        // headers (everything from offset 0). VT needs the sequence header
-        // to size the decoder; carrying it on the first picture is the
-        // standard MPEG-2 access-unit shape.
-        let unit_start = if idx == 0 { 0 } else { start };
-        let unit_end = picture_starts.get(idx + 1).copied().unwrap_or(buf.len());
-        if unit_end > unit_start {
-            units.push(&buf[unit_start..unit_end]);
-        }
-    }
-    units
+    split_es_access_units(buf, |c| c == 0x00, |c| matches!(c, 0xB3 | 0xB8))
 }
 
 /// Split an MPEG-4 Part 2 elementary-stream buffer into per-VOP access units.
 ///
 /// Per ISO/IEC 14496-2, start codes are `00 00 01 xx` and the VOP (Video
-/// Object Plane) start code is `xx = B6`. Other key codes that can precede a
-/// VOP and need to ride along on the first access unit:
+/// Object Plane) start code is `xx = B6`. The configuration headers that
+/// open the unit of the VOP they precede (between two VOPs as well as
+/// before the first):
 ///
 /// * `B0` Visual Object Sequence (VOS) start
-/// * `B1` VOS end
 /// * `B5` Visual Object start
 /// * `00..1F` Video Object start (VO)
 /// * `20..2F` Video Object Layer start (VOL) — carries width/height/profile
 /// * `B3` Group of VOP (GOV) start
-/// * `B2` user data
 ///
-/// VideoToolbox needs the VOL (or an equivalent extradata blob) to size the
-/// decoder, so we attach every leading header byte to the first VOP exactly
-/// as `split_mpeg2_access_units` does for sequence headers.
+/// User data (`B2`) follows the header it belongs to and rides along.
+/// VideoToolbox needs the VOL (or an equivalent extradata blob) to size
+/// the decoder, exactly as `split_mpeg2_access_units` carries sequence
+/// headers.
 fn split_mpeg4_part_two_access_units(buf: &[u8]) -> Vec<&[u8]> {
-    // Collect byte offsets of every VOP start code (00 00 01 B6).
-    let mut vop_starts: Vec<usize> = Vec::new();
+    split_es_access_units(
+        buf,
+        |c| c == 0xB6,
+        |c| matches!(c, 0xB0 | 0xB5 | 0xB3 | 0x00..=0x2F),
+    )
+}
+
+/// Per-picture access units of a start-code elementary stream: a unit
+/// starts at a picture start code (`is_picture`), or earlier at the first
+/// configuration header (`is_header`) since the previous picture; the
+/// first unit starts at offset 0. A buffer with no picture start code is
+/// handed over whole.
+fn split_es_access_units(
+    buf: &[u8],
+    is_picture: impl Fn(u8) -> bool,
+    is_header: impl Fn(u8) -> bool,
+) -> Vec<&[u8]> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut header_since_picture: Option<usize> = None;
     let mut i = 0usize;
     while i + 4 <= buf.len() {
-        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 && buf[i + 3] == 0xB6 {
-            vop_starts.push(i);
+        if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+            let code = buf[i + 3];
+            if is_picture(code) {
+                starts.push(if starts.is_empty() {
+                    0
+                } else {
+                    header_since_picture.unwrap_or(i)
+                });
+                header_since_picture = None;
+            } else if is_header(code) && !starts.is_empty() && header_since_picture.is_none() {
+                header_since_picture = Some(i);
+            }
             i += 4;
         } else {
             i += 1;
         }
     }
-
-    if vop_starts.is_empty() {
+    if starts.is_empty() {
         return if buf.is_empty() {
             Vec::new()
         } else {
             vec![buf]
         };
     }
-
-    let mut units: Vec<&[u8]> = Vec::new();
-    for (idx, &start) in vop_starts.iter().enumerate() {
-        // First VOP inherits every leading header byte so VT can size the
-        // decoder from the VOL embedded in the stream.
-        let unit_start = if idx == 0 { 0 } else { start };
-        let unit_end = vop_starts.get(idx + 1).copied().unwrap_or(buf.len());
-        if unit_end > unit_start {
-            units.push(&buf[unit_start..unit_end]);
-        }
-    }
-    units
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &start)| {
+            let end = starts.get(idx + 1).copied().unwrap_or(buf.len());
+            (end > start).then(|| &buf[start..end])
+        })
+        .collect()
 }
 
 /// Extract the MPEG-4 Part 2 configuration prefix (VOS / Visual Object / VO /
@@ -1350,6 +1352,69 @@ pub fn split_vvc_access_units(buf: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+// ─────────────────────────── Coded-size probes ───────────────────────────────
+
+/// A session configuration called for by an access unit (see
+/// `BlobDecoder::coded_config`).
+struct CodedConfig {
+    size: (usize, usize),
+    atom: Option<(&'static str, Vec<u8>)>,
+}
+
+/// VVC `SPS_NUT` (H.266 Table 5).
+const VVC_SPS_NUT: u8 = 15;
+
+/// Picture size (`X` × `Y`, T.81 §B.2.2) of the first DCT-process SOF
+/// segment of a JPEG image, `None` without one (or with `Y = 0`, a
+/// height defined later by DNL).
+pub fn jpeg_sof_size(data: &[u8]) -> Option<(usize, usize)> {
+    let seg = jpeg_sof_segment(data)?;
+    if seg.len() < 5 {
+        return None;
+    }
+    let y = u16::from_be_bytes([seg[1], seg[2]]) as usize;
+    let x = u16::from_be_bytes([seg[3], seg[4]]) as usize;
+    (x > 0 && y > 0).then_some((x, y))
+}
+
+/// Frame size of a VP9 key frame (uncompressed header §6.2, read with
+/// `oxideav-bitstream`); the first frame of a superframe (Annex B) is
+/// the one inspected. `None` for inter / intra-only frames.
+fn vp9_key_frame_size(chunk: &[u8]) -> Option<(usize, usize)> {
+    let frame = *oxideav_bitstream::vp9::frame::split_superframe(chunk).first()?;
+    let h = oxideav_bitstream::vp9::parse_uncompressed_header(frame).ok()?;
+    (h.frame_type == 0 && !h.show_existing_frame)
+        .then_some((h.frame_width as usize, h.frame_height as usize))
+}
+
+/// Coded picture size of the MPEG-2 sequence header in `unit` (ISO/IEC
+/// 13818-2 §6.2.2.1 `horizontal_size_value` / `vertical_size_value`,
+/// extended by the §6.2.2.3 sequence extension's size-extension bits
+/// when one follows), read with `oxideav-bitstream`.
+fn mpeg2_sequence_size(unit: &[u8]) -> Option<(usize, usize)> {
+    use oxideav_bitstream::mpeg2;
+    let codes = mpeg2::find_start_codes(unit);
+    let at = codes.iter().position(|&(code, _)| code == 0xB3)?;
+    let seq = mpeg2::parse_sequence_header(&unit[codes[at].1..]).ok()?;
+    let (mut w, mut h) = (seq.horizontal_size, seq.vertical_size);
+    if let Some(&(0xB5, off)) = codes.get(at + 1)
+        && let Ok(ext) = mpeg2::parse_sequence_extension(&unit[off..])
+    {
+        w |= u32::from(ext.horizontal_size_extension) << 12;
+        h |= u32::from(ext.vertical_size_extension) << 12;
+    }
+    Some((w as usize, h as usize))
+}
+
+/// `true` when an MPEG-4 Part 2 header prefix holds a Video Object
+/// Layer start code (`00 00 01 20..2F`, ISO/IEC 14496-2 Table 6-3) —
+/// a GOV-only prefix does not re-configure the stream.
+fn carries_mpeg4_vol(prefix: &[u8]) -> bool {
+    prefix
+        .windows(4)
+        .any(|w| w[0] == 0 && w[1] == 0 && w[2] == 1 && (0x20..=0x2F).contains(&w[3]))
+}
+
 // ─────────────────────────── Decoder ─────────────────────────────────────────
 
 /// Blob-style VTDecompressionSession decoder.
@@ -1385,14 +1450,20 @@ pub struct BlobDecoder {
     /// JPEG is full range by definition (T.871); the 8-bit bi-planar
     /// request families have distinct full-range codes.
     full_range: bool,
+    /// `target` is the container's declaration (never re-negotiated).
+    declared: bool,
+    /// The first JPEG's SOF has been vetted (see `send_packet`).
+    jpeg_seen: bool,
     session: sys::VTDecompressionSessionRef,
     fmt_desc: sys::CMVideoFormatDescriptionRef,
     state: Arc<Mutex<DecCallbackState>>,
-    output_queue: VecDeque<VideoFrame>,
+    output_queue: VecDeque<(VideoFrame, Shape)>,
     pts_counter: i64,
     flushed: bool,
     /// Hardware-acceleration policy from `options["hardware"]`.
     hw_mode: Option<HardwareMode>,
+    /// Stream-level output description and its change generation.
+    shape: ShapeTracker,
 }
 
 // SAFETY: VTDecompressionSession is documented thread-safe; we never share
@@ -1440,6 +1511,8 @@ impl BlobDecoder {
             })?),
             None => None,
         };
+        let mut shape = ShapeTracker::new(CodecId::new(codec_id));
+        shape.predict(Some(width as u32), Some(height as u32), target);
         Ok(Box::new(BlobDecoder {
             codec_id: CodecId::new(codec_id),
             codec_type,
@@ -1450,6 +1523,8 @@ impl BlobDecoder {
             target,
             request,
             full_range,
+            declared: params.pixel_format.is_some(),
+            jpeg_seen: false,
             session: std::ptr::null_mut(),
             fmt_desc: std::ptr::null_mut(),
             state: DecCallbackState::new(),
@@ -1457,6 +1532,7 @@ impl BlobDecoder {
             pts_counter: 0,
             flushed: false,
             hw_mode: params.options.get("hardware").and_then(parse_hardware_mode),
+            shape,
         }))
     }
 
@@ -1694,6 +1770,89 @@ impl BlobDecoder {
         Ok(())
     }
 
+    /// The session configuration `unit` calls for, when it differs from
+    /// the live one: the coded picture size its own header states
+    /// (JPEG SOF, T.81 §B.2.2; MPEG-2 sequence header + sequence
+    /// extension, ISO/IEC 13818-2 §6.2.2 / §6.2.2.3; VP9 key-frame
+    /// uncompressed header, §6.2; AV1 sequence header
+    /// `max_frame_{width,height}_minus_1`, §5.5) and, for the codecs
+    /// whose session takes a configuration record, the record rebuilt
+    /// from the unit's in-band headers (AV1 `av1C`, MPEG-4 Part 2
+    /// `esds` from a new VOL, VVC `vvcC`). `None` when the unit carries
+    /// no such header or it matches the live configuration.
+    fn coded_config(&self, unit: &[u8]) -> Option<CodedConfig> {
+        let current = (self.width, self.height);
+        let (size, atom) = match self.framer {
+            FrameSplit::Whole => match self.codec_type {
+                K_CM_VIDEO_CODEC_TYPE_JPEG => (jpeg_sof_size(unit)?, None),
+                K_CM_VIDEO_CODEC_TYPE_VP9 => (vp9_key_frame_size(unit)?, None),
+                _ => return None,
+            },
+            FrameSplit::Mpeg2Es => (mpeg2_sequence_size(unit)?, None),
+            FrameSplit::Av1Whole => {
+                let sh = extract_av1_sequence_header_obu(unit).filter(|s| !s.is_empty())?;
+                let size = sequence_header_payload(sh)
+                    .and_then(|p| oxideav_bitstream::av1::parse_sequence_header(p).ok())
+                    .map(|s| (s.max_frame_width() as usize, s.max_frame_height() as usize))
+                    .unwrap_or(current);
+                (size, Some(("av1C", build_av1c_config_record(sh))))
+            }
+            FrameSplit::Mpeg4PartTwoEs => {
+                let vol = extract_mpeg4_part_two_vol(unit).filter(|v| carries_mpeg4_vol(v))?;
+                (current, Some(("esds", build_mpeg4_part_two_esds(vol))))
+            }
+            FrameSplit::VvcEs => {
+                let prefix = extract_vvc_config_prefix(unit).filter(|p| !p.is_empty())?;
+                if extract_vvc_nals_of_type(prefix, VVC_SPS_NUT).is_empty() {
+                    return None;
+                }
+                (
+                    current,
+                    Some(("vvcC", build_vvc_decoder_config_record(prefix))),
+                )
+            }
+        };
+        if size.0 == 0 || size.1 == 0 {
+            return None;
+        }
+        let atom_changed = atom
+            .as_ref()
+            .is_some_and(|a| self.extradata.as_ref() != Some(a));
+        (size != current || atom_changed).then_some(CodedConfig { size, atom })
+    }
+
+    /// Adopt `next`: drain and release the live session (its pictures
+    /// enter the output queue, still in the old shape), then record the
+    /// new size / configuration record for the next `ensure_session`.
+    /// Before the first frame the stated description follows the new
+    /// size.
+    fn reconfigure(&mut self, next: CodedConfig) {
+        if !self.session.is_null()
+            && let Ok(vt) = sys::vtable()
+        {
+            unsafe {
+                (vt.vt_decomp_wait)(self.session);
+                (vt.vt_decomp_invalidate)(self.session);
+                (vt.cf_release)(self.session);
+                if !self.fmt_desc.is_null() {
+                    (vt.cf_release)(self.fmt_desc);
+                }
+            }
+            self.session = std::ptr::null_mut();
+            self.fmt_desc = std::ptr::null_mut();
+            self.pull_frames();
+        }
+        (self.width, self.height) = next.size;
+        if next.atom.is_some() {
+            self.extradata = next.atom;
+        }
+        self.shape.predict(
+            Some(self.width as u32),
+            Some(self.height as u32),
+            self.target,
+        );
+    }
+
     /// Move the callback's frames into the output queue, converting each
     /// from the layout VideoToolbox delivered into the negotiated target
     /// label. A frame that cannot be brought to the target is an error
@@ -1702,10 +1861,17 @@ impl BlobDecoder {
         let Ok(mut g) = self.state.lock() else {
             return;
         };
-        while let Some((f, native)) = g.frames.pop_front() {
+        while let Some((f, native, (width, height))) = g.frames.pop_front() {
             let target = self.target.unwrap_or(native);
             match pixbuf::deliver_as(f, native, target) {
-                Some(frame) => self.output_queue.push_back(frame),
+                Some(frame) => self.output_queue.push_back((
+                    frame,
+                    Shape {
+                        width,
+                        height,
+                        pixel_format: target,
+                    },
+                )),
                 None => {
                     g.error = Some(format!(
                         "VideoToolbox delivered {native:?} frames but the stream is labelled {target:?}"
@@ -1785,7 +1951,7 @@ impl Decoder for BlobDecoder {
         // decoder claims 4:2:0 and single-component sources only; the
         // rest is a typed `Unsupported` and the registry falls back to
         // the pure-Rust decoder, which decodes them exactly.
-        if self.session.is_null() && self.full_range && !packet.data.is_empty() {
+        if !self.jpeg_seen && self.full_range && !packet.data.is_empty() {
             let label = jpeg_sof_label(&packet.data).ok_or_else(|| {
                 Error::unsupported(
                     "videotoolbox: JPEG frame type (precision / components / process) \
@@ -1808,7 +1974,34 @@ impl Decoder for BlobDecoder {
                 None => {
                     self.target = Some(label);
                     self.request = pixbuf::request_for_label(label, true);
+                    self.shape.predict(
+                        Some(self.width as u32),
+                        Some(self.height as u32),
+                        Some(label),
+                    );
                 }
+            }
+            self.jpeg_seen = true;
+        } else if self.full_range && !packet.data.is_empty() {
+            // Every later JPEG: a declared label must keep matching the
+            // scan; an undeclared stream switching between the two
+            // layouts VideoToolbox delivers truthfully (4:2:0 colour and
+            // greyscale) gets a session asking for the new one.
+            let label = jpeg_sof_label(&packet.data);
+            match (self.target, label) {
+                (Some(t), Some(l)) if pixbuf::same_layout(t, l) => {}
+                (Some(t), Some(l)) if self.declared => {
+                    return Err(Error::unsupported(format!(
+                        "videotoolbox: JPEG scan is {l:?} but the stream is labelled {t:?}"
+                    )));
+                }
+                (_, Some(l @ (PixelFormat::YuvJ420P | PixelFormat::Gray8))) => {
+                    let size = jpeg_sof_size(&packet.data).unwrap_or((self.width, self.height));
+                    self.target = Some(l);
+                    self.request = pixbuf::request_for_label(l, true);
+                    self.reconfigure(CodedConfig { size, atom: None });
+                }
+                _ => {}
             }
         }
 
@@ -1854,45 +2047,27 @@ impl Decoder for BlobDecoder {
             }
         }
 
-        self.ensure_session()?;
-        match self.framer {
-            FrameSplit::Whole | FrameSplit::Av1Whole => {
-                // AV1 packets are container-framed: one temporal unit per
-                // `Packet`. Submit verbatim, exactly like the `Whole` path
-                // used by JPEG / ProRes / VP9.
-                self.submit_frame(&packet.data, packet.pts)?;
+        // Carve the packet into access units: container-framed codecs
+        // (JPEG / ProRes / VP9 / AV1) submit the packet verbatim; the
+        // elementary-stream framers split per picture, and only the first
+        // unit inherits the packet's PTS (the rest get sequential synthetic
+        // timestamps so VT keeps a monotone presentation timeline).
+        let units: Vec<&[u8]> = match self.framer {
+            FrameSplit::Whole | FrameSplit::Av1Whole => vec![&packet.data[..]],
+            FrameSplit::Mpeg2Es => split_mpeg2_access_units(&packet.data),
+            FrameSplit::Mpeg4PartTwoEs => split_mpeg4_part_two_access_units(&packet.data),
+            FrameSplit::VvcEs => split_vvc_access_units(&packet.data),
+        };
+        for (idx, unit) in units.iter().enumerate() {
+            // A unit that re-configures the stream (a picture header of
+            // another size, a new configuration record) gets a session
+            // built for it; pictures of the old session are drained first.
+            if let Some(next) = self.coded_config(unit) {
+                self.reconfigure(next);
             }
-            FrameSplit::Mpeg2Es => {
-                // Carve the elementary stream into per-picture access units.
-                // Only the first access unit inherits the packet's PTS; the
-                // rest get sequential synthetic timestamps so VT keeps a
-                // monotone presentation timeline.
-                let units = split_mpeg2_access_units(&packet.data);
-                for (idx, unit) in units.iter().enumerate() {
-                    let pts = if idx == 0 { packet.pts } else { None };
-                    self.submit_frame(unit, pts)?;
-                }
-            }
-            FrameSplit::Mpeg4PartTwoEs => {
-                // Carve the elementary stream into per-VOP access units (see
-                // `split_mpeg4_part_two_access_units`). PTS handling matches
-                // the MPEG-2 path.
-                let units = split_mpeg4_part_two_access_units(&packet.data);
-                for (idx, unit) in units.iter().enumerate() {
-                    let pts = if idx == 0 { packet.pts } else { None };
-                    self.submit_frame(unit, pts)?;
-                }
-            }
-            FrameSplit::VvcEs => {
-                // Carve the VVC Annex-B elementary stream into per-access-
-                // unit payloads (see `split_vvc_access_units`). PTS handling
-                // matches the MPEG-2 / MPEG-4 Part 2 paths.
-                let units = split_vvc_access_units(&packet.data);
-                for (idx, unit) in units.iter().enumerate() {
-                    let pts = if idx == 0 { packet.pts } else { None };
-                    self.submit_frame(unit, pts)?;
-                }
-            }
+            self.ensure_session()?;
+            let pts = if idx == 0 { packet.pts } else { None };
+            self.submit_frame(unit, pts)?;
         }
         self.pull_frames();
         // Decoding is synchronous here (no decode flags), so an error the
@@ -1906,8 +2081,15 @@ impl Decoder for BlobDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.output_queue.pop_front() {
-            return Ok(Frame::Video(f));
+        if let Some(&(_, shape)) = self.output_queue.front() {
+            if self.shape.announce(shape)
+                && let Some(p) = self.shape.params()
+            {
+                return Ok(Frame::StreamParams(Box::new(p)));
+            }
+            if let Some((f, _)) = self.output_queue.pop_front() {
+                return Ok(Frame::Video(f));
+            }
         }
         if let Some(e) = self.take_error() {
             return Err(e);
@@ -1933,8 +2115,36 @@ impl Decoder for BlobDecoder {
         Ok(())
     }
 
+    fn reset(&mut self) -> Result<()> {
+        // Drop in-flight and queued output; keep the session (every
+        // payload these codecs take is self-describing or starts at a
+        // random-access point after a seek). The output description is
+        // kept too: a first frame of another shape after the seek is
+        // announced like any other change.
+        if !self.session.is_null()
+            && let Ok(vt) = sys::vtable()
+        {
+            unsafe { (vt.vt_decomp_wait)(self.session) };
+        }
+        if let Ok(mut g) = self.state.lock() {
+            g.frames.clear();
+            g.error = None;
+        }
+        self.output_queue.clear();
+        self.flushed = false;
+        Ok(())
+    }
+
     fn output_pixel_format(&self) -> Option<PixelFormat> {
-        self.target
+        self.output_params().and_then(|p| p.pixel_format)
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        self.shape.params()
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.shape.generation()
     }
 }
 
@@ -2633,7 +2843,7 @@ pub fn make_mpeg4_part_two_decoder(params: &CodecParameters) -> Result<Box<dyn D
 ///
 /// AV1 in MP4 / Matroska / WebM carries an `av1C` configuration record
 /// (per the AV1 ISO Base Media File Format Binding Specification §2.3)
-/// whose body is the [`AV1CodecConfigurationRecord`] — a 4-byte fixed
+/// whose body is the `AV1CodecConfigurationRecord` — a 4-byte fixed
 /// header (`marker`, `version`, `seq_profile`, `seq_level_idx_0`,
 /// `seq_tier_0`, colour-config flags, `initial_presentation_delay_*`)
 /// followed by a `configOBUs[]` field that SHALL contain at most one
@@ -2760,6 +2970,19 @@ mod tests {
     }
 
     #[test]
+    fn sequence_header_between_pictures_opens_the_next_unit() {
+        // PIC1 + SLICE + SEQ + EXT + GOP + PIC2 + SLICE: the repeated
+        // sequence header (a size change arrives this way) belongs to the
+        // second picture, not the tail of the first.
+        const EXT: &[u8] = &[0x00, 0x00, 0x01, 0xB5, 0x14];
+        let pic1 = cat(&[SEQ, PIC, SLICE]);
+        let pic2 = cat(&[SEQ, EXT, GOP, PIC, EXT, SLICE]);
+        let buf = cat(&[&pic1, &pic2]);
+        let units = split_mpeg2_access_units(&buf);
+        assert_eq!(units, vec![&pic1[..], &pic2[..]]);
+    }
+
+    #[test]
     fn no_picture_start_code_returns_whole() {
         // A buffer with only a sequence header (no picture) is handed through
         // intact rather than dropped.
@@ -2785,7 +3008,9 @@ mod tests {
     const VOL: &[u8] = &[0x00, 0x00, 0x01, 0x20, 0xCC]; // VOL (one of 20..2F)
     const GOV: &[u8] = &[0x00, 0x00, 0x01, 0xB3, 0xDD]; // GOV start
     const VOP: &[u8] = &[0x00, 0x00, 0x01, 0xB6, 0xEE]; // VOP start
-    const M4_SLICE: &[u8] = &[0x00, 0x00, 0x01, 0x01, 0xFF];
+    // VOP payload: MPEG-4 Part 2 VOP data carries no start codes (a
+    // `00 00 01 01` there would be a Video Object start, §6.2.1).
+    const M4_SLICE: &[u8] = &[0x12, 0x34, 0x56, 0xFF];
 
     #[test]
     fn mpeg4_single_vop_with_headers() {
@@ -2807,6 +3032,16 @@ mod tests {
         assert_eq!(units.len(), 2);
         assert_eq!(units[0], &vop1[..]);
         assert_eq!(units[1], &vop2[..]);
+    }
+
+    #[test]
+    fn mpeg4_vol_between_vops_opens_the_next_unit() {
+        let vop1 = cat(&[VOS, VOL, VOP, M4_SLICE]);
+        let vop2 = cat(&[VOS, VOB, VOL, GOV, VOP, M4_SLICE]);
+        let vop3 = cat(&[VOP, M4_SLICE]);
+        let buf = cat(&[&vop1, &vop2, &vop3]);
+        let units = split_mpeg4_part_two_access_units(&buf);
+        assert_eq!(units, vec![&vop1[..], &vop2[..], &vop3[..]]);
     }
 
     #[test]
