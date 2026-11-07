@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.4...v0.0.5) - 2026-11-07
+
+### Other
+
+- output_params + Frame::StreamParams on mid-stream shape changes
+- dlsym instead of libloading
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - decoders implement the core output-description contract: `output_params()` (picture size + label; H.264 / HEVC from the first SPS's cropped size before the first frame), `output_params_generation()`, and one `Frame::StreamParams` event immediately before the first frame of each new shape — after the queued frames of the old shape, across `flush` drains and after `reset`, never for the first shape or for repeated identical parameter sets
