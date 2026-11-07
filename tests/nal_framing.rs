@@ -40,6 +40,7 @@ fn stream(codec: NalCodec) -> Stream {
     let (es, yuv) = match codec {
         NalCodec::H264 => ("x264_48x32_12f.h264", "x264_48x32_12f.yuv"),
         NalCodec::Hevc => ("x265_48x32_12f.hevc", "x265_48x32_12f.yuv"),
+        other => unreachable!("no fixture for {other:?}"),
     };
     let annex_b = std::fs::read(fixture(es)).expect("fixture");
     let reference = std::fs::read(fixture(yuv)).expect("reference");
@@ -85,6 +86,7 @@ fn length_prefixed(s: &Stream) -> (ParamSets, Vec<Vec<u8>>) {
                 let is_ps = match s.codec {
                     NalCodec::H264 => matches!(t, 7 | 8),
                     NalCodec::Hevc => matches!(t, 32..=34),
+                    other => unreachable!("no fixture for {other:?}"),
                 };
                 if is_ps {
                     continue;
@@ -145,6 +147,7 @@ fn params(codec: NalCodec, extradata: Vec<u8>, declare_size: bool) -> CodecParam
     let mut p = CodecParameters::video(CodecId::new(match codec {
         NalCodec::H264 => "h264",
         NalCodec::Hevc => "hevc",
+        other => unreachable!("no case for {other:?}"),
     }));
     if declare_size {
         p.width = Some(W);
@@ -238,6 +241,7 @@ fn run(codec: NalCodec) {
     let record = match codec {
         NalCodec::H264 => build_avcc(&ps),
         NalCodec::Hevc => build_hvcc(&ps),
+        other => unreachable!("no case for {other:?}"),
     };
     let parsed = ParamSets::from_extradata(codec, &record).expect("record parses");
     assert_eq!(parsed.sets, ps.sets);

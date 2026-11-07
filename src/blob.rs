@@ -149,6 +149,7 @@ unsafe extern "C" fn dec_callback(
 /// anything VideoToolbox cannot deliver truthfully: precisions other
 /// than 8, four-component (CMYK / YCCK) scans, lossless / hierarchical
 /// processes, or a stream with no SOF.
+#[doc(hidden)]
 pub fn jpeg_sof_label(data: &[u8]) -> Option<PixelFormat> {
     let seg = jpeg_sof_segment(data)?;
     if seg.len() < 6 {
@@ -234,6 +235,8 @@ fn jpeg_sof_segment(data: &[u8]) -> Option<&[u8]> {
 /// bitstream framing (the codec's job, not a container's), so the splitter
 /// lives in the codec bridge.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[doc(hidden)]
 pub enum FrameSplit {
     /// One `Packet` == one VT access unit (JPEG, ProRes).
     Whole,
@@ -365,6 +368,7 @@ fn split_es_access_units(
 /// are the VOS (`B0`) and at minimum one VOL (`20..2F`); GOV (`B3`),
 /// user-data (`B2`), and the Visual Object (`B5`) headers are commonly
 /// included in the same prefix and ride along.
+#[doc(hidden)]
 pub fn extract_mpeg4_part_two_vol(buf: &[u8]) -> Option<&[u8]> {
     let mut i = 0usize;
     while i + 4 <= buf.len() {
@@ -567,6 +571,8 @@ pub fn extract_av1_sequence_header_obu(buf: &[u8]) -> Option<&[u8]> {
 /// only the fields the av1C record requires; the rest of the sequence
 /// header travels along verbatim inside `configOBUs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[doc(hidden)]
 pub struct Av1SeqHeaderFields {
     pub seq_profile: u8,
     pub seq_level_idx_0: u8,
@@ -637,6 +643,7 @@ impl<'a> BitReader<'a> {
 /// reach a field — av1C will still be built with the Sequence Header OBU
 /// in `configOBUs`, which is the authoritative source per the binding
 /// spec §2.3.4.
+#[doc(hidden)]
 pub fn parse_av1_seq_header_fields(payload: &[u8]) -> Av1SeqHeaderFields {
     let mut out = Av1SeqHeaderFields::defaults();
     let mut br = BitReader::new(payload);

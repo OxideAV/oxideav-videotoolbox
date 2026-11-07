@@ -164,6 +164,7 @@ fn nal_codec(ffmpeg: &Path, codec: decoder::NalCodec, encoder: &str, ext: &str, 
     let id = match codec {
         decoder::NalCodec::H264 => "h264",
         decoder::NalCodec::Hevc => "hevc",
+        other => unreachable!("no case for {other:?}"),
     };
     let Some(mut dec) = skip_or(decoder::NalVtDecoder::make(codec, &params(id, None)), &tag) else {
         return;

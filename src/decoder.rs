@@ -69,6 +69,7 @@ use crate::sys::{
 
 /// Split an Annex B byte stream (ITU-T H.264 / H.265 Annex B) into its
 /// NAL units (start codes stripped, trailing zero bytes trimmed).
+#[doc(hidden)]
 pub fn annex_b_nals(buf: &[u8]) -> Vec<&[u8]> {
     let mut result = Vec::new();
     let mut pos = 0usize;
@@ -127,6 +128,7 @@ pub fn annex_b_nals(buf: &[u8]) -> Vec<&[u8]> {
 }
 
 /// `true` when `buf` starts with an Annex B start code (3- or 4-byte).
+#[doc(hidden)]
 pub fn starts_with_start_code(buf: &[u8]) -> bool {
     buf.starts_with(&[0, 0, 1]) || buf.starts_with(&[0, 0, 0, 1])
 }
@@ -135,6 +137,7 @@ pub fn starts_with_start_code(buf: &[u8]) -> bool {
 /// `length_size` ∈ {1, 2, 4} bytes, big-endian) into its NAL units. A
 /// length that overruns the buffer ends the walk (the units before it
 /// are still returned).
+#[doc(hidden)]
 pub fn length_prefixed_nals(buf: &[u8], length_size: usize) -> Vec<&[u8]> {
     length_prefixed_walk(buf, length_size).0
 }
@@ -166,6 +169,7 @@ fn length_prefixed_walk(buf: &[u8], length_size: usize) -> (Vec<&[u8]>, bool) {
 /// length size the length-prefixed reading wins whenever it consumes
 /// the packet exactly; without a record a start code means Annex B and
 /// anything else is read with 4-byte lengths.
+#[doc(hidden)]
 pub fn packet_nals(buf: &[u8], length_size: Option<usize>) -> Vec<&[u8]> {
     match length_size {
         Some(ls) => {
@@ -179,6 +183,7 @@ pub fn packet_nals(buf: &[u8], length_size: Option<usize>) -> Vec<&[u8]> {
 
 /// Which of the two NAL-stream codecs a [`NalVtDecoder`] drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NalCodec {
     H264,
     Hevc,
@@ -247,6 +252,7 @@ impl NalCodec {
 /// Group the NAL units of one packet into access units (one coded
 /// picture each, with its leading non-VCL units). Parameter sets are
 /// *not* removed — the caller files them and strips them.
+#[doc(hidden)]
 pub fn split_access_units<'a>(codec: NalCodec, nals: &[&'a [u8]]) -> Vec<Vec<&'a [u8]>> {
     let mut units: Vec<Vec<&'a [u8]>> = Vec::new();
     let mut current: Vec<&'a [u8]> = Vec::new();
@@ -277,6 +283,8 @@ pub fn split_access_units<'a>(codec: NalCodec, nals: &[&'a [u8]]) -> Vec<Vec<&'a
 /// Parameter sets and sample NAL length size read from a codec
 /// configuration record (`avcC` / `hvcC`) or from Annex-B extradata.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+#[doc(hidden)]
 pub struct ParamSets {
     /// `[VPS, SPS, PPS]` NAL units (VPS stays empty for H.264).
     pub sets: [Vec<Vec<u8>>; 3],
@@ -789,6 +797,7 @@ impl OrderState {
 /// the coded size minus the H.264 frame-cropping rectangle
 /// (§7.4.2.1.1, eq. 7-19 … 7-22) or the H.265 conformance window
 /// (§7.4.3.2.1). `None` when the SPS does not parse.
+#[doc(hidden)]
 pub fn sps_output_size(codec: NalCodec, nal: &[u8]) -> Option<(u32, u32)> {
     let (w, h) = match codec {
         NalCodec::H264 => {

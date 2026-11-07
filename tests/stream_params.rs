@@ -67,6 +67,7 @@ fn ext(codec: NalCodec) -> &'static str {
     match codec {
         NalCodec::H264 => "h264",
         NalCodec::Hevc => "hevc",
+        other => unreachable!("no case for {other:?}"),
     }
 }
 

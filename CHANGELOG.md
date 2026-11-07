@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]` on `NalCodec`, `FrameSplit`, `ParamSets` and
+  `Av1SeqHeaderFields`.
+- `#[doc(hidden)]` on the internal NAL / blob framing helpers
+  (`annex_b_nals`, `starts_with_start_code`, `length_prefixed_nals`,
+  `packet_nals`, `split_access_units`, `sps_output_size`, `ParamSets`,
+  `jpeg_sof_label`, `extract_mpeg4_part_two_vol`, `FrameSplit`,
+  `parse_av1_seq_header_fields`, `Av1SeqHeaderFields`).
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-videotoolbox/compare/v0.0.4...v0.0.5) - 2026-11-07
 
 ### Other
